@@ -1,0 +1,51 @@
+
+╭────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (x0.000.0)                         │
+│                                                    │
+│ xxxxx:       gpt-6-astra medium   /xxxxx xx xxxxxx │
+│ xxxxxxxxx:   ~                                     │
+│ xxxxxxxxxxx: XXXX xxxx                             │
+╰────────────────────────────────────────────────────╯
+
+  Tip: Xxx xxx Xxxxxxx xxx. Xxx 'codex xxx' xx xxxxx xxxxx://xxxxxxx.xxx/codex?xxx-xxxxxxx-xxxx=xxxx
+
+⚠ 0 MCP xxxxxxx xxxxx · xxxx + x for xxxxxxx
+
+
+› xxx xxx xx xx xxxxx
+
+
+• xxx xxxxxx! xxxxx xxxx. xxx’x xxxx xxx xxxxx?
+
+⚠ xxxxx-xxxxxxxxxxx xxxxxxxx xxxxxxx: xxxxxxxxx. xxxxx-xxxxxxxxxxx xxxxxxxx xxx xxxxxxxxxx xxx xxx xxxxxx xxxxxxxxxxxxx. xx xxxxxxxx xxxx xxxxxxx, xxx `xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  = xxxx` xx /xxxxx/x/.xxxxx/xxxxxx.xxxx.
+
+
+› xxx
+
+
+• xxx xxxxxx! xxxx’x xx xxxx xxxx?
+
+⚠ Xxxxx xx, xxx xxxx xxxx xxxx 00% xx xxxx weekly limit left. Xxx /xxxxxx for x xxxxxxxxx.
+
+⚠ Xxxxx xx, xxx xxxx xxxx xxxx 00% xx xxxx weekly limit left. Xxx /xxxxxx for x xxxxxxxxx.
+
+⚠ Xxxxx xx, xxx xxxx xxxx xxxx 0% xx xxxx weekly limit left. Xxx /xxxxxx for x xxxxxxxxx.
+
+⚠ MCP xxxxxx for `xxxxxxxx-xxxxxxx` xxxxxx xx xxxxx: MCP xxxxxxx xxxxxx: xxxxxxxxxxx xxxx MCP server xxxxxx: XXXX-XXX error: -00000: Xxxxxxxx error: Xxx xxxx xxxxxx’x xx read xxxxxxx xx
+  xxx’x xx xxx xxxxxxx xxxxxx.({"xxxxxx":"xxx xxxx xxxxxx’x xx xxxx xxxxxxx xx xxx’x xx xxx xxxxxxx xxxxxx."}): xxxx-xxx xxxxx: -xxxxx: xxxxxxxx xxxxx: xxx xxxx xxxxxx’x xx xxxx xxxxxxx
+  xx xxx’x xx xxx xxxxxxx xxxxxx.({"xxxxxx":"xxx xxxx xxxxxx’x xx xxxx xxxxxxx xx xxx’x xx xxx xxxxxxx xxxxxx."})
+
+⚠ MCP xxxxxxx xxxxxxxxxx (xxxxxx: xxxxxxxx-xxxxxxx)
+
+
+› Ask Codex to do anything
+
+  gpt-6-astra · ~ · Context 00% left · Context 0% used · weekly 00% left · 258K window
+
+
+
+
+
+
+

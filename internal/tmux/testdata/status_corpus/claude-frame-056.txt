@@ -1,0 +1,35 @@
+  │                Xxx                │                                             Xxxxxx                                              │
+  ├───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Xxx xxxx xxxxx                    │ 00 xxxx                                                                                         │
+  ├───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Xxx xxxxxxxxxxx xxxxx, xxxxx      │ 00 xxxx                                                                                         │
+  │ Xxxxxxxx 00                       │                                                                                                 │
+  ├───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Xxx 0 XXX xxxxxxxxxxx xxxxx       │ 000 xxxx                                                                                        │
+  ├───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Xxxxxxx xxx xxxxxxxx xxxxxx       │ 00 xxxx                                                                                         │
+  ├───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Xxxx xxxx xxxxx                   │ 0000 xxxx                                                                                       │
+  ├───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Xxxxxxx xxx, xxxx xxxx xxxxxxxx   │ 0 xxx for xxx xxxxx xxxxxx                                                                      │
+  ├───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Xxxx xxxxxxxxxxx xxxxx            │ 00 xxx xxxxx, xxx xxx-xxxxxxxx (00 xx xxx xxxxx-xxx xxxx, 00 in xxx xxxxxxxxxx xxxxxx, xxxxxx   │
+  │                                   │ xxx xx xxxxxxxxx xxxxx)                                                                         │
+  └───────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  xx xx: xxxx xxx xxxxx, xxxx-xxxxxx xxxxxxxxxxx xxx xxxxx xxxxxxx xx xxxxxx xxxx.
+
+  xxxxxx-xx xxxx, xxx xxxxxxx xxxxx xxx xxxx xx: xxxxxxx xxxxx xx xxxxxx. xxx xx xxx xxx xxxx xxxx xxxx xx xxxxxxx xxxxxxxx xxxx xxxxxx xxx
+  xxxx xxxx xxx xxxxx xx, xx xxxx xxx xxxx xxxxx.
+
+  ===XXXXXXXXX_XXXX=== xxxxxx=xx xxxxxxx=xxx
+  xxx xxxxxxxx xxxx xx xxx xxxxx xxxxxx xxx_xxxxxxxx_xxxxx_xxxxxxx xxxxxxx xxx, xxxxxxxxx xxxx xxxxxxx xxx xxxxxx, #xxx xxxx-xxxxxx xxxx
+  xxxxxxxxx, xxxxxxxx xxx xxxxxx xxxxxxx xx xxx xx xxxx
+
+✻ Baked for 2m 42s · done 00:00 XX · 2 shells xxxxx running
+                                                                                                    new task? /clear to save 000.0k tokens
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xxxxxx-x-xxx-xxxxxxx-xxxx ─
+❯ xxxxxx xx xxx xxxxxx xxxx
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [xxxxxx-x · xxxxxxxx] x@xxxx:/xxx/xxxx-x/xxxxxxxxx/xxxxxx-x/xxx-xxxxxxx-xxxx | [Fable 5.1] ctx:00% in:000.0k out:0.0k 7d:00%
+  ⏵⏵ bypass permissions on · XX #000 · 2 shells · ← for agents

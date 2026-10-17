@@ -1,0 +1,50 @@
+
+  ⎿  0 xxxxx xxxxxxxxx
+  ⎿  Xxx'xx xxxxxxx xxxx Fable xxxxx. Xxx /xxxxx-xxxxxxx xx xxxxxxxx xx xxxxxx xxxxxx xxxx /xxxxx.
+     /xxxxx-xxxxxxx xx xxxxxx xxxx xxx’xx xxxxxxx xx.
+
+✻ Xxxxxxx for 0s · done 0:00 XX
+
+❯ /xxxxx
+  ⎿  Xxx xxxxx xx Xxxx 0 (0X context) xxx xxxxx xx xxxx default for xxx xxxxxxxx
+
+❯ xxxxx xxx xx x
+
+⏺ xxxxxxxx xxx xxxx xxx xxxx xxxxxxx xx xxx xxx xxx.
+
+⏺ xxxxx(xxxx-xx-xxxxxx)
+  ⎿  Xxxxxxxxxxxx xxxxxx xxxxx
+
+  Ran 13 shell xxxxxxxx
+
+⏺ xxxxxxx xxx xx xx xx xxx xxx.
+
+  xxx xxxx
+
+  - xx xx xxxxx xx xxx xxxxxx xxxx, xxxx xxxxxx, xxx xxx xxxxxx, xxx xxxx xxxxxx xxxxxxxx xxx xxx xxxxxxxx xxxxx, xxx xxxxxxxx.
+  - xx xxx xxx xxxxxxx xxxxxx xxxxx'x xxxxxxxx xxxx. xxxxxx, xx xx xxx xxxxxxx xxxxxx xxxxxxx.
+  - xxx xxxxx xx xxxxx xxxxx, xx xxx xxx xxxxx xxx xxxx xxxxxx. x xxxxxx x xxxx xxx xx xxxx xxxxxxx.
+
+  xxx xxxxxxxx
+
+  - xxx xxx xxxxxxx xxxx xxx xxxx xxxxxx xxx xxxx. x xxxxxxx xxx xxxx xxxxxx, xxx xxxx xxx xxxxxxxx.
+  - xxxxx xxxx xxxxx xxx xxx xxxxx xxx. xxx xxxxxxx xxx xxx xx xxxxx xxx xxxx xxxxx xxxxxxx xx xxxx xxxx xxxxxx, xx x xxxxx xxxx xx xxxx xxxxx xxxxxxx.
+  - xxx xxxxx xxx xxx xx xxxxx xxxx x xxx xx xx. xx xxx xxx xxx, xx x xxxxxxx xx xxx xx xxxx xxxx xxxx xxx xxxx xxxxxxx, xxxxxx xxx xxxx.
+
+  xxx xxxx xxxxxxx xx xxxxxxx
+
+  - xxx xxxxxxx xxxxx xxxxxxxx xxxxxx xx xxx xxxxxxx xxxxx xx xxxx xxxx xxxxxx. xx xx xxxxx xxx xxx xxxxxx, xxx xxxxxxx xxxx.
+
+  xxx xxxxx xx xxxx
+
+  - xxx xxxxx xxxxxxx xxxx xx xxx xxxxx x xxxxx xx xxx xxxx xxxx. xxxx xxxxxxx xxxx xxxx xxxxx xx xxx xxxx xx xx.
+
+  xxxxxxx xxx xxx xx xx. xx xxx xxxx xxx xxxxxxx xxx xx xxx xxxx xx xxxx, xxx xxxx xxxxxx.
+
+✻ Crunched for 6m 9s · done 0:00 XX
+                                                                                                                                                    new task? /clear to save 000k tokens
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xxxx ─
+❯ xxxx xxxxxx
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [xxxxxxx-x] x@xxxx:/Xxxxx/x/.xxxxxx-xxxxxxx-x/xxxxxxxx/-Xxxxx-xxxxx/xxxxxx | [Xxxx 0 (0X context)] ctx:00% in:000.0k out:0.0k
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

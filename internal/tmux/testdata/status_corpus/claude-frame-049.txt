@@ -1,0 +1,35 @@
+  xxxxx xx xx x xxxxxx.
+
+  xxxx: xxxx xx xxxxxx xxxxx xxxxx xxxx x xxxxxxx xx xxxxx'x xxxxxx xxxxx. xxxxx xx xxx xxxx xx xxxxxxx, xx xxxxx.
+
+  xx xxxxxxx xxxx xx. xxxxxxx xxxx xxx xxxx xxxxxxxxx.
+
+● Xxxxxx xxxx xxx xxxxxxxx xxxxx for: x xxxxxxx-xxx xxxx, x xxxxxx × xxx xxxxxxxx xxxx, x xxxxxxxx xxxxx xxxx xxxxxxxxx "no xxxxxxxx xx xxx
+  xxx" xxxx "xxx", xxx xxxxxxxxxxx xxxxxxx.
+
+  Ran 3 shell xxxxxxxx
+
+● Xxxxx xxxx xxxxxx-x'x task-xxx xxxx x xxxxx xxxxxx xxxxxx (- 0000-00-00X00:00:00X …) xxx xxxxxxxxx xxxxx xxxxxxxxx for, xxxxxxx xxx
+  xxx-xxx xxxx xx xx xxxxxxxxxx xx xxxx. xxxxxx xxx xxxxxx, xxxx xx-xxxxxxxxxx xxx xxxx xxxx xxx xxxxxxxxxx. · xxxxxxxxxx
+
+  Ran 3 shell xxxxxxxx
+
+● Xxx xxxxxxx xxxx xx xxx xxxxxxxx xx xxxxx in xxxxxx (xxx xxxxxxx xx xxxxxx xxx-xxxx). Xxxxxxx xxxx for xxxxxxxx.
+
+  xxxxxxx xxx xxx xxxxxxx xxxx xx xxxxxx xx xxxx xxx
+  ⎿  $ for x in $(xxx 0 00); xx xxxxx -x "agent-xxxx xxxxxxx xxxx" >/xxx/xxxx || xxxxx; xxxxx 0; done; xxxx "--- output:"; xxx
+     /xxx/xxxxxx-xxxx/-xxx-xxxxx-xxxx-xxxxxx/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx/xxxxx/xxxxxxxxx.xxxxxx; xxxxx -x "xxxxx-xxxx xxxxxxx xxxx"
+     >/xxx/xxxx && xxxx "xxxxx xxxxxxx" || xxx…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Xxx'xx xxxxxxx xxxx Fable xxxxx
+
+  xxx'xx xxxx xxxx xxxxxxxx xxxxx xxxxx xxx xxxx xxxx. xxxxxxxxxx xx xxxxx x.x xxxx xxxxx xxxxxxx, xxxxxxxxx xxxxxxxxxx xxxx xxxx xxxx.
+
+  xxxxx xxxx: xxxxx://xxxxxxx.xxxxxx.xxx/xx/xxxxxxxx/xxxxxxxx-xxxxx-xxxxx-xxx-xxxx-xxxxxx-xxxxx
+
+  ❯ xxxxxx xx xxxx x (xx xxxxxxx) xxx xxxxxxxx
+    xxxxxxxx xxxx xxxxx x.x
+
+
+  Enter to confirm · Esc to cancel

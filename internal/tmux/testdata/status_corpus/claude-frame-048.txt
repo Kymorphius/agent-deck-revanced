@@ -1,0 +1,50 @@
+
+⏺ xxxxxxxx x xxxx xxxx xxxxx xxxxxxx xx xxxx xxxx xxx xxxxxxxx xx xxx xxxxxxx.
+
+  xxxx x xxxxxxxxxx xxxx +xxx
+
+❯ xxxx xx xxxx xxx x xx xx xx xx xxxxx xxxx xxx xx x xxx x x xxxx xx xxxx xxx xxxxx xxx xxx xxxx xxxx xxxxxxxx xxx  xxxxxx
+
+❯ xxxxxxxxxx
+
+❯ xxxx xxx xxx xxxx xxxxxxx xxx xxx xx xxx xxxx xx xxxxx xxxxx xxxxxxxx
+
+❯ xxx xxxx xxx x xxxxx xxx xxxx xxxxx xxxx xxxxxxxxxx xxxxxxx xxx
+
+⏺ xxx, xxx x'xx xxxx xxx xxxx xxxxx xxxxxx xxxx xx xxxxxxxxxxxx: xxx xxxxx xxxxxxx xxxx xxxx xx xxxx xxxxxxx, xxx xxx xxxxx xxxxxx xxxx xxxxx xxx, xxx xxx xx xxxx xxxxx.
+
+  Ran 2 shell xxxxxxxx
+
+⏺ xxxxxxxx("xxx-xxxxxxxxx.xxxx")
+  ⎿  Xxxxxxxxx ⧉ xxxxx://xxxxxx.xx/xxxxxxxx/XXxxxXxXxXXxxXxxxXxxXx
+
+⏺ xxxx xx xxx xxxx: ⧉ xxxxx://xxxxxx.xx/xxxxxxxx/xxxxxxxxxxxxxxxxxxxxxx
+
+  xx xxxxx xxxxxxx x xxxx xxxx xxxx xxxx xxx xx xxxx xxxx "xxxx xxx x xxxxxxx xxx xxxxx", xxxx xxxxxxx xxxxxxxx xx. xxx xxxxx xxxxxxx xx xxxx xx xxxxx:
+
+  xxxx xxxx xx. xxx xxxxxxx xxxx, xxx xxxxxxxx xxxxxxx xxxx xxx xxxxxx xx xxxxxxx, xxx xxx xxxxxxxxx, xxx xxx xxxxx, xxxx xxxx x xxxxxxxxx xxxx xxxxx xx xxxx.
+
+  xxxxxxx xxx xxxxx xxx xxxxx. xxx xxxx "xxxxxxx" xxxx xxx xxxxxx xxx xxxxx xx xxx xxxx xxx "xxxxx", xxx xxx xxxxxx xx xxxx x.xx xxxxxxxxxx. xxxx xx xxx xxx xxx.
+
+  xxx xx xxxxx xxxxxx. xxx "xxxxxxx" xxx xxxx xxx xxxxx, xxxxxx, xxxxxxx, xxxx, xxxxxx. xxx xxxx xxx xxxxx, "xxxx", xx xxxx xxxxx xxxx xxxx x xxxxxxx, xx xx xxxxxxxx xxxxxx xxxxxx xx,
+  xxx xxx xxxxxx xxxx xxxx xx xx xxx xxxxx. xx xxxxx "xxxxx" xx x.xx xxxxxxxxxx, xxxxx xx xxx xxxxxxxx xxxxxx xx xx xxxxxxxx.
+
+  ┌──────────────────┬───────────────────────────┐
+  │                  │          Output           │
+  ├──────────────────┼───────────────────────────┤
+  │ Xxx xxxx context │ Xxx xx x xxxxx xx working │
+  ├──────────────────┼───────────────────────────┤
+  │ Xxxx xxx xxxxx   │ Xxx xx xxxx working?      │
+  └──────────────────┴───────────────────────────┘
+
+  xx xxxx xxxx xx xxxxx: xxx xxxxx xx xxx xxx xxxxxxx, xxx xxxxx xx. x xxxxxx xxxxxx xx xxxxxx xxxx xxx xxxxx, xxx xxxx xxxxxx xxxx xxx xxxxx xxxx xxxxxxx xxx xxxxx xxx xxxxx. x xxxxxx,
+  xxxxxx xxxx xxxx xxxxxxxx, xx xxxx xxxx xxxxx. xxx'x xxxxxx xxxxxxxxxx xx xxx xxxxx xxxxx xxxxxxx, xx xxx, xxx xxxxxxxx xxxxxxxx xxxxx.
+
+✻ Worked for 2m 1s · done 0:00 XX
+                                                                                                                                                  new task? /clear to save 000.0k tokens
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── write ─
+❯ 
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [xxxx-xxxxx] x@xxxx:/Xxxxx/x | [Fable 5.1] ctx:00% in:000.0k out:000
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+  ⧉  xxx-xxxxxxxxx

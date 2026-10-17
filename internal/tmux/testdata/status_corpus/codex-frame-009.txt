@@ -1,0 +1,15 @@
+• Ran xx
+  └ x.xx
+
+• Working (0s • esc to interrupt) · 1 background terminal x…
+  └ xxxxxxxx 文文文 xxxx xxxxxx
+  └ Xxxxxxxx xxxxxxx xxxx xxxx xxxx x
+    xxxxxx xxx
+• Queued follow-up inputs
+  ↳ xxxx xxxxxx xxx changelog
+    shift + ← edit last queued message
+
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol default · /xxx/xxxxxxx

@@ -1,0 +1,650 @@
+package session
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Issue #1225: the consumer side of the durable per-parent outbox. The parent
+// drains its inbox at its own turn boundary (Stop hook) and on heartbeat.
+//
+// Audit B1 — TRUE at-least-once durability. The drain is a two-phase commit so
+// no record is ever lost to a crash:
+//
+//	Phase 1 (stage, under inboxWriteMu): recover any records left by a prior
+//	crashed drain (the in-flight WAL), read the current inbox, durably stage the
+//	union to the WAL (fsync), THEN remove the inbox file. The WAL is the durable
+//	copy that survives the truncate — "record intent → delete → finalize".
+//
+//	Phase 2 (finalize, under consumedTurnsMu): collapse retries per turn,
+//	skip turn_fingerprints already consumed (exactly-once EFFECTS), mark the rest
+//	consumed (fsync the ledger), and only THEN drop the WAL.
+//
+// A process death anywhere between the inbox-remove and the WAL-drop re-delivers
+// the staged records on the next drain; the consumed-turn ledger (a fsync'd
+// dedup table) collapses any duplicate. This is the outbox + inbox dedup-table
+// pattern: at-least-once delivery with exactly-once effects, never loss.
+//
+// Messaging audit P1-3 — cross-process serialization. The producers
+// (CommitToInbox, WriteInboxEventIfNew) hold the flock on the inbox file while
+// they rewrite it by rename; the daemon, the parent's Stop hook and `inbox
+// drain` are separate processes, so the consumer must hold the SAME flock
+// across both phases or a rename can land between its read and its remove
+// (lost record), and two drains can both stage the same WAL (double
+// delivery). Lock order, outermost first, everywhere in this package:
+//
+//	1. inbox flock   AcquireConfigFileLock(InboxPathFor(parent))  cross-process
+//	2. consumedTurnsMu                                              in-process
+//	3. inboxWriteMu                                                 in-process
+//
+// Producers take 1 then 3; the drain takes 1, then 3 (stage), then 2 then 3
+// (finalize); WriteInboxEventIfUnseen takes 1, 2, 3. The flock is never taken
+// while 2 or 3 is held, so producers and consumers cannot deadlock; the
+// consumer's wait is bounded (inboxLockWait) so a stuck holder surfaces as
+// ErrConfigLockBusy instead of wedging a Stop hook.
+
+// consumedTurnsTTL bounds the consumed-fingerprint ledger so it can't grow
+// without limit. Remote exports are read-only and may outlive their normal
+// inbox TTL, so WriteInboxEventIfUnseen separately refuses records outside
+// this same acceptance window before a pruned fingerprint can become "new".
+const consumedTurnsTTL = 14 * 24 * time.Hour
+
+// inboxLockWait bounds how long a consumer or sweep waits for the inbox flock.
+// Producers hold it for one append, so a wait this long means a holder is
+// stuck; the caller reports ErrConfigLockBusy and retries on its next turn.
+var inboxLockWait = 10 * time.Second
+
+// acquireInboxLock takes the per-parent inbox flock (lock order step 1) with
+// the bounded wait. Callers must not hold consumedTurnsMu or inboxWriteMu.
+func acquireInboxLock(parentID string) (*ConfigFileLock, error) {
+	path := InboxPathFor(parentID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	lock, err := AcquireConfigFileLockTimeout(path, inboxLockWait)
+	if err != nil {
+		return nil, fmt.Errorf("lock inbox %s: %w", sanitizeInboxName(parentID), err)
+	}
+	return lock, nil
+}
+
+// consumedLedgerGenerationKey stores the ledger's generation without changing
+// the historical JSON object shape (fingerprint -> int64). The authoritative
+// copy is stored beside the inbox, outside ConsumedTurnsDir, so restoring an
+// older consumed-ledger backup cannot also roll it back accidentally.
+const consumedLedgerGenerationKey = "__agent_deck_consumed_generation__"
+
+type inboxConsumeMarker struct {
+	Generation uint64 `json:"generation"`
+}
+
+var consumedTurnsMu sync.Mutex
+
+// ConsumedTurnsDir holds per-parent consumed-fingerprint ledgers.
+func ConsumedTurnsDir() string {
+	dir, err := runtimeDataPath("consumed-turns")
+	if err != nil {
+		return tempAgentDeckPath("runtime", "consumed-turns")
+	}
+	return dir
+}
+
+func consumedTurnsPathFor(parentID string) string {
+	return filepath.Join(ConsumedTurnsDir(), sanitizeInboxName(parentID)+".json")
+}
+
+func inboxConsumeMarkerPathFor(parentID string) string {
+	return filepath.Join(InboxDir(), sanitizeInboxName(parentID)+".consumed-generation.json")
+}
+
+func loadInboxConsumeMarker(parentID string) (inboxConsumeMarker, error) {
+	var marker inboxConsumeMarker
+	raw, err := os.ReadFile(inboxConsumeMarkerPathFor(parentID))
+	if errors.Is(err, fs.ErrNotExist) {
+		return marker, nil // pre-marker installations begin at generation zero
+	}
+	if err != nil {
+		return marker, err
+	}
+	if err := json.Unmarshal(raw, &marker); err != nil {
+		return marker, err
+	}
+	return marker, nil
+}
+
+func saveInboxConsumeMarker(parentID string, generation uint64) error {
+	raw, err := json.Marshal(inboxConsumeMarker{Generation: generation})
+	if err != nil {
+		return err
+	}
+	return writeFileDurable(inboxConsumeMarkerPathFor(parentID), raw, 0o644)
+}
+
+func consumedLedgerGeneration(consumed map[string]int64) uint64 {
+	generation := consumed[consumedLedgerGenerationKey]
+	if generation < 0 {
+		return 0
+	}
+	return uint64(generation)
+}
+
+func loadConsumedTurnsLocked(parentID string) map[string]int64 {
+	out := map[string]int64{}
+	raw, err := os.ReadFile(consumedTurnsPathFor(parentID))
+	if err != nil {
+		return out
+	}
+	_ = json.Unmarshal(raw, &out)
+	return out
+}
+
+// InboxEventPresence is the result of checking both durable dedup stores used
+// by inbox delivery.  Unknown is deliberately distinct from both inserted and
+// already-present: a damaged consumed-turn ledger cannot honestly answer
+// whether a fetched turn was delivered before.
+type InboxEventPresence int
+
+const (
+	InboxEventPresenceUnknown InboxEventPresence = iota
+	InboxEventInserted
+	InboxEventAlreadyPresent
+	// InboxEventPresenceUnknownAfterLedgerRestore remains UNKNOWN for public
+	// accounting, but lets callers name the detected recovery condition.
+	InboxEventPresenceUnknownAfterLedgerRestore
+)
+
+// WriteInboxEventIfUnseen writes event only when it is absent from both the
+// pending inbox and the durable consumed-turn ledger. Remote drain needs this
+// wider answer because its source is read-only and continues serving records
+// after this conductor has consumed them.
+//
+// The inbox flock and then the consumed lock are held through the inbox
+// check-and-append (lock order 1 → 2 → 3, see the file comment), which
+// prevents a concurrent consumer, in this or another process, from moving a
+// record between the two stores while the decision is made.
+func WriteInboxEventIfUnseen(parentID string, event TransitionNotificationEvent) (InboxEventPresence, error) {
+	if strings.TrimSpace(parentID) == "" {
+		return InboxEventPresenceUnknown, errors.New("inbox: empty parent session id")
+	}
+
+	// The consumed ledger is deliberately bounded, while a read-only remote
+	// export can keep serving a record indefinitely. Therefore the record's own
+	// timestamp is the acceptance boundary: once it reaches the ledger horizon,
+	// it is stale/already-present and can never be resurrected after pruning.
+	// Zero or future timestamps cannot establish age (including clock skew), so
+	// fail closed as unknown rather than silently treating them as new.
+	now := time.Now()
+	if event.Timestamp.IsZero() || event.Timestamp.After(now) {
+		return InboxEventPresenceUnknown, nil
+	}
+	if !event.Timestamp.After(now.Add(-consumedTurnsTTL)) {
+		return InboxEventAlreadyPresent, nil
+	}
+
+	fileLock, err := acquireInboxLock(parentID)
+	if err != nil {
+		return InboxEventPresenceUnknown, err
+	}
+	defer fileLock.Release()
+
+	consumedTurnsMu.Lock()
+	defer consumedTurnsMu.Unlock()
+
+	raw, err := os.ReadFile(consumedTurnsPathFor(parentID))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return InboxEventPresenceUnknown, nil
+	}
+	consumed := map[string]int64{}
+	if err == nil {
+		if json.Unmarshal(raw, &consumed) != nil {
+			return InboxEventPresenceUnknown, nil
+		}
+		fp := event.TurnFingerprint
+		if fp == "" {
+			fp = TurnFingerprint(event)
+		}
+		if _, ok := consumed[fp]; ok {
+			return InboxEventAlreadyPresent, nil
+		}
+	}
+	marker, markerErr := loadInboxConsumeMarker(parentID)
+	if markerErr != nil {
+		return InboxEventPresenceUnknown, nil
+	}
+	if consumedLedgerGeneration(consumed) < marker.Generation {
+		// Recovery contract: restoring the mutable consumed ledger trades
+		// replay protection for recovery. The inbox-side marker detects the
+		// regression, but cannot reconstruct which forgotten fingerprints
+		// were consumed. Window-inside records absent from the restored ledger
+		// are therefore UNKNOWN, never new. Non-rollbackable tombstones would
+		// require a separate design and are intentionally out of scope here.
+		return InboxEventPresenceUnknownAfterLedgerRestore, nil
+	}
+
+	written, err := writeInboxEventIfNewFlocked(parentID, event)
+	if err != nil {
+		return InboxEventPresenceUnknown, err
+	}
+	if written {
+		return InboxEventInserted, nil
+	}
+	return InboxEventAlreadyPresent, nil
+}
+
+// turnAlreadyConsumed reports whether the parent's consumed-turn ledger already
+// holds fp, i.e. the parent has acted on this turn and its next drain would drop
+// a fresh copy. Read-only; used by the producer to withhold the wake-nudge for
+// a record that cannot produce a non-empty drain.
+func turnAlreadyConsumed(parentID, fp string) bool {
+	if strings.TrimSpace(fp) == "" {
+		return false
+	}
+	consumedTurnsMu.Lock()
+	defer consumedTurnsMu.Unlock()
+	_, ok := loadConsumedTurnsLocked(parentID)[fp]
+	return ok
+}
+
+func saveConsumedTurnsLocked(parentID string, m map[string]int64) error {
+	// Prune expired entries on every save to bound growth.
+	cutoff := time.Now().Add(-consumedTurnsTTL).Unix()
+	for fp, ts := range m {
+		if fp == consumedLedgerGenerationKey {
+			continue
+		}
+		if ts < cutoff {
+			delete(m, fp)
+		}
+	}
+	path := consumedTurnsPathFor(parentID)
+	data, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	// Audit B1: the consumed ledger is the exactly-once dedup table; it MUST be
+	// durably on disk (fsync) before the WAL is dropped, or a crash could both
+	// forget the record was consumed AND lose the staged copy.
+	return writeFileDurable(path, data, 0o644)
+}
+
+// DrainInboxForParent drains the parent's durable outbox and returns the
+// deliverables (all distinct turns, exactly once per turn). See file comment.
+//
+// Two-phase, crash-safe (audit B1): stage the records into the in-flight WAL
+// before truncating the inbox, then finalize the consumed ledger and drop the
+// WAL. A crash between the two phases re-delivers from the WAL on the next call.
+func DrainInboxForParent(parentID string) ([]TransitionNotificationEvent, error) {
+	if strings.TrimSpace(parentID) == "" {
+		return nil, errors.New("inbox drain: empty parent session id")
+	}
+
+	// The producers' flock, held across BOTH phases so no rename can land
+	// between the read and the remove and no second drain (in any process) can
+	// stage the same WAL (messaging audit P1-3).
+	fileLock, err := acquireInboxLock(parentID)
+	if err != nil {
+		return nil, err
+	}
+	defer fileLock.Release()
+
+	// Phase 1: recover prior in-flight records, read the current inbox, durably
+	// stage the union to the WAL, then remove the inbox. Exactly one concurrent
+	// caller wins the inbox under the flock + inboxWriteMu.
+	staged, err := stageInboxDrainLocked(parentID)
+	if err != nil {
+		return nil, err
+	}
+	if len(staged) == 0 {
+		return nil, nil
+	}
+
+	// Phase 2: dedup against the consumed ledger, mark the rest consumed (fsync),
+	// then drop the WAL.
+	return finalizeInboxDrain(parentID, staged)
+}
+
+// stageInboxDrainLocked is phase 1 of the crash-safe drain. It recovers any
+// records a prior crashed drain left in the in-flight WAL, reads the current
+// inbox, durably stages the union to the WAL (fsync), then removes the inbox
+// file. After it returns the records live in the WAL even though the inbox is
+// gone, so a crash before finalize re-delivers them. Caller holds the inbox
+// flock; the function acquires inboxWriteMu itself.
+func stageInboxDrainLocked(parentID string) ([]TransitionNotificationEvent, error) {
+	inboxWriteMu.Lock()
+	defer inboxWriteMu.Unlock()
+
+	recovered, err := loadInflightLocked(parentID)
+	if err != nil {
+		return nil, err
+	}
+	current, err := readInboxEventsLocked(InboxPathFor(parentID))
+	if err != nil {
+		return nil, err
+	}
+
+	union := append(recovered, current...)
+	if len(union) == 0 {
+		// Nothing recovered and nothing pending — make sure no stale WAL lingers.
+		removeInflightLocked(parentID)
+		return nil, nil
+	}
+
+	// Record intent: durably stage the union BEFORE truncating the inbox.
+	if err := writeInflightLocked(parentID, union); err != nil {
+		return nil, err
+	}
+	// Now safe to remove the inbox — the records are durably in the WAL.
+	if err := os.Remove(InboxPathFor(parentID)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return union, err
+	}
+	delete(inboxFingerprintCache, InboxPathFor(parentID))
+	return union, nil
+}
+
+// finalizeInboxDrain is phase 2: collapse same-turn retries, dedup against the consumed
+// ledger, mark newly-delivered turns consumed (durable), then drop the WAL.
+// Caller holds the inbox flock.
+func finalizeInboxDrain(parentID string, staged []TransitionNotificationEvent) ([]TransitionNotificationEvent, error) {
+	collapsed := collapseTurnRetries(staged)
+
+	consumedTurnsMu.Lock()
+	defer consumedTurnsMu.Unlock()
+	consumed := loadConsumedTurnsLocked(parentID)
+	marker, err := loadInboxConsumeMarker(parentID)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().Unix()
+	var out []TransitionNotificationEvent
+	dirty := false
+	for _, ev := range collapsed {
+		fp := ev.TurnFingerprint
+		if fp == "" {
+			fp = TurnFingerprint(ev)
+		}
+		if _, seen := consumed[fp]; seen {
+			continue // exactly-once effects: this turn was already acted on
+		}
+		consumed[fp] = now
+		dirty = true
+		out = append(out, ev)
+	}
+	if dirty {
+		generation := marker.Generation + 1
+		if ledgerGeneration := consumedLedgerGeneration(consumed); generation <= ledgerGeneration {
+			generation = ledgerGeneration + 1
+		}
+		consumed[consumedLedgerGenerationKey] = int64(generation) // #nosec G115 -- generation increments by 1 per consume; reaching int64 overflow would need 2^63 consumed turns
+		if err := saveConsumedTurnsLocked(parentID, consumed); err != nil {
+			// Ledger not durable — leave the WAL in place so the next drain
+			// re-delivers rather than loses.
+			return out, err
+		}
+		// The marker is deliberately alongside the inbox, not the restorable
+		// ledger. Writing ledger first is fail-closed: a marker-write failure
+		// leaves the WAL for retry and cannot falsely bless a rolled-back ledger.
+		if err := saveInboxConsumeMarker(parentID, generation); err != nil {
+			return out, err
+		}
+		marker.Generation = generation
+	}
+	// If the ledger write succeeded but the marker write failed on a previous
+	// attempt, the WAL retry sees every event as already consumed. Reconcile the
+	// marker before dropping that WAL so the completed consume is still pinned.
+	if ledgerGeneration := consumedLedgerGeneration(consumed); marker.Generation < ledgerGeneration {
+		if err := saveInboxConsumeMarker(parentID, ledgerGeneration); err != nil {
+			return out, err
+		}
+	}
+	// Consumed ledger durable (or nothing new to mark) — the records are now
+	// either delivered-and-recorded or already-consumed duplicates; drop the WAL.
+	inboxWriteMu.Lock()
+	removeInflightLocked(parentID)
+	inboxWriteMu.Unlock()
+	return out, nil
+}
+
+// DrainStagePhaseForCrashTest runs ONLY phase 1 of the drain (stage + truncate)
+// and returns the staged records, simulating a process that dies before the
+// consumed ledger is finalized. Tests use it to prove the at-least-once
+// re-delivery contract (audit B1). Production code never calls it.
+func DrainStagePhaseForCrashTest(parentID string) ([]TransitionNotificationEvent, error) {
+	fileLock, err := acquireInboxLock(parentID)
+	if err != nil {
+		return nil, err
+	}
+	defer fileLock.Release()
+	return stageInboxDrainLocked(parentID)
+}
+
+// InboxHasPending cheaply reports whether the parent has anything to drain —
+// either a non-empty inbox or records recovered in the in-flight WAL. It does
+// NOT consume anything (a single stat per file). Used as the Stop-hook fast
+// path: a leaf / non-parent session (no inbox file) returns false, so the
+// Stop-hook sync flip is inert for it — no block, no stop-block ledger write
+// (audit B12 scope).
+func InboxHasPending(parentID string) bool {
+	if strings.TrimSpace(parentID) == "" {
+		return false
+	}
+	return fileHasContent(InboxPathFor(parentID)) || fileHasContent(inboxInflightPathFor(parentID))
+}
+
+func fileHasContent(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir() && info.Size() > 0
+}
+
+// --- in-flight WAL (audit B1 durability) ------------------------------------
+
+// inboxInflightDir holds per-parent in-flight drain WALs: the durable copy of
+// records staged for a drain, written before the inbox is truncated and dropped
+// only after the consumed ledger is finalized.
+func inboxInflightDir() string {
+	dir, err := runtimeDataPath("inbox-inflight")
+	if err != nil {
+		return tempAgentDeckPath("runtime", "inbox-inflight")
+	}
+	return dir
+}
+
+func inboxInflightPathFor(parentID string) string {
+	return filepath.Join(inboxInflightDir(), sanitizeInboxName(parentID)+".jsonl")
+}
+
+// loadInflightLocked reads any records a prior crashed drain staged but never
+// finalized. Caller holds inboxWriteMu. Corrupt lines are skipped (matching the
+// inbox read path) so one bad line can't strand the rest.
+func loadInflightLocked(parentID string) ([]TransitionNotificationEvent, error) {
+	return readInboxEventsLocked(inboxInflightPathFor(parentID))
+}
+
+// writeInflightLocked durably stages records to the in-flight WAL. Caller holds
+// inboxWriteMu. The records are fsync'd before this returns so they survive a
+// crash that happens after the subsequent inbox truncate.
+func writeInflightLocked(parentID string, events []TransitionNotificationEvent) error {
+	var buf strings.Builder
+	for _, ev := range events {
+		fp := EventFingerprint(ev)
+		line, err := json.Marshal(inboxWireEvent{TransitionNotificationEvent: ev, Fingerprint: fp})
+		if err != nil {
+			return err
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	return writeFileDurable(inboxInflightPathFor(parentID), []byte(buf.String()), 0o644)
+}
+
+// removeInflightLocked drops the in-flight WAL after a drain is fully finalized.
+// Caller holds inboxWriteMu. Best-effort: a missing file is not an error.
+func removeInflightLocked(parentID string) {
+	_ = os.Remove(inboxInflightPathFor(parentID))
+}
+
+// readInboxEventsLocked reads all parseable events from a JSONL inbox/WAL file
+// without truncating it. Returns an empty slice for a missing/empty file.
+// Corrupt lines are skipped rather than failing the whole read (audit B3/B11),
+// and oversized lines are discarded without blocking later records (audit B6).
+// Caller holds inboxWriteMu.
+func readInboxEventsLocked(path string) ([]TransitionNotificationEvent, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	var out []TransitionNotificationEvent
+	if err := forEachInboxLine(f, func(line []byte) error {
+		ev, derr := decodeInboxLine(line)
+		if derr != nil {
+			return nil // skip corrupt lines rather than failing the whole drain
+		}
+		out = append(out, ev)
+		return nil
+	}); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// collapseTurnRetries reduces repeated records for one logical turn to the
+// latest copy while preserving every distinct turn and first-seen order.
+func collapseTurnRetries(events []TransitionNotificationEvent) []TransitionNotificationEvent {
+	latest := map[string]TransitionNotificationEvent{}
+	order := []string{}
+	for _, ev := range events {
+		fp := ev.TurnFingerprint
+		if fp == "" {
+			fp = TurnFingerprint(ev)
+		}
+		cur, seen := latest[fp]
+		if !seen {
+			order = append(order, fp)
+			latest[fp] = ev
+			continue
+		}
+		if !ev.Timestamp.Before(cur.Timestamp) {
+			latest[fp] = ev
+		}
+	}
+	out := make([]TransitionNotificationEvent, 0, len(order))
+	for _, fp := range order {
+		out = append(out, latest[fp])
+	}
+	return out
+}
+
+// ForgetConsumedTurnsForChild removes any consumed-turn ledger entries for a
+// child across all parents — used by rm_sweep on child removal so the ledger
+// doesn't leak. Best-effort.
+func ForgetConsumedTurnsForChild(childSessionID string) {
+	child := strings.TrimSpace(childSessionID)
+	if child == "" {
+		return
+	}
+	prefix := child + "@"
+	consumedTurnsMu.Lock()
+	defer consumedTurnsMu.Unlock()
+	entries, err := os.ReadDir(ConsumedTurnsDir())
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		parentID := strings.TrimSuffix(e.Name(), ".json")
+		m := loadConsumedTurnsLocked(parentID)
+		changed := false
+		for fp := range m {
+			if strings.HasPrefix(fp, prefix) {
+				delete(m, fp)
+				changed = true
+			}
+		}
+		if changed {
+			_ = saveConsumedTurnsLocked(parentID, m)
+		}
+	}
+}
+
+// DrainInboxForParentWhere is DrainInboxForParent for a consumer with a
+// delivery budget (issue #2469: the prompt-time injection has a size cap).
+// After staging, retry-collapse and consumed-ledger dedup, choose receives
+// the records that are genuinely pending, oldest first, and returns the
+// subset to deliver now; every other pending record is written back to the
+// inbox, unconsumed, so it is delivered by a later drain. Nothing is marked
+// consumed unless it is returned to the caller.
+//
+// Crash safety: the kept records are re-queued BEFORE the chosen ones are
+// finalized. A crash in between leaves them both in the WAL and in the
+// inbox; the next drain's union collapses the duplicate by turn fingerprint.
+func DrainInboxForParentWhere(parentID string, choose func(pending []TransitionNotificationEvent) []TransitionNotificationEvent) ([]TransitionNotificationEvent, error) {
+	if strings.TrimSpace(parentID) == "" {
+		return nil, errors.New("inbox drain: empty parent session id")
+	}
+	if choose == nil {
+		return DrainInboxForParent(parentID)
+	}
+	fileLock, err := acquireInboxLock(parentID)
+	if err != nil {
+		return nil, err
+	}
+	defer fileLock.Release()
+
+	staged, err := stageInboxDrainLocked(parentID)
+	if err != nil {
+		return nil, err
+	}
+	if len(staged) == 0 {
+		return nil, nil
+	}
+
+	consumedTurnsMu.Lock()
+	consumed := loadConsumedTurnsLocked(parentID)
+	consumedTurnsMu.Unlock()
+	var pending []TransitionNotificationEvent
+	for _, ev := range collapseTurnRetries(staged) {
+		if _, seen := consumed[turnFingerprintOf(ev)]; !seen {
+			pending = append(pending, ev)
+		}
+	}
+	take := choose(pending)
+	taken := make(map[string]bool, len(take))
+	for _, ev := range take {
+		taken[turnFingerprintOf(ev)] = true
+	}
+	inboxWriteMu.Lock()
+	for _, ev := range pending {
+		if taken[turnFingerprintOf(ev)] {
+			continue
+		}
+		if err := appendInboxLineLocked(InboxPathFor(parentID), ev); err != nil {
+			inboxWriteMu.Unlock()
+			// Re-queue failed: leave the WAL in place (nothing consumed yet) so
+			// the next drain re-delivers everything.
+			return nil, err
+		}
+	}
+	inboxWriteMu.Unlock()
+	return finalizeInboxDrain(parentID, take)
+}
+
+func turnFingerprintOf(ev TransitionNotificationEvent) string {
+	if ev.TurnFingerprint != "" {
+		return ev.TurnFingerprint
+	}
+	return TurnFingerprint(ev)
+}

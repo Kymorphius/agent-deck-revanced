@@ -1,0 +1,50 @@
+  ├───────────────────────────────────────────────┼─────────────────────────────┤
+  │ Xxxx xxx xxxx Xxxxxx Xxxxxx                   │ ~$0000+ xxx xxxx xx xxxxxxx │
+  ├───────────────────────────────────────────────┼─────────────────────────────┤
+  │ Xxxxxxx xx ~000 xx xxx xxxx, xxxx xxxxxxxxxxx │ x xxx xxxxx                 │
+  └───────────────────────────────────────────────┴─────────────────────────────┘
+
+  xxxxxxx
+
+  - xx xx xxxxxxxx xxxx xxxxx xxx. xxxxxxx xxx xx xxxxx xxxxx xxx xxx xxxxxx.
+  - xxx xxxxx xx xxxxxxx xxxx xxxxx xxxxxxx xx x xxx xxxx xxx xxxxxxx. xxxx xxx xxxxxx, xxx
+    xxxxx xxxxx xxx xxxx xxx xxxxxxxxxx xxxxx. xxx xxxxxx xxxxxxx xxxxxxx xxxxxxx, xxxx xxxxx
+    xxxxx xx xxxxxx.
+  - xx xxxxxxxxxx, xx xxxx xxx xxxxx. xxxxxxx xxx xxxxxxxxx xxxxx xxxx x xxxxxx xxx, xxx xxxx
+    xxx xxx xxxxx xxxxx xxx xxxxx xx xxxxxxxxx.
+
+  xx xxx xxxx, xxx xxxx xxxx xx xx xxxx xxx xxxxxxxx xx xxxxxxxx.xx xxx x xxxx xxx xxxxxxx
+  xxxxxxxx xxxx xxxxxx xxxxx.
+
+✻ Baked for 27s · done 0:00 XX
+
+❯ x xx xxxx xxxx xx xxxxxxxxxxx xxxxxx xxxxxxxxxx xxxxxxx
+
+⏺ xxx xx xxxxx xxxxxxx xxxxxxxx xxx xxx xxxxxx xxxxxxxxx xx xxxxx xxxxxxxxxxx.
+
+  Ran 1 shell xxxxxxx
+
+⏺ xx, xxxxx xx xx xxxxxx xxxxxxxxx xx xxxxx xxxxxxxxxxx. xxxxxxxx xxxx xxxxxx x xxx xxx xxxx
+  xxxxxx xxx xxxxxxxxxx xxxx. xxxxxxx xx xxxxx xxxx xxxxxxxx xxxxx, xxxxxx, xx xxx xxx xx.
+
+  xxxx xx xxxx xxx xxxx xxxx xxxxxx. xxx xxxx xxxxxxx xxxxxx xx xxxx xxxx:
+
+  - xxxx xxxxxx xx ~/.xxxxx-xxxx/xxxxx-xxxx-xxxx/ xxxxxxx xxxxx xx xxxxx xxxx xxxx xxx xxx
+    xxx xxxxx xxxxxxxx xxx xxxxxx xxxxxxxxx.
+  - xxx xxxxx xxxxxxxxx xx xxxx xxxxxxx xxx xxx xxx xxxxxxx xxx xxxxx xxxxxx xxx xxxxxxx xx
+    xxxx.
+
+  xx xxx xxxxxxxx xxxxx xx: xxxx xxxx xxxx xxxx xxxx, xxxx xxx xxxxxxxx xxxx xx xxx xxxx x
+  xxxxx xxxxxxxx xxx, xxxxx xxx xxxxxxx xx x xxxxx xxxxxx xxxxx, xxxx xxxxx xxxxxx xxxxxxx
+  xxxxx. xxxxxxxx xxxxx xxxxx xx xxxx xx xx xxxxx, xx xxxx xxxx xxxx.
+
+  xx xxx xxxxx xxxx xxxx xxxxxx xxxxx xx x xxxxxx xxxxxxxxx xxxxxxx xxxxxx xxxx xxxxx xxxxx,
+  xxxx xxxxxxx xxxxxxx xxxxxx. xxxx xxxx, xxxx xxxxxx xxx.
+
+✻ Xxxxxx for 15s · done 0:00 XX
+                                                     ✔ Xxxxxx xxxxxxxxx · Xxxxxxx xx xxxxxx
+────────────────────────────────────────────────────────────────────────────────────── xxxx ─
+❯ xx xxxx xxx xxxxxxxx xxx xx
+─────────────────────────────────────────────────────────────────────────────────────────────
+  [xxxxxxxx] x@xxxx:/Xxxxx/x | [Fable 5.1] ctx:0% in:00.0k out:000 0x:…
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

@@ -1,0 +1,375 @@
+package statedb
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"time"
+)
+
+// jsonStorageData mirrors session.StorageData for migration (avoids circular import).
+type jsonStorageData struct {
+	Instances []*jsonInstanceData `json:"instances"`
+	Groups    []*jsonGroupData    `json:"groups,omitempty"`
+	UpdatedAt time.Time           `json:"updated_at"`
+}
+
+// jsonInstanceData mirrors session.InstanceData for migration.
+type jsonInstanceData struct {
+	ID              string    `json:"id"`
+	Title           string    `json:"title"`
+	ProjectPath     string    `json:"project_path"`
+	GroupPath       string    `json:"group_path"`
+	Order           int       `json:"order"`
+	ParentSessionID string    `json:"parent_session_id,omitempty"`
+	Command         string    `json:"command"`
+	Wrapper         string    `json:"wrapper,omitempty"`
+	Tool            string    `json:"tool"`
+	Status          string    `json:"status"`
+	CreatedAt       time.Time `json:"created_at"`
+	LastAccessedAt  time.Time `json:"last_accessed_at,omitempty"`
+	TmuxSession     string    `json:"tmux_session"`
+
+	WorktreePath     string `json:"worktree_path,omitempty"`
+	WorktreeRepoRoot string `json:"worktree_repo_root,omitempty"`
+	WorktreeBranch   string `json:"worktree_branch,omitempty"`
+
+	ClaudeSessionID  string    `json:"claude_session_id,omitempty"`
+	ClaudeDetectedAt time.Time `json:"claude_detected_at,omitempty"`
+
+	GeminiSessionID  string    `json:"gemini_session_id,omitempty"`
+	GeminiDetectedAt time.Time `json:"gemini_detected_at,omitempty"`
+	GeminiYoloMode   *bool     `json:"gemini_yolo_mode,omitempty"`
+	GeminiModel      string    `json:"gemini_model,omitempty"`
+
+	OpenCodeSessionID  string    `json:"opencode_session_id,omitempty"`
+	OpenCodeDetectedAt time.Time `json:"opencode_detected_at,omitempty"`
+
+	CodexSessionID  string    `json:"codex_session_id,omitempty"`
+	CodexDetectedAt time.Time `json:"codex_detected_at,omitempty"`
+
+	LatestPrompt              string          `json:"latest_prompt,omitempty"`
+	Notes                     string          `json:"notes,omitempty"`
+	ToolOptionsJSON           json.RawMessage `json:"tool_options,omitempty"`
+	LoadedMCPNames            []string        `json:"loaded_mcp_names,omitempty"`
+	Channels                  []string        `json:"channels,omitempty"`
+	Plugins                   []string        `json:"plugins,omitempty"`
+	PluginChannelLinkDisabled bool            `json:"plugin_channel_link_disabled,omitempty"`
+	AutoLinkedChannels        []string        `json:"auto_linked_channels,omitempty"`
+	ExtraArgs                 []string        `json:"extra_args,omitempty"`
+	Sandbox                   json.RawMessage `json:"sandbox,omitempty"`
+	SandboxContainer          string          `json:"sandbox_container,omitempty"`
+}
+
+// jsonGroupData mirrors session.GroupData for migration.
+type jsonGroupData struct {
+	Name          string `json:"name"`
+	Path          string `json:"path"`
+	Expanded      bool   `json:"expanded"`
+	Order         int    `json:"order"`
+	DefaultPath   string `json:"default_path,omitempty"`
+	MaxConcurrent int    `json:"max_concurrent,omitempty"`
+}
+
+// toolDataBlob is the JSON structure stored in the tool_data column.
+type toolDataBlob struct {
+	ClaudeSessionID           string          `json:"claude_session_id,omitempty"`
+	ClaudeDetectedAt          int64           `json:"claude_detected_at,omitempty"`
+	GeminiSessionID           string          `json:"gemini_session_id,omitempty"`
+	GeminiDetectedAt          int64           `json:"gemini_detected_at,omitempty"`
+	GeminiYoloMode            *bool           `json:"gemini_yolo_mode,omitempty"`
+	GeminiModel               string          `json:"gemini_model,omitempty"`
+	OpenCodeSessionID         string          `json:"opencode_session_id,omitempty"`
+	OpenCodeDetectedAt        int64           `json:"opencode_detected_at,omitempty"`
+	CodexSessionID            string          `json:"codex_session_id,omitempty"`
+	CodexDetectedAt           int64           `json:"codex_detected_at,omitempty"`
+	LatestPrompt              string          `json:"latest_prompt,omitempty"`
+	Notes                     string          `json:"notes,omitempty"`
+	LoadedMCPNames            []string        `json:"loaded_mcp_names,omitempty"`
+	Channels                  []string        `json:"channels,omitempty"`
+	Plugins                   []string        `json:"plugins,omitempty"`
+	PluginChannelLinkDisabled bool            `json:"plugin_channel_link_disabled,omitempty"`
+	AutoLinkedChannels        []string        `json:"auto_linked_channels,omitempty"`
+	ExtraArgs                 []string        `json:"extra_args,omitempty"`
+	ToolOptions               json.RawMessage `json:"tool_options,omitempty"`
+	Sandbox                   json.RawMessage `json:"sandbox,omitempty"`
+	SandboxContainer          string          `json:"sandbox_container,omitempty"`
+	SSHHost                   string          `json:"ssh_host,omitempty"`
+	SSHRemotePath             string          `json:"ssh_remote_path,omitempty"`
+	// Multi-repo support
+	MultiRepoEnabled   bool                    `json:"multi_repo_enabled,omitempty"`
+	AdditionalPaths    []string                `json:"additional_paths,omitempty"`
+	MultiRepoTempDir   string                  `json:"multi_repo_temp_dir,omitempty"`
+	MultiRepoWorktrees []multiRepoWorktreeBlob `json:"multi_repo_worktrees,omitempty"`
+	// Presentation
+	Color string `json:"color,omitempty"` // issue #391 — per-session TUI row tint
+
+	// ContextLevel is the per-session context-level override (issue #2260),
+	// written/read via internal/session/context_level_persist.go. Listed here
+	// (not used directly by MigrateFromJSON) purely so toolDataKnownKeys sees
+	// it as typed-schema-authoritative: an explicit clear (`session set <id>
+	// context-level ""`, which omits the key) must win over the stored row,
+	// the same way Color and other omitempty scalar fields already in this
+	// struct do — MergeToolDataExtras would otherwise treat the omission as
+	// "a binary that doesn't know this key" and resurrect the old value.
+	ContextLevel string `json:"context_level,omitempty"`
+}
+
+// multiRepoWorktreeBlob is the JSON representation of a multi-repo worktree in tool_data.
+type multiRepoWorktreeBlob struct {
+	OriginalPath string `json:"original_path"`
+	WorktreePath string `json:"worktree_path"`
+	RepoRoot     string `json:"repo_root"`
+	Branch       string `json:"branch"`
+}
+
+// MigrateFromJSON reads a sessions.json file and inserts all data into the StateDB.
+// Returns the number of instances and groups migrated.
+func MigrateFromJSON(jsonPath string, db *StateDB) (int, int, error) {
+	data, err := os.ReadFile(jsonPath)
+	if err != nil {
+		return 0, 0, fmt.Errorf("read json: %w", err)
+	}
+
+	var storage jsonStorageData
+	if err := json.Unmarshal(data, &storage); err != nil {
+		return 0, 0, fmt.Errorf("parse json: %w", err)
+	}
+
+	// Convert instances
+	rows := make([]*InstanceRow, 0, len(storage.Instances))
+	for _, inst := range storage.Instances {
+		td := toolDataBlob{
+			ClaudeSessionID:           inst.ClaudeSessionID,
+			GeminiSessionID:           inst.GeminiSessionID,
+			GeminiYoloMode:            inst.GeminiYoloMode,
+			GeminiModel:               inst.GeminiModel,
+			OpenCodeSessionID:         inst.OpenCodeSessionID,
+			CodexSessionID:            inst.CodexSessionID,
+			LatestPrompt:              inst.LatestPrompt,
+			Notes:                     inst.Notes,
+			LoadedMCPNames:            inst.LoadedMCPNames,
+			Channels:                  inst.Channels,  // pre-existing omission, fixed alongside Plugins
+			ExtraArgs:                 inst.ExtraArgs, // pre-existing omission, fixed alongside Plugins
+			Plugins:                   inst.Plugins,
+			PluginChannelLinkDisabled: inst.PluginChannelLinkDisabled,
+			AutoLinkedChannels:        inst.AutoLinkedChannels,
+			ToolOptions:               inst.ToolOptionsJSON,
+			Sandbox:                   inst.Sandbox,
+			SandboxContainer:          inst.SandboxContainer,
+		}
+		if !inst.ClaudeDetectedAt.IsZero() {
+			td.ClaudeDetectedAt = inst.ClaudeDetectedAt.Unix()
+		}
+		if !inst.GeminiDetectedAt.IsZero() {
+			td.GeminiDetectedAt = inst.GeminiDetectedAt.Unix()
+		}
+		if !inst.OpenCodeDetectedAt.IsZero() {
+			td.OpenCodeDetectedAt = inst.OpenCodeDetectedAt.Unix()
+		}
+		if !inst.CodexDetectedAt.IsZero() {
+			td.CodexDetectedAt = inst.CodexDetectedAt.Unix()
+		}
+
+		tdJSON, err := json.Marshal(td)
+		if err != nil {
+			return 0, 0, fmt.Errorf("marshal tool_data for %s: %w", inst.ID, err)
+		}
+
+		rows = append(rows, &InstanceRow{
+			ID:              inst.ID,
+			Title:           inst.Title,
+			ProjectPath:     inst.ProjectPath,
+			GroupPath:       inst.GroupPath,
+			Order:           inst.Order,
+			Command:         inst.Command,
+			Wrapper:         inst.Wrapper,
+			Tool:            inst.Tool,
+			Status:          inst.Status,
+			TmuxSession:     inst.TmuxSession,
+			CreatedAt:       inst.CreatedAt,
+			LastAccessed:    inst.LastAccessedAt,
+			ParentSessionID: inst.ParentSessionID,
+			WorktreePath:    inst.WorktreePath,
+			WorktreeRepo:    inst.WorktreeRepoRoot,
+			WorktreeBranch:  inst.WorktreeBranch,
+			ToolData:        tdJSON,
+		})
+	}
+
+	if err := db.SaveInstances(rows); err != nil {
+		return 0, 0, fmt.Errorf("save instances: %w", err)
+	}
+
+	// Convert groups
+	groupRows := make([]*GroupRow, 0, len(storage.Groups))
+	for _, g := range storage.Groups {
+		groupRows = append(groupRows, &GroupRow{
+			Path:          g.Path,
+			Name:          g.Name,
+			Expanded:      g.Expanded,
+			Order:         g.Order,
+			DefaultPath:   g.DefaultPath,
+			MaxConcurrent: g.MaxConcurrent,
+		})
+	}
+
+	if len(groupRows) > 0 {
+		if err := db.SaveGroups(groupRows); err != nil {
+			return 0, 0, fmt.Errorf("save groups: %w", err)
+		}
+	}
+
+	return len(rows), len(groupRows), nil
+}
+
+// MarshalToolData creates a tool_data JSON blob from individual fields.
+// This is the forward path: Instance fields -> JSON blob for SQLite storage.
+//
+// INVARIANT, load-bearing for every sticky key: this blob is merged on write by
+// MergeToolDataExtras, which reads OMISSION of a sticky key as "this writer has
+// not observed the value, preserve what is on disk" and an EXPLICIT empty value
+// as a deliberate clear. Anything that produces a tool_data blob has to keep
+// that distinction — writing an empty string for a value it simply does not
+// know wipes a live binding another process just recorded, and dropping a key
+// it does know resurrects a stale one. See stickyToolDataKeys and
+// tool_data_extras.go.
+// MultiRepoWorktreeData holds multi-repo worktree info for serialization.
+type MultiRepoWorktreeData struct {
+	OriginalPath string
+	WorktreePath string
+	RepoRoot     string
+	Branch       string
+}
+
+func MarshalToolData(
+	claudeSessionID string, claudeDetectedAt time.Time,
+	geminiSessionID string, geminiDetectedAt time.Time,
+	geminiYoloMode *bool, geminiModel string,
+	openCodeSessionID string, openCodeDetectedAt time.Time,
+	codexSessionID string, codexDetectedAt time.Time,
+	latestPrompt string, notes string, loadedMCPNames []string,
+	toolOptionsJSON json.RawMessage,
+	sandboxJSON json.RawMessage, sandboxContainer string,
+	sshHost string, sshRemotePath string,
+	multiRepoEnabled bool, additionalPaths []string,
+	multiRepoTempDir string, multiRepoWorktrees []MultiRepoWorktreeData,
+	channels []string,
+	extraArgs []string,
+	plugins []string, // RFC docs/rfc/PLUGIN_ATTACH.md
+	pluginChannelLinkDisabled bool, // RFC docs/rfc/PLUGIN_ATTACH.md §4.7
+	autoLinkedChannels []string, // RFC §4.7 — fixes G4/C2 stale autolink retention
+	color string, // issue #391
+) json.RawMessage {
+	td := toolDataBlob{
+		ClaudeSessionID:           claudeSessionID,
+		GeminiSessionID:           geminiSessionID,
+		GeminiYoloMode:            geminiYoloMode,
+		GeminiModel:               geminiModel,
+		OpenCodeSessionID:         openCodeSessionID,
+		CodexSessionID:            codexSessionID,
+		LatestPrompt:              latestPrompt,
+		Notes:                     notes,
+		LoadedMCPNames:            loadedMCPNames,
+		Channels:                  channels,
+		Plugins:                   plugins,
+		PluginChannelLinkDisabled: pluginChannelLinkDisabled,
+		AutoLinkedChannels:        autoLinkedChannels,
+		ExtraArgs:                 extraArgs,
+		ToolOptions:               toolOptionsJSON,
+		Sandbox:                   sandboxJSON,
+		SandboxContainer:          sandboxContainer,
+		SSHHost:                   sshHost,
+		SSHRemotePath:             sshRemotePath,
+		MultiRepoEnabled:          multiRepoEnabled,
+		AdditionalPaths:           additionalPaths,
+		MultiRepoTempDir:          multiRepoTempDir,
+		Color:                     color,
+	}
+	for _, wt := range multiRepoWorktrees {
+		td.MultiRepoWorktrees = append(td.MultiRepoWorktrees, multiRepoWorktreeBlob(wt))
+	}
+	if !claudeDetectedAt.IsZero() {
+		td.ClaudeDetectedAt = claudeDetectedAt.Unix()
+	}
+	if !geminiDetectedAt.IsZero() {
+		td.GeminiDetectedAt = geminiDetectedAt.Unix()
+	}
+	if !openCodeDetectedAt.IsZero() {
+		td.OpenCodeDetectedAt = openCodeDetectedAt.Unix()
+	}
+	if !codexDetectedAt.IsZero() {
+		td.CodexDetectedAt = codexDetectedAt.Unix()
+	}
+	data, _ := json.Marshal(td)
+	return data
+}
+
+// UnmarshalToolData extracts individual fields from the tool_data JSON blob.
+// This is the reverse path: JSON blob from SQLite -> individual Instance fields.
+func UnmarshalToolData(data json.RawMessage) (
+	claudeSessionID string, claudeDetectedAt time.Time,
+	geminiSessionID string, geminiDetectedAt time.Time,
+	geminiYoloMode *bool, geminiModel string,
+	openCodeSessionID string, openCodeDetectedAt time.Time,
+	codexSessionID string, codexDetectedAt time.Time,
+	latestPrompt string, notes string, loadedMCPNames []string,
+	toolOptionsJSON json.RawMessage,
+	sandboxJSON json.RawMessage, sandboxContainer string,
+	sshHost string, sshRemotePath string,
+	multiRepoEnabled bool, additionalPaths []string,
+	multiRepoTempDir string, multiRepoWorktrees []MultiRepoWorktreeData,
+	channels []string,
+	extraArgs []string,
+	plugins []string, // RFC docs/rfc/PLUGIN_ATTACH.md
+	pluginChannelLinkDisabled bool, // RFC docs/rfc/PLUGIN_ATTACH.md §4.7
+	autoLinkedChannels []string, // RFC §4.7 — fixes G4/C2 stale autolink retention
+	color string, // issue #391
+) {
+	if len(data) == 0 {
+		return
+	}
+	var td toolDataBlob
+	if err := json.Unmarshal(data, &td); err != nil {
+		return
+	}
+	color = td.Color
+	claudeSessionID = td.ClaudeSessionID
+	if td.ClaudeDetectedAt > 0 {
+		claudeDetectedAt = time.Unix(td.ClaudeDetectedAt, 0)
+	}
+	geminiSessionID = td.GeminiSessionID
+	if td.GeminiDetectedAt > 0 {
+		geminiDetectedAt = time.Unix(td.GeminiDetectedAt, 0)
+	}
+	geminiYoloMode = td.GeminiYoloMode
+	geminiModel = td.GeminiModel
+	openCodeSessionID = td.OpenCodeSessionID
+	if td.OpenCodeDetectedAt > 0 {
+		openCodeDetectedAt = time.Unix(td.OpenCodeDetectedAt, 0)
+	}
+	codexSessionID = td.CodexSessionID
+	if td.CodexDetectedAt > 0 {
+		codexDetectedAt = time.Unix(td.CodexDetectedAt, 0)
+	}
+	latestPrompt = td.LatestPrompt
+	notes = td.Notes
+	loadedMCPNames = td.LoadedMCPNames
+	channels = td.Channels
+	plugins = td.Plugins
+	pluginChannelLinkDisabled = td.PluginChannelLinkDisabled
+	autoLinkedChannels = td.AutoLinkedChannels
+	extraArgs = td.ExtraArgs
+	toolOptionsJSON = td.ToolOptions
+	sandboxJSON = td.Sandbox
+	sandboxContainer = td.SandboxContainer
+	sshHost = td.SSHHost
+	sshRemotePath = td.SSHRemotePath
+	multiRepoEnabled = td.MultiRepoEnabled
+	additionalPaths = td.AdditionalPaths
+	multiRepoTempDir = td.MultiRepoTempDir
+	for _, wt := range td.MultiRepoWorktrees {
+		multiRepoWorktrees = append(multiRepoWorktrees, MultiRepoWorktreeData(wt))
+	}
+	return
+}

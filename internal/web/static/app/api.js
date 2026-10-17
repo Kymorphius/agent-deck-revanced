@@ -1,0 +1,68 @@
+// api.js -- Shared fetch helper for mutation API calls
+// Applies the auth token from auth.js and handles JSON parsing uniformly.
+// Imports only leaf modules (auth.js, toasts.js) so state.js can import
+// apiFetch without forming an import cycle.
+import { authTokenSignal } from './auth.js'
+import { addToast } from './toasts.js'
+
+// authHeaders returns the headers every /api/ request must carry.
+//
+// The bearer token lives only in authTokenSignal (main.js reads it from the
+// URL and strips it), so any call site that hand-rolls its own fetch silently
+// drops it and 401s the moment the server is started with --token/--token-file.
+// That is exactly how the MCP pane broke: it had a private copy of this helper
+// that never grew the Authorization header. Every /api/ caller must go through
+// apiFetch or at minimum spread authHeaders() — see
+// TestAppScriptsUseTheSharedAuthenticatedFetch for the regression gate.
+export function authHeaders(extra) {
+  const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json', ...extra }
+  const token = authTokenSignal.value
+  if (token) headers['Authorization'] = 'Bearer ' + token
+  return headers
+}
+
+export async function apiFetch(method, path, body) {
+  const headers = authHeaders()
+  let res
+  try {
+    res = await fetch(path, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    })
+  } catch (err) {
+    const msg = 'Network error: ' + (err.message || 'request failed')
+    addToast(msg)
+    throw new Error(msg)
+  }
+  const data = await res.json()
+  if (!res.ok) {
+    const msg = data?.error?.message || res.statusText
+    // Only show toast for mutation errors (not GET requests, which are often background)
+    if (method !== 'GET') addToast(msg)
+    throw new Error(msg)
+  }
+  return data
+}
+
+// matrix/hardened: uploadSessionImage posts one image file as the raw request
+// body to /api/sessions/{id}/image and resolves to the absolute path the host
+// stored it under (see terminalImage.js). The server sniffs the type from the
+// bytes; Content-Type here is informational only.
+export async function uploadSessionImage(sessionId, file) {
+  let res
+  try {
+    res = await fetch('/api/sessions/' + encodeURIComponent(sessionId) + '/image', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': file.type || 'application/octet-stream' }),
+      body: file,
+    })
+  } catch (err) {
+    throw new Error('Network error: ' + (err.message || 'upload failed'))
+  }
+  const data = await res.json().catch(() => null)
+  if (!res.ok || !data?.path) {
+    throw new Error(data?.error?.message || res.statusText || 'upload failed')
+  }
+  return data.path
+}

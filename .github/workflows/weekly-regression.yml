@@ -1,0 +1,374 @@
+# Weekly regression check: runs visual regression + Lighthouse CI on a schedule.
+# On failure, creates a GitHub issue with diff images and failed metrics.
+# On success, stays silent (no noise).
+#
+# Alert-only by design (TEST-E requirement). Does NOT create fix PRs,
+# update baselines, or run any automated fix agent. Auto-fix is deferred
+# to v1.6+ per Pitfall 15 research.
+#
+# Manual trigger:
+#   gh workflow run weekly-regression.yml
+#   Or: GitHub Actions UI > Weekly Regression Check > Run workflow
+#
+# Baseline regeneration (the ONLY supported way to produce committed
+# baselines — they must be generated on the CI runner environment):
+#   gh workflow run weekly-regression.yml --ref <branch> -f update_baselines=true
+#   Then download the visual-baselines-<run_id> artifact and commit its
+#   contents to tests/e2e/visual-regression/__screenshots__/.
+#   update_baselines runs Playwright with --update-snapshots, uploads the
+#   regenerated screenshots as an artifact, and skips Lighthouse + issue
+#   creation. skip_issue=true runs the normal checks but never files an issue.
+#
+# Configure assignee:
+#   Edit the `assignees: [context.repo.owner]` line in the "Create or update
+#   regression issue" step to assign to a different user or team.
+#
+# Local testing:
+#   Render the template with test values and pipe through the format validator:
+#   cat tests/ci/sample-weekly-issue.txt | tests/ci/weekly-alert-format.test.sh
+#
+# Artifacts:
+#   After each run, screenshots and Lighthouse reports are uploaded as
+#   GitHub Actions artifacts with 30-day retention. Find them at:
+#   https://github.com/asheshgoplani/agent-deck/actions/workflows/weekly-regression.yml
+#
+# Dependencies:
+#   - Visual regression config from Plan 10-01 (pw-visual-regression.config.ts)
+#   - Lighthouse CI config from Plan 10-02 (.lighthouserc.json)
+#   - If those config files are renamed, update the test steps below accordingly.
+
+name: Weekly Regression Check
+
+on:
+  schedule:
+    # Every Sunday at midnight UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+    # Manual trigger for testing the workflow itself, regenerating
+    # baselines, or running checks without filing an issue.
+    inputs:
+      update_baselines:
+        description: 'Regenerate visual baselines (--update-snapshots), upload them as an artifact, and skip issue creation'
+        type: boolean
+        default: false
+      skip_issue:
+        description: 'Run the checks but skip creating/updating the regression issue'
+        type: boolean
+        default: false
+
+# Every job here builds or launches the agent-deck binary. Since v1.16.7 a
+# TUI or daemon installs a newer release on its own and restarts in place;
+# a release landing mid-run must never hijack a test (issue #2251). The
+# binary also refuses under go test, CI=true and without a TTY, this is the
+# one switch that covers every spawn in this workflow.
+env:
+  AGENTDECK_SKIP_UPDATE_CHECK: "1"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: weekly-regression
+  cancel-in-progress: false
+
+jobs:
+  regression-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+        env:
+          GOTOOLCHAIN: go1.25.13
+
+      - name: Build binary
+        run: make build
+        env:
+          GOTOOLCHAIN: go1.25.13
+
+      - name: Build headless test server
+        # The main `agent-deck web` subcommand falls through to a Bubble Tea
+        # TUI launch, which under `&` background + no-TTY fails with
+        # "cancelreader: add reader to epoll interest list" and kills the
+        # process before /healthz can respond. `agent-deck-test-server` is
+        # the TUI-less entry point built for exactly this case.
+        # See cmd/agent-deck-test-server/main.go and issue #943.
+        run: go build -o ./build/agent-deck-test-server ./cmd/agent-deck-test-server
+        env:
+          GOTOOLCHAIN: go1.25.13
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install test dependencies
+        working-directory: tests/e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Install Lighthouse CI
+        run: npm install -g @lhci/cli@0.15.1
+
+      - name: Start test server
+        run: |
+          AGENTDECK_PROFILE=_ci_weekly \
+            ./build/agent-deck web --no-tui --listen 127.0.0.1:18420 --token test &
+          SERVER_PID=$!
+          echo "SERVER_PID=$SERVER_PID" >> $GITHUB_ENV
+          # Wait for /healthz (up to 30 seconds)
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:18420/healthz > /dev/null 2>&1; then
+              echo "Server ready after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "ERROR: Server failed to start within 30s"
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run visual regression tests
+        # Skipped in baseline-regeneration mode (see the next two steps).
+        # NOTE: `inputs.*` is empty for scheduled runs, so `!= true` keeps
+        # the cron behavior identical.
+        if: inputs.update_baselines != true
+        id: visual
+        continue-on-error: true
+        working-directory: tests/e2e
+        run: |
+          npx playwright test --config=pw-visual-regression.config.ts --reporter=json
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:18420/?token=test
+          PLAYWRIGHT_JSON_OUTPUT_DIR: /tmp
+          PLAYWRIGHT_JSON_OUTPUT_NAME: visual-results.json
+
+      - name: Regenerate visual baselines
+        # Baseline-regeneration mode (workflow_dispatch + update_baselines).
+        # Regenerates EVERY baseline on the CI runner — the canonical
+        # rendering environment — and uploads them as an artifact for a
+        # human to review and commit. Never pushes anything itself.
+        if: inputs.update_baselines == true
+        working-directory: tests/e2e
+        run: |
+          npx playwright test --config=pw-visual-regression.config.ts --update-snapshots
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:18420/?token=test
+
+      - name: Upload regenerated baselines
+        if: inputs.update_baselines == true
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: visual-baselines-${{ github.run_id }}
+          retention-days: 30
+          path: tests/e2e/visual-regression/__screenshots__/
+
+      - name: Run Lighthouse CI
+        if: inputs.update_baselines != true
+        id: lighthouse
+        continue-on-error: true
+        run: |
+          lhci autorun --config=.lighthouserc.json 2>&1 | tee /tmp/lighthouse-results.txt
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: weekly-regression-${{ github.run_id }}
+          retention-days: 30
+          path: |
+            tests/e2e/test-results/
+            tests/e2e/visual/__screenshots__/
+            /tmp/visual-results.json
+            /tmp/lighthouse-results.txt
+            .lighthouseci/
+
+      - name: Stop test server
+        if: always()
+        run: |
+          if [ -n "${SERVER_PID:-}" ]; then
+            kill "$SERVER_PID" 2>/dev/null || true
+          fi
+
+      - name: Create or update regression issue
+        # Skipped when regenerating baselines or when skip_issue is set.
+        # `inputs.*` is empty for scheduled runs, so the cron path is unchanged.
+        if: >-
+          (steps.visual.outcome == 'failure' || steps.lighthouse.outcome == 'failure') &&
+          inputs.update_baselines != true &&
+          inputs.skip_issue != true
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const { renderVisualDetails } = require(
+              `${process.env.GITHUB_WORKSPACE}/.github/scripts/render-visual-details.js`
+            );
+
+            // --- Read visual results (recursive suite walk, see #1674) ---
+            let rawVisual = null;
+            try {
+              rawVisual = fs.readFileSync('/tmp/visual-results.json', 'utf8');
+            } catch (e) {
+              rawVisual = null;
+            }
+            const visual = renderVisualDetails(rawVisual);
+            const visualDetails = visual.details;
+
+            // --- Compute failure count and statuses ---
+            // A visual step failure only counts as a regression when the
+            // Playwright report actually contains test results. A missing or
+            // empty report is "NO DATA (skipped)": it is surfaced in the issue
+            // body if Lighthouse failed, but it never files an issue by itself.
+            const visualOutcome = '${{ steps.visual.outcome }}';
+            const lighthouseOutcome = '${{ steps.lighthouse.outcome }}';
+            let visualStatus;
+            if (visualOutcome === 'success') {
+              visualStatus = 'PASS';
+            } else if (visual.noData) {
+              visualStatus = 'NO DATA (skipped)';
+            } else {
+              visualStatus = 'FAIL';
+            }
+            const lighthouseStatus = lighthouseOutcome === 'success' ? 'PASS' : 'FAIL';
+            let failureCount = 0;
+            if (visualStatus === 'FAIL') failureCount++;
+            if (lighthouseOutcome !== 'success') failureCount++;
+
+            if (failureCount === 0) {
+              core.info(
+                `No countable failures (visual: ${visualStatus}, lighthouse: ${lighthouseStatus}); not filing an issue.`
+              );
+              return;
+            }
+
+            let lighthouseDetails = 'No detailed results available.';
+            try {
+              const raw = fs.readFileSync('/tmp/lighthouse-results.txt', 'utf8');
+              const lines = raw.split('\n').filter(l =>
+                l.includes('assert') || l.includes('PASS') || l.includes('FAIL') ||
+                l.includes('score') || l.includes('numericValue')
+              );
+              if (lines.length > 0) {
+                lighthouseDetails = '```\n' + lines.join('\n') + '\n```';
+              }
+            } catch (e) {
+              lighthouseDetails = `Could not parse Lighthouse results: ${e.message}`;
+            }
+
+            // --- Build issue body from template ---
+            const today = new Date().toISOString().split('T')[0];
+            const commitSha = context.sha.substring(0, 7);
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const artifactsUrl = `${runUrl}/artifacts`;
+
+            let template;
+            try {
+              template = fs.readFileSync('.github/weekly-regression-issue-template.md', 'utf8');
+            } catch (e) {
+              // Fallback inline template if file is missing
+              template = [
+                '## Summary',
+                '',
+                '- **Visual regression:** {{VISUAL_STATUS}}',
+                '- **Lighthouse CI:** {{LIGHTHOUSE_STATUS}}',
+                '- **Total failures:** {{FAILURE_COUNT}}',
+                '- **Date:** {{DATE}}',
+                '',
+                '## Visual Regression Results',
+                '',
+                '{{VISUAL_DETAILS}}',
+                '',
+                '## Lighthouse CI Results',
+                '',
+                '{{LIGHTHOUSE_DETAILS}}',
+                '',
+                '## Artifacts',
+                '',
+                '- [Test artifacts]({{ARTIFACTS_URL}})',
+                '',
+                'Screenshots, diff images, and Lighthouse HTML reports are attached as workflow artifacts.',
+                '',
+                '## Run Details',
+                '',
+                '- **Workflow run:** {{RUN_URL}}',
+                '- **Branch:** {{BRANCH}}',
+                '- **Commit:** {{COMMIT_SHA}} — {{COMMIT_MSG}}',
+                '',
+                'Labels: regression, automated',
+              ].join('\n');
+            }
+
+            // Get commit message
+            let commitMsg = 'unknown';
+            try {
+              const commit = await github.rest.repos.getCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: context.sha,
+              });
+              commitMsg = commit.data.commit.message.split('\n')[0];
+            } catch (e) {
+              commitMsg = `(could not fetch: ${e.message})`;
+            }
+
+            // Substitute placeholders
+            const body = template
+              .replace(/\{\{DATE\}\}/g, today)
+              .replace(/\{\{FAILURE_COUNT\}\}/g, String(failureCount))
+              .replace(/\{\{VISUAL_STATUS\}\}/g, visualStatus)
+              .replace(/\{\{VISUAL_DETAILS\}\}/g, visualDetails)
+              .replace(/\{\{LIGHTHOUSE_STATUS\}\}/g, lighthouseStatus)
+              .replace(/\{\{LIGHTHOUSE_DETAILS\}\}/g, lighthouseDetails)
+              .replace(/\{\{ARTIFACTS_URL\}\}/g, artifactsUrl)
+              .replace(/\{\{RUN_URL\}\}/g, runUrl)
+              .replace(/\{\{BRANCH\}\}/g, context.ref.replace('refs/heads/', ''))
+              .replace(/\{\{COMMIT_SHA\}\}/g, commitSha)
+              .replace(/\{\{COMMIT_MSG\}\}/g, commitMsg);
+
+            const title = `Weekly regression check: ${failureCount} failure(s) detected [${today}]`;
+
+            // --- Idempotency: check for existing open issue ---
+            const existingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'regression,automated',
+              per_page: 5,
+            });
+
+            const existing = existingIssues.data.find(i =>
+              i.title.startsWith('Weekly regression check:')
+            );
+
+            if (existing) {
+              // Append comment to existing issue instead of creating duplicate
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: `## Update: ${today}\n\n${body}`,
+              });
+              core.info(`Appended comment to existing issue #${existing.number}`);
+            } else {
+              // Create new issue
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['regression', 'automated'],
+                assignees: [context.repo.owner],
+              });
+              core.info(`Created issue #${created.data.number}: ${created.data.html_url}`);
+            }

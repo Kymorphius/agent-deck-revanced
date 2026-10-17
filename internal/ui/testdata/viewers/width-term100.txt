@@ -1,0 +1,2 @@
+terminal_width=100 list_width=35
+   └─ ● a genuinely long sess… ◉ 2

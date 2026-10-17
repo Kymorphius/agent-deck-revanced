@@ -1,0 +1,989 @@
+package ui
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/session"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// ConfirmType indicates what action is being confirmed
+type ConfirmType int
+
+const (
+	ConfirmDeleteSession ConfirmType = iota
+	ConfirmCloseSession
+	ConfirmDeleteGroup
+	ConfirmQuitWithPool
+	ConfirmCreateDirectory
+	ConfirmInstallHooks
+	ConfirmDeleteRemoteSession
+	ConfirmCloseRemoteSession
+	ConfirmArchiveRemoteSession
+	ConfirmUnarchiveRemoteSession
+	ConfirmRemoveSession     // status-gated registry-only remove (TUI 'X')
+	ConfirmBulkRemoveErrored // bulk remove of all errored sessions (TUI Ctrl+X)
+	ConfirmArchiveSession
+	ConfirmUnarchiveSession
+	ConfirmNotice // acknowledge-only message (single OK button), e.g. protected-action blocks
+	ConfirmInstallHermesHooks
+	ConfirmDeleteRemoteGroup // delete a group on a remote deck (TUI 'd' on a remote group header)
+	ConfirmUpdateRemote      // push this controller's release to an older remote (TUI 'u' on its header, #2164)
+	ConfirmCrossHarnessTransfer
+	ConfirmSwitchAccount // Edit Session: same-harness account switch (restart, conversation carried over)
+	// ConfirmArchiveDestinationSwitch offers the explicit "archive destination
+	// copy and switch" retry after a switch was refused because the
+	// destination already holds a newer or genuinely divergent conversation
+	// that install could not prove stale. It is never a dead end.
+	ConfirmArchiveDestinationSwitch
+	ConfirmKillWindow
+)
+
+// ConfirmDialog handles confirmation for destructive actions
+type ConfirmDialog struct {
+	visible     bool
+	confirmType ConfirmType
+	targetID    string // Session ID or group path
+	targetName  string // Display name
+	width       int
+	height      int
+	mcpCount    int  // Number of running MCPs (for quit confirmation)
+	sandboxed   bool // Whether the session uses a Docker sandbox.
+	worktree    bool // Whether the session has an associated git worktree.
+	hookEvents  []string
+
+	remoteName string // Remote name for remote session confirmations.
+
+	// switchFrom is the account the session runs under now (ConfirmSwitchAccount).
+	switchFrom string
+
+	// Cross-harness transfer carries the explicit target selected in the edit
+	// dialog. The source remains in targetID and is not rewritten on confirm.
+	targetHarness  string
+	targetAccount  string
+	sourceSnapshot crossHarnessConfirmationSource
+	// remoteSource is the remote row a remote switch confirmation was opened
+	// for (remoteName set); the switch is cancelled when the row changed.
+	remoteSource session.RemoteSessionInfo
+	// switchWarnings are the remote preview's warnings (e.g. the target
+	// harness missing on that host); the local preview shows none here.
+	switchWarnings []string
+
+	windowIndex int    // Tmux window index for ConfirmKillWindow.
+	windowID    string // Tmux window id (e.g. "@12") captured when the dialog opened, for ConfirmKillWindow.
+
+	// Notice (ConfirmNotice) carries an acknowledge-only title/body.
+	noticeTitle string
+	noticeBody  string
+
+	// focusedButton tracks which button has arrow-key focus.
+	// 0 = confirm (left), 1 = cancel (right).
+	// For ConfirmQuitWithPool: 0 = keep, 1 = shutdown.
+	focusedButton int
+	// buttonCount is the number of selectable buttons for the current dialog.
+	buttonCount int
+
+	// Pending session creation data (for ConfirmCreateDirectory)
+	pendingSessionName       string
+	pendingSessionPath       string
+	pendingSessionCommand    string
+	pendingSessionGroupPath  string
+	pendingToolOptionsJSON   json.RawMessage // Generic tool options (claude, codex, etc.)
+	pendingClaudeExtraArgs   []string        // User-supplied claude CLI tokens
+	pendingClaudeStartQuery  string          // Per-session claude startup query (v1.7.67, #725)
+	pendingClaudeAccount     string          // Per-session named account slot (#924)
+	pendingLaunchModelID     string          // Optional per-session model/version override.
+	pendingParentSessionID   string
+	pendingParentProjectPath string
+}
+
+// NewConfirmDialog creates a new confirmation dialog
+func NewConfirmDialog() *ConfirmDialog {
+	return &ConfirmDialog{}
+}
+
+// ShowDeleteSession shows confirmation for session deletion.
+func (c *ConfirmDialog) ShowDeleteSession(sessionID string, sessionName string, sandboxed, worktree bool) {
+	c.visible = true
+	c.confirmType = ConfirmDeleteSession
+	c.targetID = sessionID
+	c.targetName = sessionName
+	c.sandboxed = sandboxed
+	c.worktree = worktree
+	c.buttonCount = 2
+	c.focusedButton = 1 // default to Cancel
+}
+
+// ShowKillWindow shows confirmation for killing a tmux window (sub-tab)
+// inside a session. windowIndex, windowName and windowID (the stable tmux
+// window id, e.g. "@12") all describe the one cached row the user selected;
+// the dialog shows id and name so the user confirms a specific window, and
+// confirm re-verifies both live before killing anything.
+func (c *ConfirmDialog) ShowKillWindow(sessionID string, windowIndex int, windowName string, windowID string) {
+	c.visible = true
+	c.confirmType = ConfirmKillWindow
+	c.targetID = sessionID
+	c.targetName = windowName
+	c.windowIndex = windowIndex
+	c.windowID = windowID
+	c.buttonCount = 2
+	c.focusedButton = 1 // default to Cancel
+}
+
+// ShowKillWindowRefused replaces a kill-window confirmation with the reason
+// the kill was refused (last window, or the window changed since it was
+// selected). Shown in the modal because the footer error is clamped away on
+// a full viewport.
+func (c *ConfirmDialog) ShowKillWindowRefused(reason string) {
+	c.ShowNotice("⚠  Window Not Killed", reason+"\n\nNothing was closed.")
+}
+
+// ShowArchiveSession shows confirmation for archiving a session.
+func (c *ConfirmDialog) ShowArchiveSession(sessionID string, sessionName string) {
+	c.visible = true
+	c.confirmType = ConfirmArchiveSession
+	c.targetID = sessionID
+	c.targetName = sessionName
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowUnarchiveSession shows confirmation for restoring an archived session.
+func (c *ConfirmDialog) ShowUnarchiveSession(sessionID string, sessionName string) {
+	c.visible = true
+	c.confirmType = ConfirmUnarchiveSession
+	c.targetID = sessionID
+	c.targetName = sessionName
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowCloseSession shows confirmation for non-destructive session close.
+func (c *ConfirmDialog) ShowCloseSession(sessionID string, sessionName string, sandboxed bool) {
+	c.visible = true
+	c.confirmType = ConfirmCloseSession
+	c.targetID = sessionID
+	c.targetName = sessionName
+	c.sandboxed = sandboxed
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowDeleteRemoteSession shows confirmation for deleting a remote session.
+func (c *ConfirmDialog) ShowDeleteRemoteSession(remoteName, sessionID, sessionName string) {
+	c.visible = true
+	c.confirmType = ConfirmDeleteRemoteSession
+	c.targetID = sessionID
+	c.targetName = sessionName
+	c.remoteName = remoteName
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowDeleteRemoteGroup shows the delete confirmation for one of a remote's
+// own groups. targetID carries the remote-relative group path the remote's
+// `group delete` expects.
+func (c *ConfirmDialog) ShowDeleteRemoteGroup(remoteName, groupPath, groupName string) {
+	c.visible = true
+	c.confirmType = ConfirmDeleteRemoteGroup
+	c.targetID = groupPath
+	c.targetName = groupName
+	c.remoteName = remoteName
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowUpdateRemote asks before deploying this controller's release (to) onto a
+// remote that reported an older one (from). targetID carries the target
+// version and targetName the current one.
+func (c *ConfirmDialog) ShowUpdateRemote(remoteName, from, to string) {
+	c.visible = true
+	c.confirmType = ConfirmUpdateRemote
+	c.targetID = to
+	c.targetName = from
+	c.remoteName = remoteName
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowCloseRemoteSession shows confirmation for closing a remote session.
+func (c *ConfirmDialog) ShowCloseRemoteSession(remoteName, sessionID, sessionName string) {
+	c.visible = true
+	c.confirmType = ConfirmCloseRemoteSession
+	c.targetID = sessionID
+	c.targetName = sessionName
+	c.remoteName = remoteName
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowArchiveRemoteSession shows the archive confirmation for a remote session.
+// Same wording and keys as the local archive dialog, plus the remote name.
+func (c *ConfirmDialog) ShowArchiveRemoteSession(remoteName, sessionID, sessionName string) {
+	c.visible = true
+	c.confirmType = ConfirmArchiveRemoteSession
+	c.targetID = sessionID
+	c.targetName = sessionName
+	c.remoteName = remoteName
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowUnarchiveRemoteSession shows the unarchive confirmation for a remote session.
+func (c *ConfirmDialog) ShowUnarchiveRemoteSession(remoteName, sessionID, sessionName string) {
+	c.visible = true
+	c.confirmType = ConfirmUnarchiveRemoteSession
+	c.targetID = sessionID
+	c.targetName = sessionName
+	c.remoteName = remoteName
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowRemoveSession shows confirmation for status-gated registry removal (TUI 'X').
+// Safer than ConfirmDeleteSession: the caller has already verified the
+// session is stopped or errored, and the dialog wording reflects the
+// registry-only intent (transcripts + worktrees are preserved).
+func (c *ConfirmDialog) ShowRemoveSession(sessionID string, sessionName string) {
+	c.visible = true
+	c.confirmType = ConfirmRemoveSession
+	c.targetID = sessionID
+	c.targetName = sessionName
+	c.buttonCount = 2
+	c.focusedButton = 1 // default to Cancel
+}
+
+// ShowBulkRemoveErrored shows confirmation for removing all errored sessions
+// (TUI Ctrl+X). count is the number of errored sessions that will be removed.
+func (c *ConfirmDialog) ShowBulkRemoveErrored(count int) {
+	c.visible = true
+	c.confirmType = ConfirmBulkRemoveErrored
+	c.targetID = ""
+	c.targetName = ""
+	c.mcpCount = count // reuse mcpCount as a generic integer carrier
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowDeleteGroup shows confirmation for group deletion
+func (c *ConfirmDialog) ShowDeleteGroup(groupPath, groupName string) {
+	c.visible = true
+	c.confirmType = ConfirmDeleteGroup
+	c.targetID = groupPath
+	c.targetName = groupName
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowNotice shows an acknowledge-only message in the same centered modal used
+// for confirmations. Unlike a transient bottom-of-screen error banner (which the
+// final viewport clamp can truncate when the panel fills the height), this dialog
+// replaces the whole view while visible, so the message is always seen. Dismissed
+// with Enter/Esc/o.
+// crossHarnessConfirmationSource is the source identity which participates in
+// a transfer. It is captured before the disclosure is shown, so accepting the
+// modal cannot silently transfer a later incarnation.
+//
+// Status is deliberately NOT part of it. A live session's Status is refreshed
+// by the background poller (Running/Idle/Waiting) independently of anything
+// the operator does, so including it made a confirmation held open for one
+// poll tick cancel itself with "the source session changed while this
+// confirmation was open" - the switch then only landed on a retry that raced
+// the poller successfully. Status is liveness, not identity: it changes no
+// transcript, config dir, account or target, and the durable recovery guard
+// (sourceRecoveryIdentityMatches) already excludes it for the same reason.
+type crossHarnessConfirmationSource struct {
+	id, tool, account, project, title, group, command string
+	claudeID, codexID, workingDir                     string
+	lastStartedAt                                     time.Time
+}
+
+func snapshotCrossHarnessConfirmationSource(inst *session.Instance) crossHarnessConfirmationSource {
+	if inst == nil {
+		return crossHarnessConfirmationSource{}
+	}
+	return crossHarnessConfirmationSource{
+		id: inst.ID, tool: inst.Tool, account: inst.Account, project: inst.ProjectPath,
+		title: inst.Title, group: inst.GroupPath, command: inst.Command,
+		claudeID: inst.ClaudeSessionID, codexID: inst.CodexSessionID,
+		workingDir: inst.EffectiveWorkingDir(), lastStartedAt: inst.LastStartedAt,
+	}
+}
+
+func (s crossHarnessConfirmationSource) matches(inst *session.Instance) bool {
+	return inst != nil && s.id == inst.ID && s.tool == inst.Tool && s.account == inst.Account &&
+		s.project == inst.ProjectPath && s.title == inst.Title && s.group == inst.GroupPath &&
+		s.command == inst.Command && s.claudeID == inst.ClaudeSessionID &&
+		s.codexID == inst.CodexSessionID && s.workingDir == inst.EffectiveWorkingDir() &&
+		s.lastStartedAt.Equal(inst.LastStartedAt)
+}
+
+// remoteSwitchDetails adds what only a remote switch needs to say: the
+// whole operation runs on that host with its own slots, transcripts and
+// credentials, plus the remote preview's warnings.
+func (c *ConfirmDialog) remoteSwitchDetails() string {
+	if c.remoteName == "" {
+		return ""
+	}
+	out := fmt.Sprintf("\n• Runs on %s: its account slot, transcript and credentials stay there", c.remoteName)
+	for _, w := range c.switchWarnings {
+		out += "\n⚠ on " + c.remoteName + ": " + w
+	}
+	return out
+}
+
+func displayConfirmAccount(account string) string {
+	if strings.TrimSpace(account) == "" {
+		return "default"
+	}
+	return account
+}
+
+// ShowSwitchAccount asks before the Edit Session dialog moves a session to
+// another named account on the same harness. The switch stops the session,
+// carries its conversation into the target account's config dir and restarts
+// it, so it must never run from a plain "Enter save" without the user seeing
+// what is about to happen (the cross-harness path already asks via
+// ShowCrossHarnessTransfer). Default focus is Cancel.
+func (c *ConfirmDialog) ShowSwitchAccount(source *session.Instance, harness, account string) {
+	c.visible = true
+	c.confirmType = ConfirmSwitchAccount
+	c.remoteName, c.switchWarnings = "", nil
+	c.sourceSnapshot = snapshotCrossHarnessConfirmationSource(source)
+	c.targetID, c.targetName = c.sourceSnapshot.id, c.sourceSnapshot.title
+	c.targetHarness, c.targetAccount = harness, account
+	c.switchFrom = source.Account
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowCrossHarnessTransfer presents the lossy-context disclosure before a
+// fresh target can be created. Cancel is the default safe choice.
+func (c *ConfirmDialog) ShowCrossHarnessTransfer(source *session.Instance, harness, account string, losses []string) {
+	c.visible = true
+	c.confirmType = ConfirmCrossHarnessTransfer
+	c.remoteName, c.switchWarnings = "", nil
+	c.sourceSnapshot = snapshotCrossHarnessConfirmationSource(source)
+	c.targetID, c.targetName = c.sourceSnapshot.id, c.sourceSnapshot.title
+	c.targetHarness, c.targetAccount = harness, account
+	c.noticeBody = strings.Join(losses, "\n• ")
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowRemoteSwitchAccount is ShowSwitchAccount for a session a remote deck
+// owns: the same question, fed by the remote's own switch-preview, and the
+// switch runs on that host. warnings are the remote preview's warnings.
+func (c *ConfirmDialog) ShowRemoteSwitchAccount(remoteName string, source session.RemoteSessionInfo, harness, account string, warnings []string) {
+	c.visible = true
+	c.confirmType = ConfirmSwitchAccount
+	c.remoteName, c.remoteSource, c.switchWarnings = remoteName, source, warnings
+	c.sourceSnapshot = crossHarnessConfirmationSource{}
+	c.targetID, c.targetName = source.ID, source.Title
+	c.targetHarness, c.targetAccount = harness, account
+	c.switchFrom = source.Account
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowRemoteCrossHarnessTransfer is ShowCrossHarnessTransfer for a session a
+// remote deck owns; losses and warnings come from the remote's preview.
+func (c *ConfirmDialog) ShowRemoteCrossHarnessTransfer(remoteName string, source session.RemoteSessionInfo, harness, account string, losses, warnings []string) {
+	c.visible = true
+	c.confirmType = ConfirmCrossHarnessTransfer
+	c.remoteName, c.remoteSource, c.switchWarnings = remoteName, source, warnings
+	c.sourceSnapshot = crossHarnessConfirmationSource{tool: source.Tool}
+	c.targetID, c.targetName = source.ID, source.Title
+	c.targetHarness, c.targetAccount = harness, account
+	c.noticeBody = strings.Join(losses, "\n• ")
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// RemoteSourceMatches validates a remote switch confirmation against the
+// row the remote currently reports: identity, title, harness and slot must
+// be the ones the user confirmed.
+func (c *ConfirmDialog) RemoteSourceMatches(info *session.RemoteSessionInfo) bool {
+	return info != nil && c.remoteSource.ID == info.ID && c.remoteSource.Title == info.Title &&
+		c.remoteSource.Tool == info.Tool && c.remoteSource.Account == info.Account
+}
+
+// CrossHarnessSourceMatches validates the modal-time snapshot at acceptance,
+// before the asynchronous switch captures its own execution-time snapshot.
+func (c *ConfirmDialog) CrossHarnessSourceMatches(inst *session.Instance) bool {
+	return c.sourceSnapshot.matches(inst)
+}
+
+// ShowArchiveDestinationSwitch offers to archive an existing destination
+// transcript that a same-harness account switch could not prove stale (newer,
+// or diverging after its common prefix with the source) and retry. reason is
+// the refusal text from the failed attempt. Default focus is Cancel: this is
+// a data-preserving retry, not a routine action.
+func (c *ConfirmDialog) ShowArchiveDestinationSwitch(source *session.Instance, harness, account, reason string) {
+	c.visible = true
+	c.confirmType = ConfirmArchiveDestinationSwitch
+	c.sourceSnapshot = snapshotCrossHarnessConfirmationSource(source)
+	c.targetID, c.targetName = c.sourceSnapshot.id, c.sourceSnapshot.title
+	c.targetHarness, c.targetAccount = harness, account
+	c.switchFrom = source.Account
+	c.noticeBody = reason
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+func (c *ConfirmDialog) TargetHarness() string { return c.targetHarness }
+func (c *ConfirmDialog) TargetAccount() string { return c.targetAccount }
+
+func (c *ConfirmDialog) ShowNotice(title, body string) {
+	c.visible = true
+	c.confirmType = ConfirmNotice
+	c.noticeTitle = title
+	c.noticeBody = body
+	c.targetID = ""
+	c.targetName = ""
+	c.buttonCount = 1
+	c.focusedButton = 0
+}
+
+// ShowQuitWithPool shows confirmation for quitting with MCP pool running
+func (c *ConfirmDialog) ShowQuitWithPool(mcpCount int) {
+	c.visible = true
+	c.confirmType = ConfirmQuitWithPool
+	c.mcpCount = mcpCount
+	c.targetID = ""
+	c.targetName = ""
+	c.buttonCount = 2
+	c.focusedButton = 0 // default to "Keep running" (safe choice)
+}
+
+// ShowCreateDirectory shows confirmation for creating a missing directory.
+func (c *ConfirmDialog) ShowCreateDirectory(
+	path string,
+	sessionName string,
+	command string,
+	groupPath string,
+	toolOptionsJSON json.RawMessage,
+	claudeExtraArgs []string,
+	claudeStartQuery string,
+	claudeAccount string,
+	launchModelID string,
+	parentSessionID string,
+	parentProjectPath string,
+) {
+	c.visible = true
+	c.confirmType = ConfirmCreateDirectory
+	c.targetID = path
+	c.targetName = path
+	c.pendingSessionName = sessionName
+	c.pendingSessionPath = path
+	c.pendingSessionCommand = command
+	c.pendingSessionGroupPath = groupPath
+	c.pendingToolOptionsJSON = toolOptionsJSON
+	c.pendingClaudeExtraArgs = claudeExtraArgs
+	c.pendingClaudeStartQuery = claudeStartQuery
+	c.pendingClaudeAccount = claudeAccount
+	c.pendingLaunchModelID = launchModelID
+	c.pendingParentSessionID = parentSessionID
+	c.pendingParentProjectPath = parentProjectPath
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowInstallHooks shows confirmation for installing Claude Code hooks
+func (c *ConfirmDialog) ShowInstallHooks() {
+	c.visible = true
+	c.confirmType = ConfirmInstallHooks
+	c.targetID = ""
+	c.targetName = ""
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowInstallHermesHooks shows the Hermes-specific hook consent boundary.
+func (c *ConfirmDialog) ShowInstallHermesHooks(configPath string, events []string) {
+	c.visible = true
+	c.confirmType = ConfirmInstallHermesHooks
+	c.targetID = configPath
+	c.targetName = ""
+	c.hookEvents = append(c.hookEvents[:0], events...)
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// GetPendingSession returns the pending session creation data
+func (c *ConfirmDialog) GetPendingSession() (name, path, command, groupPath string, toolOptionsJSON json.RawMessage, claudeExtraArgs []string, claudeStartQuery, claudeAccount, launchModelID string, parentSessionID, parentProjectPath string) {
+	return c.pendingSessionName, c.pendingSessionPath, c.pendingSessionCommand, c.pendingSessionGroupPath, c.pendingToolOptionsJSON, c.pendingClaudeExtraArgs, c.pendingClaudeStartQuery, c.pendingClaudeAccount, c.pendingLaunchModelID, c.pendingParentSessionID, c.pendingParentProjectPath
+}
+
+// ShowCreateRemoteDirectory asks whether to create a directory the remote
+// reported missing (see session.IsRemotePathMissing) and retry the create
+// there with --create-dir. The pending dialog values stay on Home.
+func (c *ConfirmDialog) ShowCreateRemoteDirectory(remoteName, path string) {
+	c.visible = true
+	c.confirmType = ConfirmCreateDirectory
+	c.targetID = path
+	c.targetName = path
+	c.remoteName = remoteName
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// Hide hides the dialog.
+func (c *ConfirmDialog) Hide() {
+	c.visible = false
+	c.targetID = ""
+	c.targetName = ""
+	c.sandboxed = false
+	c.remoteName = ""
+	c.noticeTitle = ""
+	c.noticeBody = ""
+	c.hookEvents = nil
+}
+
+// IsVisible returns whether the dialog is visible
+func (c *ConfirmDialog) IsVisible() bool {
+	return c.visible
+}
+
+// GetTargetID returns the session ID or group path being confirmed
+func (c *ConfirmDialog) GetTargetID() string {
+	return c.targetID
+}
+
+// GetConfirmType returns the type of confirmation
+func (c *ConfirmDialog) GetConfirmType() ConfirmType {
+	return c.confirmType
+}
+
+// GetWindowIndex returns the tmux window index for ConfirmKillWindow.
+func (c *ConfirmDialog) GetWindowIndex() int {
+	return c.windowIndex
+}
+
+// GetWindowID returns the tmux window id captured when the ConfirmKillWindow
+// dialog opened, for re-verification at confirm time.
+func (c *ConfirmDialog) GetWindowID() string {
+	return c.windowID
+}
+
+// GetWindowName returns the window name shown in the ConfirmKillWindow
+// dialog, re-verified against the live window at confirm time.
+func (c *ConfirmDialog) GetWindowName() string {
+	return c.targetName
+}
+
+// GetRemoteName returns the remote name for remote session confirmations.
+func (c *ConfirmDialog) GetRemoteName() string {
+	return c.remoteName
+}
+
+// SetSize updates dialog dimensions
+func (c *ConfirmDialog) SetSize(width, height int) {
+	c.width = width
+	c.height = height
+}
+
+// GetFocusedButton returns the currently focused button index.
+func (c *ConfirmDialog) GetFocusedButton() int {
+	return c.focusedButton
+}
+
+// Update handles key events for arrow-key navigation between buttons.
+func (c *ConfirmDialog) Update(msg tea.KeyMsg) (*ConfirmDialog, tea.Cmd) {
+	switch msg.String() {
+	case "left", "h":
+		if c.focusedButton > 0 {
+			c.focusedButton--
+		}
+	case "right", "l", "tab":
+		if c.focusedButton < c.buttonCount-1 {
+			c.focusedButton++
+		}
+	}
+	return c, nil
+}
+
+// View renders the confirmation dialog
+func (c *ConfirmDialog) View() string {
+	if !c.visible {
+		return ""
+	}
+
+	// Build warning message and buttons based on action type
+	var title, warning, details string
+	var buttons string
+	var borderColor lipgloss.Color
+
+	// Styles (shared)
+	detailsStyle := lipgloss.NewStyle().
+		Foreground(ColorTextDim).
+		MarginBottom(1)
+
+	// Focused buttons get filled background; unfocused get dim outline.
+	renderButton := func(label string, bg lipgloss.Color, focused bool) string {
+		if focused {
+			return lipgloss.NewStyle().
+				Foreground(ColorBg).
+				Background(bg).
+				Padding(0, 2).
+				Bold(true).
+				Render("▸ " + label)
+		}
+		return lipgloss.NewStyle().
+			Foreground(bg).
+			Padding(0, 2).
+			Bold(true).
+			Render("  " + label)
+	}
+
+	hintStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+
+	switch c.confirmType {
+	case ConfirmDeleteSession:
+		title = "⚠  Delete Session?"
+		warning = fmt.Sprintf("This will remove the session from Agent Deck:\n\n  \"%s\"", c.targetName)
+		details = "• The tmux session will be terminated\n• Any running processes will be killed\n• Terminal history will be lost\n• Native conversation logs are kept (p permanently deletes them)"
+		if c.worktree {
+			details += "\n• The git worktree directory will be removed"
+		}
+		if c.sandboxed {
+			details += "\n• The Docker container will be removed"
+		}
+		details += "\n• Undo is available from the session list"
+		borderColor = ColorRed
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Delete", ColorRed, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y delete · p permanent delete (preview) · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmArchiveSession, ConfirmArchiveRemoteSession:
+		title = "Archive Session?"
+		warning = fmt.Sprintf("Archive this session:\n\n  \"%s\"", c.targetName)
+		details = "• The tmux process will be stopped\n• The session will move to the archived list\n• You can unarchive later (^ view, Shift+U restore)"
+		if c.confirmType == ConfirmArchiveRemoteSession {
+			title = "Archive Remote Session?"
+			warning = fmt.Sprintf("Archive this session:\n\n  \"%s\" on %s", c.targetName, c.remoteName)
+			details = "• The remote tmux process will be stopped\n• The session will move to the remote's archived list\n• You can unarchive later (^ view, Shift+U restore)"
+		}
+		borderColor = ColorYellow
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Archive", ColorYellow, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y archive · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmUnarchiveSession, ConfirmUnarchiveRemoteSession:
+		title = "Unarchive Session?"
+		warning = fmt.Sprintf("Restore this session to the active list:\n\n  \"%s\"", c.targetName)
+		if c.confirmType == ConfirmUnarchiveRemoteSession {
+			title = "Unarchive Remote Session?"
+			warning = fmt.Sprintf("Restore this session to the active list:\n\n  \"%s\" on %s", c.targetName, c.remoteName)
+		}
+		details = "• Metadata returns to the main session list\n• The process is not started automatically"
+		borderColor = ColorGreen
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Unarchive", ColorGreen, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y unarchive · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmCloseSession:
+		title = "Close Session?"
+		warning = fmt.Sprintf("This will close the running process for:\n\n  \"%s\"", c.targetName)
+		details = "• The tmux session will be terminated\n• Session metadata will be kept in the list\n• You can restart later from the session list"
+		if c.sandboxed {
+			details += "\n• The Docker container will be removed"
+		}
+		borderColor = ColorYellow
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Close", ColorYellow, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y close · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmKillWindow:
+		title = "⚠  Kill Window?"
+		warning = fmt.Sprintf("This will kill tmux window %d (%s):\n\n  \"%s\"", c.windowIndex, c.windowID, c.targetName)
+		details = "• Any processes in the window will be killed\n• Other windows in the session are unaffected"
+		borderColor = ColorRed
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Kill", ColorRed, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y kill · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmDeleteRemoteSession:
+		title = "⚠  Delete Remote Session?"
+		warning = fmt.Sprintf("This will permanently delete the remote session:\n\n  \"%s\" on %s", c.targetName, c.remoteName)
+		details = "• The remote tmux session will be terminated\n• Any running processes on the remote will be killed\n• Terminal history will be lost"
+		borderColor = ColorRed
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Delete", ColorRed, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y delete · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmDeleteRemoteGroup:
+		title = "⚠  Delete Remote Group?"
+		warning = fmt.Sprintf("This will delete the group on the remote:\n\n  \"%s\" on %s", c.targetID, c.remoteName)
+		details = "• Only an empty group is deleted\n• A group that still holds sessions is refused by the\n  remote; move them out first (M)"
+		borderColor = ColorRed
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Delete", ColorRed, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y delete · n cancel · ←/→ navigate · Enter select · Esc")))
+	case ConfirmUpdateRemote:
+		title = "Update Remote?"
+		warning = fmt.Sprintf("Update remote %s from v%s to v%s?", c.remoteName, c.targetName, c.targetID)
+		details = "• The release archive is checksum-verified before deploy\n• The remote is re-checked afterwards; a failure leaves its current binary\n• Running sessions on the remote keep running"
+		borderColor = ColorYellow
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Update", ColorYellow, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y update · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmCloseRemoteSession:
+		title = "Close Remote Session?"
+		warning = fmt.Sprintf("This will close the running process for:\n\n  \"%s\" on %s", c.targetName, c.remoteName)
+		details = "• The remote tmux session will be terminated\n• Session metadata will be kept on the remote\n• You can restart later"
+		borderColor = ColorYellow
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Close", ColorYellow, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y close · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmRemoveSession:
+		title = "Remove Session?"
+		warning = fmt.Sprintf("Remove this session from the registry:\n\n  \"%s\"", c.targetName)
+		details = "• The session record will be deleted from agent-deck\n• Claude transcripts (~/.claude/projects/) are preserved\n• Git worktrees are preserved (use 'd' to destroy them)"
+		borderColor = ColorYellow
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Remove", ColorYellow, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y remove · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmBulkRemoveErrored:
+		title = "Remove All Errored Sessions?"
+		warning = fmt.Sprintf("Remove %d errored session(s) from the registry.", c.mcpCount)
+		details = "• Only sessions currently in the 'error' state are affected\n• Claude transcripts are preserved\n• Git worktrees are preserved"
+		borderColor = ColorYellow
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Remove All", ColorYellow, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y remove · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmDeleteGroup:
+		title = "⚠  Delete Group?"
+		warning = fmt.Sprintf("This will delete the group:\n\n  \"%s\"", c.targetName)
+		details = "• All sessions will be MOVED to 'default' group\n• Sessions will NOT be killed\n• The group structure will be lost"
+		borderColor = ColorRed
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Delete", ColorRed, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y delete · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmQuitWithPool:
+		title = "MCP Pool Running"
+		warning = fmt.Sprintf("%d MCP servers are running in the pool.", c.mcpCount)
+		details = "Keep them running for faster startup next time,\nor shut down to free resources."
+		borderColor = ColorAccent
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Keep running", ColorGreen, c.focusedButton == 0), "  ",
+			renderButton("Shut down", ColorRed, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("k keep · s shut down · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmCreateDirectory:
+		title = "📁  Directory Not Found"
+		warning = fmt.Sprintf("The path does not exist:\n\n  %s", c.targetName)
+		if c.remoteName != "" {
+			warning = fmt.Sprintf("The path does not exist on remote %s:\n\n  %s", c.remoteName, c.targetName)
+		}
+		details = "Create this directory and start the session?"
+		borderColor = ColorAccent
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Create", ColorGreen, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorRed, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y create · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmCrossHarnessTransfer:
+		title = "Transfer Context to Fresh Target?"
+		if c.remoteName != "" {
+			title = "Transfer Context on " + c.remoteName + "?"
+		}
+		warning = fmt.Sprintf("%s → NEW %s target (account %s).\n\nThe source stays visible until the target is verified ready; it is then archived as superseded (reversible).", c.sourceSnapshot.tool, c.targetHarness, displayConfirmAccount(c.targetAccount))
+		details = "Not transferred:\n• " + c.noticeBody + "\n\nTarget readiness is pending until a target-native identity and ready event are observed."
+		details += c.remoteSwitchDetails()
+		borderColor = ColorYellow
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Transfer", ColorYellow, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y transfer · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmSwitchAccount:
+		title = "Switch Account?"
+		if c.remoteName != "" {
+			title = "Switch Account on " + c.remoteName + "?"
+		}
+		warning = fmt.Sprintf("Move this session to another %s account:\n\n  \"%s\"\n  %s  →  %s", c.targetHarness, c.targetName, displayConfirmAccount(c.switchFrom), displayConfirmAccount(c.targetAccount))
+		details = "• The session is stopped and restarted with its conversation carried over\n• Tools, MCPs, plugins and usage limits follow the new account\n• Authentication is not checked until the restarted harness reports ready"
+		details += c.remoteSwitchDetails()
+		borderColor = ColorYellow
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Switch", ColorYellow, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y switch · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmArchiveDestinationSwitch:
+		title = "Archive Destination Copy?"
+		warning = fmt.Sprintf("Move this session to another %s account:\n\n  \"%s\"\n  %s  →  %s", c.targetHarness, c.targetName, displayConfirmAccount(c.switchFrom), displayConfirmAccount(c.targetAccount))
+		details = "The target account already has a conversation for this session that is newer or has diverged:\n\n  " + c.noticeBody + "\n\n• Its current copy is archived alongside it as \"<file>.pre-switch-<timestamp>\", never deleted\n• The source conversation is then installed in its place and the switch proceeds"
+		borderColor = ColorRed
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Archive & Switch", ColorRed, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y archive & switch · n cancel · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmNotice:
+		title = c.noticeTitle
+		warning = c.noticeBody
+		borderColor = ColorYellow
+		buttons = lipgloss.JoinVertical(lipgloss.Left,
+			renderButton("OK", ColorAccent, true),
+			hintStyle.Render("Enter / Esc / o dismiss"))
+
+	case ConfirmInstallHooks:
+		title = "Claude Code Hooks"
+		warning = "Agent-deck can install Claude Code lifecycle hooks\nfor real-time status detection (instant green/yellow/gray)."
+		details = "This writes to your Claude settings.json (preserves existing settings).\nNew/restarted sessions will use hooks; existing sessions continue unchanged.\nYou can disable later with: hooks_enabled = false in config.toml"
+		borderColor = ColorAccent
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Install", ColorGreen, c.focusedButton == 0), "  ",
+			renderButton("Skip", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y install · n skip · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmInstallHermesHooks:
+		title = "Hermes Agent Hooks"
+		warning = "Agent-deck can install Hermes lifecycle hooks\nfor real-time status detection (instant green/yellow/gray)."
+		details = fmt.Sprintf("Config: %s\nCommand: agent-deck hook-handler\nEvents: %s\nHermes runs this command with your user permissions and sends each event as JSON on stdin.\nExisting settings and hooks are preserved.", c.targetID, strings.Join(c.hookEvents, ", "))
+		borderColor = ColorAccent
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Install", ColorGreen, c.focusedButton == 0), "  ",
+			renderButton("Skip", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y install · n skip · ←/→ navigate · Enter select · Esc")))
+	}
+
+	// Title style
+	titleStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(borderColor).
+		MarginBottom(1)
+
+	// Warning style
+	warningStyle := lipgloss.NewStyle().
+		Foreground(ColorYellow).
+		MarginBottom(1)
+
+	// Build content
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		titleStyle.Render(title),
+		warningStyle.Render(warning),
+		detailsStyle.Render(details),
+		"",
+		buttons,
+	)
+
+	// Dialog box
+	dialogWidth := 50
+	if c.width > 0 && c.width < dialogWidth+10 {
+		dialogWidth = c.width - 10
+	}
+
+	dialogBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(borderColor).
+		Padding(1, 2).
+		Width(dialogWidth).
+		Render(content)
+
+	// Center in screen
+	if c.width > 0 && c.height > 0 {
+		// Create full-screen overlay with centered dialog
+		dialogHeight := lipgloss.Height(dialogBox)
+		dialogWidth := lipgloss.Width(dialogBox)
+
+		padLeft := (c.width - dialogWidth) / 2
+		if padLeft < 0 {
+			padLeft = 0
+		}
+		padTop := (c.height - dialogHeight) / 2
+		if padTop < 0 {
+			padTop = 0
+		}
+
+		// Build centered dialog
+		var b strings.Builder
+		for i := 0; i < padTop; i++ {
+			b.WriteString("\n")
+		}
+		for _, line := range strings.Split(dialogBox, "\n") {
+			b.WriteString(strings.Repeat(" ", padLeft))
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+
+		return b.String()
+	}
+
+	return dialogBox
+}
+
+// nbsp is a non-breaking space. ansi.Wordwrap excludes U+00A0 from its
+// breakable-space check, so substituting it for an ordinary space pins two
+// words onto the same rendered line.
+const nbsp = "\u00a0"
+
+// glueHintGroups joins the words within each " · "-separated key-group of a
+// footer hint with a non-breaking space, so a narrow dialog can only wrap at a
+// group boundary and never splits a key from its label (e.g. "Enter" /
+// "select" on a 50-col confirm dialog). The " · " separators themselves keep
+// their ordinary, breakable spaces.
+func glueHintGroups(hint string) string {
+	return glueGroups(hint, " · ")
+}
+
+// glueBracketHintGroups is glueHintGroups' counterpart for "[Key] Label  ..."
+// style hints (double-space-separated groups, e.g. the search dialog's
+// footer): it glues the single space between each bracketed key and its label,
+// while leaving the double-space group separators breakable.
+func glueBracketHintGroups(hint string) string {
+	return glueGroups(hint, "  ")
+}
+
+// glueGroups splits hint on sep, replaces every ordinary space inside each
+// group with a non-breaking one, and rejoins with sep — a plain string
+// transform with no rendering side effects.
+func glueGroups(hint, sep string) string {
+	groups := strings.Split(hint, sep)
+	for i, g := range groups {
+		groups[i] = strings.ReplaceAll(g, " ", nbsp)
+	}
+	return strings.Join(groups, sep)
+}

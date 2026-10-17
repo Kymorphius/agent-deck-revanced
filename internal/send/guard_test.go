@@ -1,0 +1,250 @@
+package send
+
+import (
+	"errors"
+	"strings"
+	"testing"
+	"time"
+)
+
+// renderComposer renders a minimal Claude-style composer block holding text as
+// the current input. An empty text renders the empty composer ("❯ ").
+func renderComposer(text string) string {
+	div := strings.Repeat("─", 40)
+	return "some prior output\n" + div + "\n❯ " + text + "\n" + div + "\n  auto mode on\n"
+}
+
+func TestComposerDraft_EmptyComposer(t *testing.T) {
+	draft, visible := ComposerDraft(renderComposer(""), nil)
+	if !visible {
+		t.Fatal("expected composer to be visible")
+	}
+	if draft != "" {
+		t.Fatalf("expected empty draft, got %q", draft)
+	}
+}
+
+func TestComposerDraft_WithOperatorDraft(t *testing.T) {
+	draft, visible := ComposerDraft(renderComposer("instruct deploy ag"), nil)
+	if !visible {
+		t.Fatal("expected composer to be visible")
+	}
+	if draft != "instruct deploy ag" {
+		t.Fatalf("expected operator draft, got %q", draft)
+	}
+}
+
+func TestComposerDraft_SuggestionPlaceholderIsNotADraft(t *testing.T) {
+	// Claude's idle composer shows a hint suggestion like:
+	//   ❯ Try "write a test for <filepath>"
+	// which must not be treated as operator input (issue #1409).
+	draft, visible := ComposerDraft(renderComposer(`Try "write a test for <filepath>"`), nil)
+	if !visible {
+		t.Fatal("expected composer to be visible")
+	}
+	if draft != "" {
+		t.Fatalf("expected placeholder to yield empty draft, got %q", draft)
+	}
+}
+
+func TestComposerDraft_NoComposerVisible(t *testing.T) {
+	_, visible := ComposerDraft("plain shell output\nno prompt here\n", nil)
+	if visible {
+		t.Fatal("did not expect a composer in plain output")
+	}
+}
+
+func TestComposerHasDraft(t *testing.T) {
+	if ComposerHasDraft(renderComposer(""), nil) {
+		t.Fatal("empty composer must not report a draft")
+	}
+	if !ComposerHasDraft(renderComposer("half-typed message"), nil) {
+		t.Fatal("expected composer draft to be reported")
+	}
+	if ComposerHasDraft(renderComposer(`Try "fix lint errors"`), nil) {
+		t.Fatal("placeholder must not report a draft")
+	}
+	if ComposerHasDraft("plain output, no composer", nil) {
+		t.Fatal("no composer must not report a draft")
+	}
+}
+
+// fakeGuardTarget scripts pane captures for GuardComposerDraft. captures[i] is
+// returned by the i-th CapturePaneFresh call; the last entry repeats once
+// exhausted. When clearOnCtrlC is set, every capture after a SendCtrlC call
+// returns an empty composer (simulating Claude clearing the input on Ctrl+C).
+type fakeGuardTarget struct {
+	captures     []string
+	captureErr   error
+	ctrlCErr     error
+	clearOnCtrlC bool
+
+	captureCalls int
+	ctrlCCalls   int
+}
+
+func (f *fakeGuardTarget) CapturePaneFresh() (string, error) {
+	i := f.captureCalls
+	f.captureCalls++
+	if f.captureErr != nil {
+		return "", f.captureErr
+	}
+	if f.clearOnCtrlC && f.ctrlCCalls > 0 {
+		return renderComposer(""), nil
+	}
+	if len(f.captures) == 0 {
+		return "", nil
+	}
+	if i >= len(f.captures) {
+		i = len(f.captures) - 1
+	}
+	return f.captures[i], nil
+}
+
+func (f *fakeGuardTarget) SendCtrlC() error {
+	f.ctrlCCalls++
+	return f.ctrlCErr
+}
+
+func TestGuardComposerDraft_ProceedsImmediatelyWhenComposerEmpty(t *testing.T) {
+	target := &fakeGuardTarget{captures: []string{renderComposer("")}}
+	res := GuardComposerDraft(target, ComposerGuardOptions{
+		HoldWait: time.Second, PollInterval: time.Millisecond, ClearWait: time.Millisecond,
+	})
+	if res.SavedDraft != "" || res.DraftCleared || res.ClearFailed {
+		t.Fatalf("expected clean pass-through, got %+v", res)
+	}
+	if target.captureCalls != 1 {
+		t.Fatalf("expected a single capture, got %d", target.captureCalls)
+	}
+	if target.ctrlCCalls != 0 {
+		t.Fatalf("must not Ctrl+C an empty composer, got %d calls", target.ctrlCCalls)
+	}
+}
+
+func TestGuardComposerDraft_ProceedsWhenNoComposerVisible(t *testing.T) {
+	target := &fakeGuardTarget{captures: []string{"codex>\nplain output\n"}}
+	res := GuardComposerDraft(target, ComposerGuardOptions{
+		HoldWait: time.Second, PollInterval: time.Millisecond, ClearWait: time.Millisecond,
+	})
+	if res.SavedDraft != "" || target.ctrlCCalls != 0 {
+		t.Fatalf("expected pass-through for non-introspectable pane, got %+v (ctrlC=%d)", res, target.ctrlCCalls)
+	}
+}
+
+func TestGuardComposerDraft_HoldsUntilOperatorDraftClears(t *testing.T) {
+	target := &fakeGuardTarget{captures: []string{
+		renderComposer("instruct deploy ag"),
+		renderComposer("instruct deploy ag"),
+		renderComposer(""), // operator submitted or cleared their draft
+	}}
+	res := GuardComposerDraft(target, ComposerGuardOptions{
+		HoldWait: 5 * time.Second, PollInterval: time.Millisecond, ClearWait: time.Millisecond,
+	})
+	if res.SavedDraft != "" {
+		t.Fatalf("draft cleared on its own; nothing should be saved, got %q", res.SavedDraft)
+	}
+	if target.ctrlCCalls != 0 {
+		t.Fatalf("must not Ctrl+C when the hold succeeds, got %d calls", target.ctrlCCalls)
+	}
+	if target.captureCalls != 3 {
+		t.Fatalf("expected 3 captures (held twice), got %d", target.captureCalls)
+	}
+}
+
+func TestGuardComposerDraft_RefusesAtHoldBound(t *testing.T) {
+	target := &fakeGuardTarget{captures: []string{renderComposer("operator draft")}, clearOnCtrlC: true}
+	for i := 0; i < 3; i++ {
+		res := GuardComposerDraft(target, ComposerGuardOptions{HoldWait: time.Millisecond, PollInterval: time.Millisecond})
+		if !res.Refused || res.SavedDraft != "" || res.DraftCleared || target.ctrlCCalls != 0 {
+			t.Fatalf("must refuse without changing input: %+v, interrupts=%d", res, target.ctrlCCalls)
+		}
+	}
+}
+
+func TestGuardComposerDraft_RepeatedRefusalNeverInterrupts(t *testing.T) {
+	target := &fakeGuardTarget{captures: []string{renderComposer("operator draft")}, clearOnCtrlC: true}
+	for i := 0; i < 3; i++ {
+		res := GuardComposerDraft(target, ComposerGuardOptions{HoldWait: time.Millisecond, PollInterval: time.Millisecond})
+		if !res.Refused || res.SavedDraft != "" || res.DraftCleared || target.ctrlCCalls != 0 {
+			t.Fatalf("must refuse without changing input: %+v, interrupts=%d", res, target.ctrlCCalls)
+		}
+	}
+}
+
+func TestGuardComposerDraft_CaptureErrorRefusesWithoutMutation(t *testing.T) {
+	target := &fakeGuardTarget{captureErr: errors.New("pane gone")}
+	res := GuardComposerDraft(target, ComposerGuardOptions{
+		HoldWait: time.Second, PollInterval: time.Millisecond, ClearWait: time.Millisecond,
+	})
+	if !res.Refused || res.SavedDraft != "" || res.ClearFailed || target.ctrlCCalls != 0 {
+		t.Fatalf("capture errors must refuse without mutating the pane, got %+v (ctrlC=%d)", res, target.ctrlCCalls)
+	}
+}
+
+func TestGuardComposerDraft_StripIsApplied(t *testing.T) {
+	// The guard receives raw pane bytes; when a Strip function is supplied it
+	// must be applied before composer introspection.
+	marker := "\x1b[31m"
+	target := &fakeGuardTarget{captures: []string{marker + renderComposer("")}}
+	res := GuardComposerDraft(target, ComposerGuardOptions{
+		HoldWait: time.Second, PollInterval: time.Millisecond, ClearWait: time.Millisecond,
+		Strip: func(s string) string { return strings.ReplaceAll(s, marker, "") },
+	})
+	if res.SavedDraft != "" || target.ctrlCCalls != 0 {
+		t.Fatalf("expected stripped empty composer to pass through, got %+v", res)
+	}
+}
+
+// Issue #1777: the guard's last pre-send observation is the provenance
+// evidence the attribution gate uses to tell agent-deck's own collapsed paste
+// from a foreign one parked in the composer.
+func TestGuardComposerDraft_ReportsComposerPasteMarkerFree(t *testing.T) {
+	empty := &fakeGuardTarget{captures: []string{renderComposer("")}}
+	if res := GuardComposerDraft(empty, ComposerGuardOptions{
+		HoldWait: time.Second, PollInterval: time.Millisecond, ClearWait: time.Millisecond,
+	}); !res.ComposerPasteMarkerFree {
+		t.Fatal("an empty composer before the send means a later paste marker is ours")
+	}
+
+	parked := &fakeGuardTarget{
+		captures: []string{renderComposer("[Pasted text #1 +89 lines]")},
+		ctrlCErr: errors.New("ctrl-c failed"),
+	}
+	if res := GuardComposerDraft(parked, ComposerGuardOptions{
+		HoldWait: 0, PollInterval: time.Millisecond, ClearWait: time.Millisecond,
+	}); res.ComposerPasteMarkerFree {
+		t.Fatal("a paste marker still parked in the composer must not be reported as clear")
+	}
+
+	broken := &fakeGuardTarget{captureErr: errors.New("pane gone")}
+	if res := GuardComposerDraft(broken, ComposerGuardOptions{
+		HoldWait: time.Second, PollInterval: time.Millisecond, ClearWait: time.Millisecond,
+	}); res.ComposerPasteMarkerFree {
+		t.Fatal("a capture failure yields no provenance evidence; must fail safe")
+	}
+}
+
+// #1778 review findings 1+2: a non-introspectable pane (no ❯ composer to
+// scope to — codex/cursor, or a transiently unreadable Claude pane) that
+// still shows a foreign "[Pasted text ...]" marker anywhere in the whole-pane
+// scan must be held with NO Ctrl+C attempt and must NOT be reported as
+// ComposerPasteMarkerFree. Before the fix, the save-clear path discarded the
+// visible bit from ComposerDraft, sent a blind Ctrl+C into a pane it never
+// confirmed had a composer, and then granted ComposerPasteMarkerFree because
+// ComposerHasDraft is trivially false for !visible.
+func TestGuardComposerDraft_NonIntrospectablePaneWithForeignMarkerNeverClears(t *testing.T) {
+	target := &fakeGuardTarget{captures: []string{"codex>\n[Pasted text #1 +42 lines]\nplain output\n"}}
+	res := GuardComposerDraft(target, ComposerGuardOptions{
+		HoldWait: 0, PollInterval: time.Millisecond, ClearWait: time.Millisecond,
+	})
+	if target.ctrlCCalls != 0 {
+		t.Fatalf("must not Ctrl+C a pane with no introspectable composer, got %d calls", target.ctrlCCalls)
+	}
+	if res.ComposerPasteMarkerFree {
+		t.Fatal("provenance cannot be established on a non-introspectable pane; must fail safe")
+	}
+	if res.DraftCleared || res.SavedDraft != "" {
+		t.Fatalf("nothing to save or clear on a non-introspectable pane, got %+v", res)
+	}
+}

@@ -1,0 +1,85 @@
+# Binaries
+bin/
+build/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/agent-deck
+out/
+
+# Test binary
+*.test
+
+# Output of go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+node_modules/
+
+# Playwright
+tests/e2e/node_modules/
+tests/e2e/playwright-report/
+tests/e2e/test-results/
+
+# Go workspace file
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config
+.env
+.env.local
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+/.claude/plans/
+
+# Agent Deck data (for development)
+.agent-deck/
+
+# VS Code extensions data
+.serena/
+
+# Personal/local files
+.mcp.json
+.playwright-mcp/
+*.screenstudio/
+
+.worktrees
+.worktree/
+agent-deck-test
+
+# Tailwind brute-force diff gate scratch file (make css temp artifact)
+internal/web/static/.brute-tw.src.css
+/dist
+
+# Python bytecode (scripts/watchdog/ + conductor/tests/)
+__pycache__/
+*.pyc
+
+# Claude harness (per-session state, never committed)
+.claude/scheduled_tasks.lock
+.claude/worktrees/
+
+# Local brainstorming/design docs (not committed)
+docs/superpowers/
+RESULTS/
+
+# sentrux structural baseline (issue #2148); generated, never committed
+.sentrux/
+
+# matrix/hardened: machine-specific notes, never committed (repo is public)
+MATRIX-LOCAL.md

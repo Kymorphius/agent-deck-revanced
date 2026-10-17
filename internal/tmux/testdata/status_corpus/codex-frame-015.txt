@@ -1,0 +1,8 @@
+• Compacting context (0s • esc to interrupt)
+  └ X xxx x xxxx x xxxxx
+    xxxxxx
+
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol default · /xxx/xxxxxxx

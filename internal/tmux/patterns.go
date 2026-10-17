@@ -1,0 +1,634 @@
+package tmux
+
+import (
+	"fmt"
+	"log/slog"
+	"regexp"
+	"strings"
+
+	"github.com/asheshgoplani/agent-deck/internal/logging"
+)
+
+var patternLog = logging.ForComponent(logging.CompStatus)
+
+// RawPatterns holds string-form patterns before compilation.
+// Patterns prefixed with "re:" are compiled as regex; everything else uses strings.Contains.
+type RawPatterns struct {
+	BusyPatterns   []string // plain strings + "re:" prefixed regex
+	PromptPatterns []string
+	SpinnerChars   []string
+	WhimsicalWords []string
+}
+
+// ResolvedPatterns holds the compiled, ready-to-use patterns for status detection.
+type ResolvedPatterns struct {
+	BusyStrings   []string
+	BusyRegexps   []*regexp.Regexp
+	PromptStrings []string
+	PromptRegexps []*regexp.Regexp
+	SpinnerChars  []string
+
+	// Pre-built combo patterns (from WhimsicalWords + SpinnerChars)
+	ThinkingPattern         *regexp.Regexp
+	ThinkingPatternEllipsis *regexp.Regexp
+	SpinnerActivePattern    *regexp.Regexp
+}
+
+// DefaultRawPatterns returns the built-in detection patterns for a known tool.
+// Returns nil for unknown tools (they have no defaults).
+func DefaultRawPatterns(toolName string) *RawPatterns {
+	switch strings.ToLower(toolName) {
+	case "claude":
+		return &RawPatterns{
+			BusyPatterns: []string{
+				`re:(?m)^[✳✽✶✻✢·]\s*.+…`, // PRIMARY: spinner + ellipsis (Claude 2.1.25+) — anchored to line start to prevent mid-line · in welcome banner from false-positiving
+				"ctrl+c to interrupt",    // SECONDARY: explicit busy text (current Claude)
+				"esc to interrupt",       // FALLBACK: older Claude Code versions
+			},
+			SpinnerChars:   defaultSpinnerChars(),
+			WhimsicalWords: defaultWhimsicalWords(),
+		}
+	case "gemini":
+		return &RawPatterns{
+			BusyPatterns:   []string{"esc to cancel"},
+			PromptPatterns: []string{"gemini>", "Type your message"},
+		}
+	case "opencode":
+		return &RawPatterns{
+			BusyPatterns: []string{
+				"esc interrupt",
+				"esc to exit",
+				"thinking...",
+				"generating...",
+				"building tool call...",
+				"waiting for tool response...",
+			},
+			PromptPatterns: []string{
+				"Ask anything",
+				"press enter to send",
+				"enter submit", // question tool / permission approval help bar (#255)
+				"esc dismiss",  // question tool cancel affordance (#255)
+			},
+			SpinnerChars: []string{"█", "▓", "▒", "░"},
+		}
+	case "codex":
+		return &RawPatterns{
+			BusyPatterns: []string{
+				// The live status line above the composer ("• Working (9m 41s •
+				// esc to interrupt)") is matched by codexLiveStatusLine, which is
+				// anchored to the composer so transcript text cannot trigger it.
+				"ctrl+c to interrupt",
+				"esc to interrupt",
+				"press esc to interrupt",
+			},
+			PromptPatterns: []string{"How can I help", "codex>", "Continue?", `re:(?m)^\s*›\s`},
+		}
+	case "codewhale":
+		// codewhale CLI (deepseek-v4-pro TUI, #1577). The codex preset's
+		// patterns never match the deepseek TUI, so a codewhale worker driven
+		// by a conductor was always misread as idle and `session send --wait`
+		// timed out. Busy is authoritative in the detector (checked before
+		// prompt), so the always-visible composer placeholder "Write a task
+		// or use /." cannot mask a working session.
+		//
+		// Captured live:
+		//   busy footer:  "... (waiting for deepseek deepseek-v4-pro, 2s/300s idle timeout)"
+		//                 "... · working (2s)"
+		//   idle footer:  no busy marker; composer placeholder visible
+		return &RawPatterns{
+			BusyPatterns:   []string{"waiting for deepseek", "working (", "idle timeout"},
+			PromptPatterns: []string{"Write a task or use"},
+		}
+	case "deepseek":
+		// DeepSeek Harness (`dsh`, npm @deepseek-ai/dsh), verified against
+		// 0.1.0-rc.6 in a sandboxed HOME. The shipped profiles are not a REPL,
+		// so these patterns describe what those two surfaces actually print:
+		//
+		//   web      one ready line, then silence:  "dsh web: http://127.0.0.1:3080"
+		//            The server is idle-but-alive from that line onward, which
+		//            is "waiting" — a prompt pattern, not a busy one.
+		//   headless streams nothing until it prints the final assistant text;
+		//            the whole run is busy, and the pane's own liveness is the
+		//            authoritative signal. Its terminal failures are handled
+		//            elsewhere: credential codes by the auth-failure scanner,
+		//            usage errors by the process simply exiting.
+		//
+		// Deliberately NOT a prompt pattern: "Usage: dsh". That is the HELP
+		// screen, which dsh prints on --help and exits 0 — a real usage failure
+		// prints `error: a task is required, …` or `error: unknown option '…'`
+		// instead, so treating the help banner as a waiting prompt described a
+		// state that never occurs (PR #1942 adversarial review).
+		//
+		// Busy is checked before prompt in the detector, so the ready banner
+		// cannot mask a run that is still working.
+		//
+		// PROVENANCE — the two fields are not equally evidenced, and saying so is
+		// the point (PR #1942 adversarial review):
+		//
+		//   PromptPatterns  CAPTURED. `dsh web --port 0` printed exactly
+		//                   "dsh web: http://127.0.0.1:39949", then served.
+		//
+		//   BusyPatterns    INFERRED, not captured. Neither shipped profile prints
+		//                   them: web emits one line and goes quiet, headless
+		//                   streams nothing until its final answer. They are the
+		//                   near-universal convention among the terminal agents
+		//                   this repo already supports (claude, codex, copilot,
+		//                   cursor and pi all use one or both), carried here as a
+		//                   default for an INSTALLED interactive profile, whose
+		//                   vocabulary agent-deck cannot know in advance. They cost
+		//                   nothing when absent — a pane that never prints them
+		//                   relies on the liveness signal — and a user whose
+		//                   profile says something else overrides through
+		//                   [tools.<name>] busy_patterns, which merge over this.
+		return &RawPatterns{
+			BusyPatterns: []string{
+				"ctrl+c to interrupt",
+				"esc to interrupt",
+			},
+			PromptPatterns: []string{
+				`re:(?mi)^dsh web:\s+https?://`,
+			},
+		}
+	case "omp":
+		// Oh My Pi (github.com/can1357/oh-my-pi). PROVENANCE — CAPTURED LIVE
+		// against the real installed binary (v17.3.8) via a PTY-driven omp
+		// session (not inferred from docs):
+		//
+		//   Busy    "⠋ Working… ⟨esc⟩" (generic) or "⠴ Echo hi ⟨esc⟩" (tool-
+		//           derived label). The stable anchor across every busy state
+		//           is the literal "⟨esc⟩" marker (U+27E8/U+27E9 angle
+		//           brackets), which is distinct from every other registered
+		//           tool's ascii "esc to interrupt" phrasing.
+		//   Waiting "Allow tool: bash\nCommand: echo hi\n\n  Approve\n   Deny\n\n
+		//           up/down navigate  enter select  esc cancel" — captured by
+		//           launching with --approval-mode always-ask and triggering
+		//           a bash tool call.
+		//
+		// No distinct idle-only literal string was found: the idle status bar
+		// is visually identical (same box-drawn border) whether busy or not,
+		// differing only in the presence/absence of the spinner+"⟨esc⟩" line
+		// beneath it, which BusyPatterns already covers. This mirrors "pi"
+		// and "deepseek", which also rely on busy-pattern absence for idle.
+		return &RawPatterns{
+			BusyPatterns: []string{
+				`re:⟨esc⟩`,
+			},
+			PromptPatterns: []string{
+				`re:(?m)^\s*Allow tool:\s`,
+			},
+			SpinnerChars: []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"},
+		}
+	case "pi":
+		return &RawPatterns{
+			BusyPatterns: []string{
+				"ctrl+c to interrupt",
+				"esc to interrupt",
+				// Subagent activity: pi writes task markers to the pane
+				// when subagents are actively running. These patterns are
+				// specific enough to NOT match the idle status bar or
+				// package-update banners.
+				//
+				// Deliberately NO line-leading "→" pattern and NO plain
+				// "delegate_task" string: a finished answer stays on screen,
+				// so an idle session whose final message had "    → ..."
+				// bullet lines or merely named delegate_task matched busy
+				// forever (instance stuck "running"). Neither pi nor
+				// pi-subagents prints "delegate_task"; a live subagent runs
+				// inside a turn, under pi's "── ⠴ Working ──" banner, which
+				// the spinner detection covers (real capture: corpus frame
+				// pi-frame-004).
+				`re:(?m)^\[subagent\]`,
+				`re:(?m)^\[running\]`,
+			},
+			PromptPatterns: []string{
+				`re:(?m)^\s*pi>\s*`,
+				// pi's composer has no prompt glyph: the frame ends with the
+				// rule-bounded input box, a "~/path • title" line and the
+				// token/cost status line ("↑5.9k ↓77 R5.5k CH96.6% …", or with
+				// no cache fields on some providers: "↑2.2k ↓198 $0.017 …").
+				// That status line only renders with the composer, so it is
+				// the idle-prompt marker (busy is checked first, so a live pi
+				// spinner banner still wins).
+				`re:(?m)^↑[\d.]+[kMG]?\s+↓[\d.]+[kMG]?\s`,
+			},
+			SpinnerChars: []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"},
+		}
+	case "copilot":
+		// GitHub Copilot CLI (the standalone `copilot` binary, Issue #556).
+		// Patterns are based on real-world Copilot CLI TUI transcripts.
+		return &RawPatterns{
+			BusyPatterns: []string{
+				"esc to interrupt",
+				"ctrl+c to interrupt",
+				"thinking",
+				"Thinking",
+				"Generating",
+				"Reading",
+				"Searching",
+				"Running",
+				`re:(?m)^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s`,
+			},
+			PromptPatterns: []string{
+				"How can I help",
+				`re:(?m)^\s*copilot>\s*`,
+				`re:(?m)^\s*›\s`,
+				`re:(?m)^\s*>\s*$`,
+			},
+		}
+	case "cursor":
+		return &RawPatterns{
+			BusyPatterns: []string{
+				"ctrl+c to interrupt",
+				"esc to interrupt",
+				"thinking",
+			},
+			PromptPatterns: []string{
+				"How can I help",
+				`re:(?m)^\s*›\s`,
+				"Ask questions",
+				"Plan mode",
+				"Switch modes",
+			},
+		}
+	case "muse":
+		// Muse Code CLI (`muse`). All patterns CAPTURED live from 1.0.2
+		// in a tmux pane (echo provider):
+		//
+		//   busy:  "◈ Thinking (2s · esc to interrupt)"
+		//   idle:  "⟩" + placeholder "Type @ to search and insert workspace
+		//           file paths", status bar "<provider> · /abs/path"
+		//   reply: "◆ <text>" assistant marker
+		//
+		// Deliberately NOT a prompt pattern: the bare "⟩" (U+27E9). Submitted
+		// prompts stay in history as "⟩ <text>", so it describes a state that
+		// is not necessarily waiting; the placeholder only ever renders in
+		// the live input box. Busy is checked before prompt in the detector,
+		// so the history lines cannot mask a working session.
+		return &RawPatterns{
+			BusyPatterns: []string{
+				"◈ Thinking (",
+				"esc to interrupt",
+			},
+			PromptPatterns: []string{
+				"Type @ to search and insert workspace file paths",
+			},
+		}
+	case "shell":
+		return &RawPatterns{
+			PromptPatterns: []string{"$ ", "# ", "% "},
+		}
+	case "openclaw":
+		return &RawPatterns{
+			BusyPatterns:   []string{"[PROCESSING]", "[CONNECTING]", "[RECONNECTING]"},
+			PromptPatterns: []string{"openclaw> "},
+		}
+	default:
+		return nil
+	}
+}
+
+// Codex error banners (status-light audit 2026-09-17, defect A). Codex renders
+// a terminal error as a line led by "■" and then redraws its composer
+// ("› Ask Codex to do anything") underneath, so prompt detection alone reads
+// the pane as an ordinary idle prompt. Captured live:
+//
+//	■ You've hit your usage limit. To continue using Codex and get access to GPT-5.3-Codex, start a free
+//	trial of Plus today (https://chatgpt.com/explore/plus), or try again at Oct 10th, 2026 8:03 AM.
+//
+// Every pattern is matched only on a "■"-led banner line (lowercased), never on
+// prose or the composer, so a user typing about the limit cannot trip it.
+const codexErrorBannerPrefix = "■"
+
+// codexUsageLimitBannerPatterns: the plan's usage window is exhausted. CAPTURED.
+var codexUsageLimitBannerPatterns = []string{
+	"hit your usage limit",
+	"usage limit",
+}
+
+// codexAuthBannerPatterns: the session cannot make progress until the user
+// logs in again. Deliberately NARROW (review P2-7): an auth verdict feeds the
+// fleet auth gate, which counts it toward halting fleet boots, so only the
+// exact phrasing Codex prints for an expired/missing login is matched — the
+// "codex login" instruction it appends to every login-required banner, and
+// its "not logged in" wording. No capture of the banner exists yet; the
+// instruction text is Codex's own command name and cannot appear in a
+// warning that merely mentions authentication. Generic words
+// ("authentication", "unauthorized", "log in to", "sign in to") are NOT
+// matched: a "■" warning carrying them degrades to the pre-existing waiting
+// verdict, never to auth-401.
+var codexAuthBannerPatterns = []string{
+	"codex login",
+	"not logged in",
+}
+
+// codexRetryAtRe pulls the retry time out of the usage-limit banner text.
+var codexRetryAtRe = regexp.MustCompile(`(?i)try again at\s+([^.]+)`)
+
+// Codex banner kinds returned by scanCodexErrorBanner.
+const (
+	codexBannerUsageLimit = "usage-limit"
+	codexBannerAuth       = "auth"
+)
+
+// codexComposerPlaceholder is the empty composer's placeholder text.
+const codexComposerPlaceholder = "Ask Codex to do anything"
+
+// codexTurnGlyphs lead the lines that prove the session moved on after a
+// banner: "›" the echoed submitted prompt (and the composer), "•" an
+// assistant reply or tool call.
+const (
+	codexPromptGlyph    = "›"
+	codexAssistantGlyph = "•"
+)
+
+// codexBusyCues are the codex busy patterns (see DefaultRawPatterns "codex"):
+// while one is on screen the session is visibly working, so no banner above
+// it is current.
+var codexBusyCues = []string{"ctrl+c to interrupt", "esc to interrupt"}
+
+// codexLine is one line of the tail as scanCodexErrorBanner sees it: the
+// trimmed text and whether it starts at column 0 of the pane. Codex prints
+// its own "■" banners at column 0; the tool-output block under a "• Ran …"
+// line ("  └ first line", then lines indented to the same column) never
+// does, so a "■" inside a cat/grep result is quoted content, not a banner
+// (review round 3 P3-6). Tool output sits BELOW its "•" line, so the "•"
+// stop alone cannot exclude it when the block is directly above the composer.
+type codexLine struct {
+	text    string
+	column0 bool
+}
+
+// scanCodexErrorBanner scans the last 15 non-empty lines for a "■"-led codex
+// error banner that belongs to the CURRENT turn and returns its kind (""
+// when none) and, for a usage-limit banner, the retry time it prints ("try
+// again at Oct 10th, 2026 8:03 AM"). The banner wraps, so the continuation
+// lines up to the next "■"/"›" line are joined before the retry time is read.
+//
+// Newest signal wins (review P1-2, the same rule the Claude scans apply): the
+// walk goes up from the bottom and stops at the first line that proves the
+// session continued after any banner above it — a submitted prompt ("› text"
+// above the composer, which is always the bottom-most "›" line), an
+// assistant/tool line ("• …"), or a live busy cue anywhere in the tail. A
+// banner sitting directly above the composer is still an error.
+//
+// Only a "■" Codex printed itself counts: a column-0 line (see codexLine).
+func scanCodexErrorBanner(content string) (kind, detail string) {
+	lines := strings.Split(content, "\n")
+	var recent []codexLine
+	for i := len(lines) - 1; i >= 0 && len(recent) < 15; i-- {
+		raw := StripANSI(lines[i])
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if containsAny(strings.ToLower(line), codexBusyCues) {
+			return "", ""
+		}
+		column0 := !strings.HasPrefix(raw, " ") && !strings.HasPrefix(raw, "\t")
+		recent = append([]codexLine{{text: line, column0: column0}}, recent...)
+	}
+	seenComposer := false
+	for i := len(recent) - 1; i >= 0; i-- {
+		line := recent[i].text
+		switch {
+		case strings.HasPrefix(line, codexPromptGlyph):
+			text := strings.TrimSpace(strings.TrimPrefix(line, codexPromptGlyph))
+			if seenComposer && text != "" && !strings.HasPrefix(text, codexComposerPlaceholder) {
+				return "", "" // a later turn was submitted; anything above is history
+			}
+			seenComposer = true
+			continue
+		case strings.HasPrefix(line, codexAssistantGlyph):
+			return "", "" // the session produced output after any banner above
+		case !strings.HasPrefix(line, codexErrorBannerPrefix), !recent[i].column0:
+			continue // not a banner, or one quoted inside indented tool output
+		}
+		lower := strings.ToLower(line)
+		switch {
+		case containsAny(lower, codexUsageLimitBannerPatterns):
+			banner := line
+			for j := i + 1; j < len(recent); j++ {
+				if strings.HasPrefix(recent[j].text, codexErrorBannerPrefix) || strings.HasPrefix(recent[j].text, codexPromptGlyph) {
+					break
+				}
+				banner += " " + recent[j].text
+			}
+			if m := codexRetryAtRe.FindStringSubmatch(banner); m != nil {
+				return codexBannerUsageLimit, "try again at " + strings.TrimSpace(m[1])
+			}
+			return codexBannerUsageLimit, ""
+		case containsAny(lower, codexAuthBannerPatterns):
+			return codexBannerAuth, ""
+		}
+	}
+	return "", ""
+}
+
+// defaultSpinnerChars returns the braille + asterisk spinner characters used by Claude Code.
+func defaultSpinnerChars() []string {
+	return []string{
+		"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+		"✳", "✽", "✶", "✢", // Claude Code 2.1.25+ asterisk spinner (excl ✻ and · which appear in done/other states)
+	}
+}
+
+// defaultWhimsicalWords returns all 90+ whimsical "thinking" words used by Claude Code.
+func defaultWhimsicalWords() []string {
+	return []string{
+		"accomplishing", "actioning", "actualizing", "baking", "booping",
+		"brewing", "calculating", "cerebrating", "channelling", "churning",
+		"clauding", "coalescing", "cogitating", "combobulating", "computing",
+		"concocting", "conjuring", "considering", "contemplating", "cooking",
+		"crafting", "creating", "crunching", "deciphering", "deliberating",
+		"determining", "discombobulating", "divining", "doing", "effecting",
+		"elucidating", "enchanting", "envisioning", "finagling", "flibbertigibbeting",
+		"forging", "forming", "frolicking", "generating", "germinating",
+		"hatching", "herding", "honking", "hustling", "ideating",
+		"imagining", "incubating", "inferring", "jiving", "manifesting",
+		"marinating", "meandering", "moseying", "mulling", "mustering",
+		"musing", "noodling", "percolating", "perusing", "philosophising",
+		"pondering", "pontificating", "processing", "puttering", "puzzling",
+		"reticulating", "ruminating", "scheming", "schlepping", "shimmying",
+		"shucking", "simmering", "smooshing", "spelunking", "spinning",
+		"stewing", "sussing", "synthesizing", "thinking", "tinkering",
+		"transmuting", "unfurling", "unravelling", "vibing", "wandering",
+		"whirring", "wibbling", "wizarding", "working", "wrangling",
+		// Claude Code 2.1.25+ additions
+		"billowing", "gusting", "metamorphosing", "sublimating", "recombobulating", "sautéing",
+	}
+}
+
+// spinnerRuneSet returns the full set of spinner runes for content normalization.
+// Includes both the "active-only" chars (used for busy detection) and the
+// additional chars (·, ✻) that appear in done/other states but still need stripping
+// for stable hashing.
+func SpinnerRuneSet() []rune {
+	return []rune{
+		'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏',
+		'·', '✳', '✽', '✶', '✻', '✢', // all spinner-like chars for normalization
+	}
+}
+
+// CompilePatterns compiles raw string patterns into ready-to-use ResolvedPatterns.
+// Patterns prefixed with "re:" are compiled as regex. Invalid regex patterns are
+// logged as warnings and skipped (never crash).
+func CompilePatterns(raw *RawPatterns) (*ResolvedPatterns, error) {
+	if raw == nil {
+		return nil, fmt.Errorf("nil RawPatterns")
+	}
+
+	resolved := &ResolvedPatterns{}
+
+	// Split busy patterns into strings vs regex
+	for _, p := range raw.BusyPatterns {
+		if strings.HasPrefix(p, "re:") {
+			re, err := regexp.Compile(p[3:])
+			if err != nil {
+				patternLog.Warn("invalid_busy_regex",
+					slog.String("pattern", p),
+					slog.String("error", err.Error()))
+				continue
+			}
+			resolved.BusyRegexps = append(resolved.BusyRegexps, re)
+		} else {
+			resolved.BusyStrings = append(resolved.BusyStrings, p)
+		}
+	}
+
+	// Split prompt patterns into strings vs regex
+	for _, p := range raw.PromptPatterns {
+		if strings.HasPrefix(p, "re:") {
+			re, err := regexp.Compile(p[3:])
+			if err != nil {
+				patternLog.Warn("invalid_prompt_regex",
+					slog.String("pattern", p),
+					slog.String("error", err.Error()))
+				continue
+			}
+			resolved.PromptRegexps = append(resolved.PromptRegexps, re)
+		} else {
+			resolved.PromptStrings = append(resolved.PromptStrings, p)
+		}
+	}
+
+	// Copy spinner chars
+	resolved.SpinnerChars = make([]string, len(raw.SpinnerChars))
+	copy(resolved.SpinnerChars, raw.SpinnerChars)
+
+	// Build combo regex patterns from WhimsicalWords + SpinnerChars
+	if len(raw.WhimsicalWords) > 0 && len(raw.SpinnerChars) > 0 {
+		spinnerCharClass := buildSpinnerCharClass(raw.SpinnerChars)
+		wordsAlt := strings.Join(raw.WhimsicalWords, "|")
+
+		// ThinkingPattern: spinner + whimsical word + timing info
+		tp, err := regexp.Compile(spinnerCharClass + `\s*(?i)(` + wordsAlt + `)[^(]*\([^)]*\)`)
+		if err != nil {
+			patternLog.Warn("failed_compile_thinking_pattern", slog.String("error", err.Error()))
+		} else {
+			resolved.ThinkingPattern = tp
+		}
+
+		// ThinkingPatternEllipsis: spinner + any text + unicode ellipsis + parens
+		tpe, err := regexp.Compile(spinnerCharClass + `\s*.+…\s*\([^)]*\)`)
+		if err != nil {
+			patternLog.Warn("failed_compile_thinking_ellipsis_pattern", slog.String("error", err.Error()))
+		} else {
+			resolved.ThinkingPatternEllipsis = tpe
+		}
+
+		// SpinnerActivePattern: spinner + any text + unicode ellipsis
+		sap, err := regexp.Compile(spinnerCharClass + `\s*.+…`)
+		if err != nil {
+			patternLog.Warn("failed_compile_spinner_active_pattern", slog.String("error", err.Error()))
+		} else {
+			resolved.SpinnerActivePattern = sap
+		}
+	}
+
+	return resolved, nil
+}
+
+// buildSpinnerCharClass builds a regex character class from spinner char strings.
+// e.g., ["⠋", "⠙", "✳"] -> "[⠋⠙✳]"
+func buildSpinnerCharClass(chars []string) string {
+	var b strings.Builder
+	b.WriteRune('[')
+	for _, ch := range chars {
+		b.WriteString(regexp.QuoteMeta(ch))
+	}
+	b.WriteRune(']')
+	return b.String()
+}
+
+// MergeRawPatterns merges defaults with overrides and extras.
+//   - If overrides has a field set (non-nil slice, even if empty), it replaces the default.
+//   - extras fields are appended to the result (after defaults or overrides).
+//   - If defaults is nil, only overrides/extras are used.
+func MergeRawPatterns(defaults, overrides, extras *RawPatterns) *RawPatterns {
+	result := &RawPatterns{}
+
+	// Start with defaults
+	if defaults != nil {
+		result.BusyPatterns = copySlice(defaults.BusyPatterns)
+		result.PromptPatterns = copySlice(defaults.PromptPatterns)
+		result.SpinnerChars = copySlice(defaults.SpinnerChars)
+		result.WhimsicalWords = copySlice(defaults.WhimsicalWords)
+	}
+
+	// Apply overrides (replace entire field if set)
+	if overrides != nil {
+		if overrides.BusyPatterns != nil {
+			result.BusyPatterns = copySlice(overrides.BusyPatterns)
+		}
+		if overrides.PromptPatterns != nil {
+			result.PromptPatterns = copySlice(overrides.PromptPatterns)
+		}
+		if overrides.SpinnerChars != nil {
+			result.SpinnerChars = copySlice(overrides.SpinnerChars)
+		}
+		if overrides.WhimsicalWords != nil {
+			result.WhimsicalWords = copySlice(overrides.WhimsicalWords)
+		}
+	}
+
+	// Append extras
+	if extras != nil {
+		result.BusyPatterns = append(result.BusyPatterns, extras.BusyPatterns...)
+		result.PromptPatterns = append(result.PromptPatterns, extras.PromptPatterns...)
+		result.SpinnerChars = append(result.SpinnerChars, extras.SpinnerChars...)
+		result.WhimsicalWords = append(result.WhimsicalWords, extras.WhimsicalWords...)
+	}
+
+	return result
+}
+
+// spinnerRuneMap is a lookup table for O(1) spinner rune detection.
+// Built once at init from SpinnerRuneSet() for use in single-pass stripping.
+var spinnerRuneMap map[rune]bool
+
+func init() {
+	spinnerRuneMap = make(map[rune]bool, len(SpinnerRuneSet()))
+	for _, r := range SpinnerRuneSet() {
+		spinnerRuneMap[r] = true
+	}
+}
+
+// StripSpinnerRunes removes all spinner characters in a single O(n) pass
+// using strings.Map, replacing 16 sequential strings.ReplaceAll calls.
+func StripSpinnerRunes(s string) string {
+	return strings.Map(func(r rune) rune {
+		if spinnerRuneMap[r] {
+			return -1 // drop the rune
+		}
+		return r
+	}, s)
+}
+
+func copySlice(s []string) []string {
+	if s == nil {
+		return nil
+	}
+	c := make([]string, len(s))
+	copy(c, s)
+	return c
+}

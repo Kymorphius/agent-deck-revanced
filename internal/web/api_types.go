@@ -1,0 +1,197 @@
+package web
+
+import "github.com/asheshgoplani/agent-deck/internal/session"
+
+// Error code constants for API error responses.
+const (
+	ErrCodeUnauthorized     = "UNAUTHORIZED"
+	ErrCodeForbidden        = "MUTATIONS_DISABLED"
+	ErrCodeCSRF             = "CROSS_ORIGIN_BLOCKED"
+	ErrCodeNotFound         = "NOT_FOUND"
+	ErrCodeBadRequest       = "INVALID_REQUEST"
+	ErrCodeMethodNotAllowed = "METHOD_NOT_ALLOWED"
+	ErrCodeRateLimited      = "RATE_LIMITED"
+	ErrCodeInternalError    = "INTERNAL_ERROR"
+	ErrCodeNotImplemented   = "NOT_IMPLEMENTED"
+	ErrCodeReadOnly         = "READ_ONLY"
+)
+
+// CreateSessionRequest is the body for POST /api/sessions.
+type CreateSessionRequest struct {
+	Title           string `json:"title"`
+	Tool            string `json:"tool"`
+	ProjectPath     string `json:"projectPath"`
+	GroupPath       string `json:"groupPath,omitempty"`
+	ModelID         string `json:"modelId,omitempty"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+}
+
+// CreateGroupRequest is the body for POST /api/groups.
+type CreateGroupRequest struct {
+	Name       string `json:"name"`
+	ParentPath string `json:"parentPath,omitempty"`
+}
+
+// UpdateGroupRequest is the body for PATCH /api/groups/:path. Both fields are
+// optional, but at least one must be present.
+//
+// Expanded is a pointer for the same reason UpdateSessionRequest's bools are:
+// a missing field must not read as "collapse this group". When both are sent,
+// the handler applies Expanded first — a rename changes the path out from
+// under the collapse write.
+type UpdateGroupRequest struct {
+	Name string `json:"name"`
+	// Expanded persists the group's collapse state so the web sidebar and the
+	// TUI agree. nil leaves it untouched.
+	Expanded *bool `json:"expanded,omitempty"`
+}
+
+// UpdateSessionRequest is the body for PATCH /api/sessions/{id}. Every field
+// is optional; only the fields present in the request body are updated.
+// Pointer types let the handler distinguish "not supplied" from "set to zero
+// value" — important for booleans, where a missing field must not silently
+// clear the flag.
+//
+// Field names mirror session.Field* constants so the handler can dispatch
+// directly through session.SetField without a translation table.
+type UpdateSessionRequest struct {
+	Title           *string `json:"title,omitempty"`
+	Notes           *string `json:"notes,omitempty"`
+	Color           *string `json:"color,omitempty"`
+	Tool            *string `json:"tool,omitempty"`
+	ExtraArgs       *string `json:"extraArgs,omitempty"`
+	Plugins         *string `json:"plugins,omitempty"`
+	Channels        *string `json:"channels,omitempty"`
+	SkipPermissions *bool   `json:"skipPermissions,omitempty"`
+	AutoMode        *bool   `json:"autoMode,omitempty"`
+}
+
+// MoveSessionRequest is the body for POST /api/sessions/{id}/move (#2368).
+// GroupPath "" or "root" moves the session to the default group.
+type MoveSessionRequest struct {
+	GroupPath string `json:"groupPath"`
+}
+
+// MoveSessionResponse confirms a move. GroupPath is where the session landed
+// (after case-insensitive matching or group creation). RestartRequired is true
+// when the destination group resolves a different Claude config dir, which
+// the running session only picks up on its next restart.
+type MoveSessionResponse struct {
+	SessionID       string `json:"sessionId"`
+	GroupPath       string `json:"groupPath"`
+	RestartRequired bool   `json:"restartRequired"`
+}
+
+// UpdateSessionResponse confirms a PATCH succeeded. RestartRequired is true
+// when any updated field only takes effect on next launch (tool, extra-args,
+// plugins, skip-permissions, auto-mode). Clients use it to prompt before/after
+// issuing a separate POST .../restart.
+type UpdateSessionResponse struct {
+	SessionID       string   `json:"sessionId"`
+	UpdatedFields   []string `json:"updatedFields"`
+	RestartRequired bool     `json:"restartRequired"`
+}
+
+// SessionActionResponse is returned by session action endpoints.
+type SessionActionResponse struct {
+	SessionID string         `json:"sessionId"`
+	Status    session.Status `json:"status"`
+}
+
+// WorktreeFinishRequest is the body for POST /api/sessions/{id}/worktree/finish.
+// All fields are optional. Mirrors `agent-deck worktree finish` CLI flags.
+// See issue #1126.
+type WorktreeFinishRequest struct {
+	Into       string `json:"into,omitempty"`
+	NoMerge    bool   `json:"noMerge,omitempty"`
+	KeepBranch bool   `json:"keepBranch,omitempty"`
+	Force      bool   `json:"force,omitempty"`
+}
+
+// WorktreeFinishResponse is returned by POST /api/sessions/{id}/worktree/finish.
+type WorktreeFinishResponse struct {
+	SessionID     string `json:"sessionId"`
+	Branch        string `json:"branch"`
+	MergedInto    string `json:"mergedInto,omitempty"`
+	Merged        bool   `json:"merged"`
+	BranchDeleted bool   `json:"branchDeleted"`
+}
+
+// SettingsResponse is returned by GET /api/settings.
+type SettingsResponse struct {
+	Profile      string `json:"profile"`
+	ReadOnly     bool   `json:"readOnly"`
+	WebMutations bool   `json:"webMutations"`
+	Version      string `json:"version"`
+
+	// show_only_installed_tools filter (issue #1259). ToolFilter reports the
+	// flag is on; VisibleTools lists the tool names that resolved on PATH (the
+	// web dialog intersects its static list against this); ToolFilterFallback
+	// reports the empty-fallback so the dialog shows a "showing all" hint. With
+	// the flag off ToolFilter is false and the dialog ignores the other fields.
+	ToolFilter         bool     `json:"toolFilter"`
+	VisibleTools       []string `json:"visibleTools"`
+	ToolFilterFallback bool     `json:"toolFilterFallback"`
+
+	// hidden_tools denylist from [ui]. HiddenTools is the configured list;
+	// PickerTools is the ordered new-session picker after hidden_tools and
+	// show_only_installed_tools ("" mapped to "shell" for web).
+	HiddenTools []string `json:"hiddenTools"`
+	PickerTools []string `json:"pickerTools"`
+
+	// Link-open policy for the web terminal (issue #1682). TrustedDomains
+	// are normalized hosts whose links open without a confirm;
+	// ConfirmLinkOpen reports whether every other host still confirms.
+	TrustedDomains  []string `json:"trustedDomains"`
+	ConfirmLinkOpen bool     `json:"confirmLinkOpen"`
+
+	// ModelCatalog carries the same model and effort lists the TUI dialog
+	// uses, keyed by picker tool name, so the web dialog shows models the
+	// installed CLI reports (#2388). Tools without a catalog are omitted and
+	// the dialog keeps its built-in list for them.
+	ModelCatalog map[string]ToolModelCatalog `json:"modelCatalog"`
+}
+
+// ToolModelCatalog is one tool's entry in SettingsResponse.ModelCatalog.
+type ToolModelCatalog struct {
+	Models           []string            `json:"models"`
+	ReasoningEfforts []string            `json:"reasoningEfforts"`
+	ModelEfforts     map[string][]string `json:"modelEfforts,omitempty"`
+}
+
+// ProfilesResponse is returned by GET /api/profiles.
+type ProfilesResponse struct {
+	Current  string   `json:"current"`
+	Profiles []string `json:"profiles"`
+}
+
+// SSESessionEvent is emitted on session:created and session:updated events.
+type SSESessionEvent struct {
+	EventType string       `json:"eventType"`
+	Session   *MenuSession `json:"session"`
+}
+
+// SSEDeleteEvent is emitted on session:deleted events.
+type SSEDeleteEvent struct {
+	EventType string `json:"eventType"`
+	ID        string `json:"id"`
+}
+
+// SSEGroupEvent is emitted on group:created and group:updated events.
+type SSEGroupEvent struct {
+	EventType string     `json:"eventType"`
+	Group     *MenuGroup `json:"group"`
+}
+
+// SSEGroupDeleteEvent is emitted on group:deleted events.
+type SSEGroupDeleteEvent struct {
+	EventType string `json:"eventType"`
+	Path      string `json:"path"`
+}
+
+// SSECostEvent is emitted on cost:updated events.
+type SSECostEvent struct {
+	EventType string  `json:"eventType"`
+	SessionID string  `json:"sessionId"`
+	Cost      float64 `json:"cost"`
+}

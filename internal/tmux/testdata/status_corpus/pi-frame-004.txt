@@ -1,0 +1,50 @@
+
+[Extensions]
+  extension, pi-subagents@0.00.0, pi-web-search@0.0.0:xxx
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Update Available
+ New version 0.00.0 is available. Run pi update
+ Changelog: xxxxx://xx.xxx/changelog
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+ Xxx xxx subagent xxxx (delegate xxx xxxx xx x subagent, xx xxx read xxx xxxxx xxxxxxxx) xx xxxxxxxxx xxxxx0.xx xxx xxxxx0.xx in xxxx xxxxxxxxx in xxxxx xxxxxxx xxxx. Xxxx xxxxxx xxx subagent'x
+ xxxxxxx.
+
+
+
+ subagent xxxx
+ Executable agents: · 00 xxxxx
+   Press ctrl+o for full output
+
+
+
+ subagent delegate
+ Run fan-out: 0/64 used, 64 remaining · 0 xxxxx
+   Press ctrl+o for full output
+
+
+
+ subagent_wait
+ Xxxxxxx 3.0s for 0 async xxx(x) xxx 0 xxxxxxxx xxxx(x). · delegate: thinking…
+ Active async runs: 1
+
+ - 0000xxxx-0000-000x-000x-000xx00xx000 | running | active 1s xxx | 1 turns | 2 tools | workflow | step 1/1 | /xxxxxxx/xxx/xxxx-xxxxxx-xxxxx-x0/xx-xx
+   0. main (delegate) | running | active 1s xxx | 1 turns | 2 tools | gpt-5.6-sol
+   Run fan-out: 1/64 used, 63 remaining
+
+
+ async subagent delegate · background
+ ⠇ delegate · step 1/1 · 2 tool uses · 5.1s
+   ⠧ Step 1/1: delegate · running (gpt-5.6-sol) · 1 turns · 2 tool uses
+     ⎿  active now
+     Press ctrl+o for live detail
+     output: /xxx/xxxxxxx/00/xx000xx000x0x0x0xxxxx0xx0000xx/X/pi-subagents-xxx-000/async-subagent-xxxx/0000xxxx-0000-000x-000x-000xx00xx000/output-0.xxx
+── ⠴ Working ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  1 active agent · Async runs 0/∞ · ↓ 0.0k tokens · ↓/← to inspect
+/xxxxxxx/xxx/xxxx-xxxxxx-xxxxx-x0/xx-xx
+↑0.0k ↓000 R00k CH00.0% $0.000 (sub) 0.0%/000k (auto)                                                                                                                   (openai-codex) gpt-5.6-sol • low

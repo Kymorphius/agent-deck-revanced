@@ -1,0 +1,50 @@
+  - xxxx xxx xxxxxxxx xx xxxxxxxx xx xxxx. xxxxxx xxx xxxx xxxxx xx xxxxxxx, xx xxxxx xxxxxx xxxxxx xxxx xxxxx.
+  - xxxxxxxx xxx xxxx xxxxxx xxxxxxx xxxxxxx xxxxxxx xxxxxxxx xx xxxxxxxxx xx, xxxxx xxxxxxx xxxxx-xxxx xxxxx xxx xxxxx xxxx xxxxxxx xxxxx xxxxxxxxx.
+  - xxxxxxxx xxxxxx xxxxx xxxxx xxx xxx xx xxx xx x,xxx xxxxx. xxx xxx xx xxx.
+
+  xxxxx xxxxxxxxxxxxxx xx xxxx xx xxxxx xx, xx xxxxx:
+  0. xxxxx xxx xxxxx. xxxxx xx xxxxx xxxxx; x xxxx xxxx xxxx xxxxxxx xxxx xxxxxx xxx x "xx".
+  0. xxxx xxx xxxxxxxxxxx. xxx xxx xxx xxxxxx xxxx xxxxxxxxxx.
+  0. xxxxx xxxx xxxxxx xxxx. xxxxxxxx xxxx xxxx xxx xxxx xxx xxxxxxx xxx xx xxxx, xxxxx xxxxxxxxx, xx xx $xxx xxx xxxxxxx.
+  0. xxxxxxx xxx xxxx xxxxxx. xxx xxxxx xxxx, xxxxxxxx xxxxx x.x xxxxxx.
+  0. xxxxxx xxxxxx xxxx xxxxxx xxxx. $xxx xxxx xxxx xxxxx xxxxxxx, xxxxxxx xxxxxxxxxxxx xxxxxxxxx. xxxxx xxxxxxxxxx.xx xxx xxxxxxxx.xx xxxxx, xxxxx x xxx xxxxx.
+
+  xxx xxxxxxxxx xxx xxxxx xxxx xxxx xxxxx xx xxxxxxx xxxxxxxx xxxxx-xxxx xx xxxxxx xxxxxxxx xxx. xxxx xxxx xxxxx xxxxxx, xxx xxxxxx, xxxxxxx, xxxxxxxxxx xxx xxxxxxxx xxx xxxxxxx xxxxxxx
+  xxx xxxxxx xxx xxx xxxxxxx xxx xxxx xxx xxxx xxxx.
+
+  xxxxxxx xx xxx xxx xxx xxxxx xxxxxxxxxx: xxxxxxx xx xxxxxxx xxx $xxx xxxxxxx xx xxxx xxxxxxxx, xxxx xxx "xx".
+
+✻ Sautéed for 1h 18m 40s · done 00:00 XX
+
+❯ xxxx xxxx xxxx xxxxx xxxx xx xxxx xxxxxxx xxxxx xxxxxx xx xxxx xxxxx xxxxx xxxxxxx xxx xxx xxxxxx xxxxxxxxx xx xxxxxxx xxxxx xxxxx xxxxx xxxx xxxxxxx xxxx xxxxxx xxxxx xxx xxxx xxxx
+  ⎿  0 xxxxxx xxxxxxxxx
+
+⏺ xxx, x xx xxxx. xxxxxx xxx xxxxx xxx xxxx. xx xxxxxxxxxx xxxxxxx xxxxxx xxx xxxxx xxxxxx, xxxx xxxxx xxxx x xxxx xxxxxxxxxx xxxx xxxxxxx xx x xxxxxxx xxxx, xxx xxxx xxxxx xxx, xxx xxx
+  x xxxxxxx xxxx xxxxxxx xxxxxx-xxxxx xxxxxxxx:
+
+  ┌─────────────────────────┬───────────────────────────────────────┬─────────────────────────────────┬────────────────────────────────────────────────────────────┐
+  │         Xxxxxxx         │             Xxxx xxx xxx              │         Xxxxxxxx xxxxxx         │                           Xxxxxx                           │
+  ├─────────────────────────┼───────────────────────────────────────┼─────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ Xxxxx XXX Xxxxx         │ $0x xx $00x xxxxxxx xxxxxx Xxxxx      │ Fable 5, Xxxx 0.0, GPT-0.0      │ Xxxxx xxxxx, xxxxxxx xx xxx                                │
+  ├─────────────────────────┼───────────────────────────────────────┼─────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ Xxxx XXX Xxxxxxxxxxx    │ $00 xx $000 xxx xxxxx xxxxxxx xxxxxxx │ Fable 5.1, Xxxx 0, GPT-0 Xxxxx  │ Xxxxx xxxx                                                 │
+  ├─────────────────────────┼───────────────────────────────────────┼─────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ Codex Xxxx Xxxxxx Xxxx  │ Xx xx $00x OpenAI XXX xxxxxxx         │ GPT-0.x, GPT-0 Xxxxx            │ Xxxxx xxxxxxxxx, xxxxxxxx xxxx xxxx Xxxx Codex xxxxxxxxxxx │
+  ├─────────────────────────┼───────────────────────────────────────┼─────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ Xxxxxxx for Xxxx Xxxxxx │ Xxxx xxxx, xxxx xxxxxxxxxxx           │ Fable 5.1, Xxxx 0 xx xxxx xxxxx │ Xxx xxxxx xxxx                                             │
+  ├─────────────────────────┼───────────────────────────────────────┼─────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ XxxXxx Xxxxxx XXX Xxxx  │ $00x xxxx xxxx $00x Xxxxx xxxxxxx     │ Xxxxxxx xxxxxx                  │ Xxxxx XXXXXXXXXX.xx xxx XXXXXXXX.xx xxxxx                  │
+  └─────────────────────────┴───────────────────────────────────────┴─────────────────────────────────┴────────────────────────────────────────────────────────────┘
+
+  xxxxxxxxxx xxxx xx xxxxxx xxxxxx, xx-xxxxxxx-xxxx, xxxxx xxxxxxx xxxxx xxxx xx xxxxx xxxxxx, xx x xxxx-xxxxxx xxxxx. xxxx xx xxx xxxxxxxx xxxx xxxxx xxxx xxxx.
+
+  xxx xxxxx, x xxxx xxxxxx xxxx xxx xxxxx xxxxx xxxxxxx xxx $xxx xx xxx xxxxxxx xx xxxx xxxxxx xxx xxxx xx x xxxxxxxxx xxxxxx. xxx "xx" xxx x xxxxxx xx xxx xxxx xxxx xx xx xxx xxxx,
+  xxxxx xxxx xxx xxxxxxx xxxxx xxx xxxx xxx: xxxxx, xxxx xxx, xxxxxx xx xxxx xxxx.
+
+✻ Brewed for 23s · done 00:00 XX
+                                                                                                                                                  ✔ Xxxxxx xxxxxxxxx · Xxxxxxx xx xxxxxx
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xxxxxxx ─
+❯ 
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [xxxxxxxx] x@xxxx:/Xxxxx/x/xxx/xxxxx/xxx-xxxxxx-xxxxxxxx | [Fable 5.1] ctx:00% in:000.0k out:000 5h:0% 7d:0%
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

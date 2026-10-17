@@ -1,0 +1,504 @@
+package session
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+func TestSetField_Title_UpdatesAndReturnsOldValue(t *testing.T) {
+	inst := &Instance{Title: "old-title"}
+
+	oldValue, _, err := SetField(inst, FieldTitle, "new-title", nil)
+	if err != nil {
+		t.Fatalf("SetField returned error: %v", err)
+	}
+	if oldValue != "old-title" {
+		t.Errorf("oldValue = %q, want %q", oldValue, "old-title")
+	}
+	if inst.Title != "new-title" {
+		t.Errorf("inst.Title = %q, want %q", inst.Title, "new-title")
+	}
+}
+
+// An explicit rename must lock the title, otherwise the #572 Claude-name sync
+// (e.g. an auto-assigned plan title) reverts it on the next hook event.
+func TestSetField_Title_LocksTitle(t *testing.T) {
+	inst := &Instance{Title: "old-title"}
+
+	if _, _, err := SetField(inst, FieldTitle, "my-rename", nil); err != nil {
+		t.Fatalf("SetField returned error: %v", err)
+	}
+	if !inst.TitleLocked {
+		t.Error("TitleLocked = false after explicit rename, want true")
+	}
+
+	// The lock stays user-controllable: title-locked=false re-enables sync.
+	if _, _, err := SetField(inst, FieldTitleLocked, "false", nil); err != nil {
+		t.Fatalf("SetField(title-locked) returned error: %v", err)
+	}
+	if inst.TitleLocked {
+		t.Error("TitleLocked = true after explicit unlock, want false")
+	}
+}
+
+// TestSetField_Command_ClearsSubcommandPassthrough is the regression test
+// for the Codex review follow-up on PR #1821: SubcommandPassthrough is a
+// provenance guarantee only resolveSessionCommand's CLI passthrough route
+// may set — SetField(FieldCommand, ...) never runs that validation, so any
+// direct command edit through it must clear the flag. Without this, a
+// session created via `-c "claude mcp list"` (SubcommandPassthrough=true)
+// whose command is later edited to something else entirely would keep
+// getting claude/codex account-routing treatment for a command nobody ever
+// checked.
+func TestSetField_Command_ClearsSubcommandPassthrough(t *testing.T) {
+	inst := &Instance{
+		Tool:                  "shell",
+		Command:               "claude mcp list",
+		SubcommandPassthrough: true,
+	}
+
+	if _, _, err := SetField(inst, FieldCommand, `claude "review this repo"`, nil); err != nil {
+		t.Fatalf("SetField returned error: %v", err)
+	}
+	if inst.SubcommandPassthrough {
+		t.Error("SubcommandPassthrough = true after a direct command edit, want false — " +
+			"this mutator never re-validates the command as a real subcommand invocation")
+	}
+	if inst.Command != `claude "review this repo"` {
+		t.Errorf("inst.Command = %q, want the edited value", inst.Command)
+	}
+}
+
+func TestSetField_Color_Valid(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"hex", "#ff00aa", "#ff00aa"},
+		{"ansi", "203", "203"},
+		{"clear_empty", "", ""},
+		{"clear_trimmed_whitespace", "   ", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inst := &Instance{Color: "initial"}
+			_, _, err := SetField(inst, FieldColor, tc.input, nil)
+			if err != nil {
+				t.Fatalf("SetField returned error: %v", err)
+			}
+			if inst.Color != tc.want {
+				t.Errorf("inst.Color = %q, want %q", inst.Color, tc.want)
+			}
+		})
+	}
+}
+
+// Bad value must NOT mutate the field — mirrors CLI pre-extraction behavior.
+func TestSetField_Color_Invalid(t *testing.T) {
+	inst := &Instance{Color: "#123456"}
+	_, _, err := SetField(inst, FieldColor, "red", nil)
+	if err == nil {
+		t.Fatal("expected error for invalid color, got nil")
+	}
+	if inst.Color != "#123456" {
+		t.Errorf("inst.Color mutated on error: %q, want %q", inst.Color, "#123456")
+	}
+}
+
+// Channels are a claude-only CLI flag — without this guard, value would
+// persist on a gemini/shell session but buildCommand would never surface it.
+func TestSetField_Channels_ClaudeOnly(t *testing.T) {
+	inst := &Instance{Tool: "gemini"}
+	_, _, err := SetField(inst, FieldChannels, "plugin:telegram@user/repo", nil)
+	if err == nil {
+		t.Fatal("expected error when setting channels on non-claude session, got nil")
+	}
+	if !strings.Contains(err.Error(), "claude") {
+		t.Errorf("error should mention 'claude' constraint: %v", err)
+	}
+}
+
+// CSV parsing must drop empty tokens — otherwise "a,,c" emits a literal
+// empty channel id to the claude binary's --channels flag.
+func TestSetField_Channels_ParsesCSV(t *testing.T) {
+	inst := &Instance{Tool: "claude"}
+	_, _, err := SetField(inst, FieldChannels, "a, b ,, c", nil)
+	if err != nil {
+		t.Fatalf("SetField returned error: %v", err)
+	}
+	want := []string{"a", "b", "c"}
+	if len(inst.Channels) != len(want) {
+		t.Fatalf("Channels = %v, want %v", inst.Channels, want)
+	}
+	for i := range want {
+		if inst.Channels[i] != want[i] {
+			t.Errorf("Channels[%d] = %q, want %q", i, inst.Channels[i], want[i])
+		}
+	}
+}
+
+// TUI form: single space-separated string. CLI form is the next test.
+func TestSetField_ExtraArgs_TUIFormat(t *testing.T) {
+	inst := &Instance{Tool: "claude"}
+	_, _, err := SetField(inst, FieldExtraArgs, "--model opus --verbose", nil)
+	if err != nil {
+		t.Fatalf("SetField returned error: %v", err)
+	}
+	want := []string{"--model", "opus", "--verbose"}
+	if len(inst.ExtraArgs) != len(want) {
+		t.Fatalf("ExtraArgs = %v, want %v", inst.ExtraArgs, want)
+	}
+	for i := range want {
+		if inst.ExtraArgs[i] != want[i] {
+			t.Errorf("ExtraArgs[%d] = %q, want %q", i, inst.ExtraArgs[i], want[i])
+		}
+	}
+}
+
+// CLI form: pre-tokenized argv — values with spaces stay one token.
+func TestSetField_ExtraArgs_CLIFormat(t *testing.T) {
+	inst := &Instance{Tool: "claude"}
+	_, _, err := SetField(inst, FieldExtraArgs, "", []string{"--model", "opus haiku"})
+	if err != nil {
+		t.Fatalf("SetField returned error: %v", err)
+	}
+	if len(inst.ExtraArgs) != 2 || inst.ExtraArgs[0] != "--model" || inst.ExtraArgs[1] != "opus haiku" {
+		t.Errorf("ExtraArgs = %v, want [--model opus haiku]", inst.ExtraArgs)
+	}
+}
+
+// Without this, "clear all extra args" silently keeps stale flags.
+func TestSetField_ExtraArgs_EmptyClears(t *testing.T) {
+	inst := &Instance{Tool: "claude", ExtraArgs: []string{"--model", "opus"}}
+	_, _, err := SetField(inst, FieldExtraArgs, "", nil)
+	if err != nil {
+		t.Fatalf("SetField returned error: %v", err)
+	}
+	if inst.ExtraArgs != nil {
+		t.Errorf("ExtraArgs should be nil after clear, got %v", inst.ExtraArgs)
+	}
+}
+
+func TestSetField_InvalidField(t *testing.T) {
+	inst := &Instance{}
+	_, _, err := SetField(inst, "bogus", "x", nil)
+	if err == nil {
+		t.Fatal("expected error for invalid field, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid field") {
+		t.Errorf("error should mention 'invalid field': %v", err)
+	}
+}
+
+// Notes must stay live — moving them to FieldRestartRequired would
+// silently force a restart for pure metadata edits.
+func TestSetField_Notes_LiveEditable(t *testing.T) {
+	inst := &Instance{Notes: "old"}
+	_, _, err := SetField(inst, FieldNotes, "new", nil)
+	if err != nil {
+		t.Fatalf("SetField returned error: %v", err)
+	}
+	if inst.Notes != "new" {
+		t.Errorf("Notes = %q, want %q", inst.Notes, "new")
+	}
+	if RestartPolicyFor(FieldNotes) != FieldLive {
+		t.Error("Notes must be live-editable, not restart-required")
+	}
+}
+
+func TestSetField_TitleLocked_ParsesBool(t *testing.T) {
+	cases := []struct {
+		input string
+		want  bool
+	}{
+		{"true", true},
+		{"false", false},
+		{"1", true},
+		{"0", false},
+		{"yes", true},
+		{"no", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			inst := &Instance{}
+			_, _, err := SetField(inst, FieldTitleLocked, tc.input, nil)
+			if err != nil {
+				t.Fatalf("SetField returned error: %v", err)
+			}
+			if inst.TitleLocked != tc.want {
+				t.Errorf("TitleLocked = %v, want %v", inst.TitleLocked, tc.want)
+			}
+		})
+	}
+}
+
+// "maybe" must error, not silently coerce to false.
+func TestSetField_TitleLocked_RejectsBadBool(t *testing.T) {
+	inst := &Instance{TitleLocked: true}
+	_, _, err := SetField(inst, FieldTitleLocked, "maybe", nil)
+	if err == nil {
+		t.Fatal("expected error for invalid bool, got nil")
+	}
+	if inst.TitleLocked != true {
+		t.Error("TitleLocked mutated on error")
+	}
+}
+
+// Pins the live-vs-restart contract — a regression that moves Command
+// into FieldLive would silently lie to users about when edits take effect.
+func TestRestartPolicyFor(t *testing.T) {
+	liveFields := []string{
+		FieldTitle, FieldColor, FieldNotes, FieldTitleLocked,
+		FieldNoTransitionNotify, FieldClaudeSessionID, FieldGeminiSessionID,
+	}
+	restartFields := []string{
+		FieldCommand, FieldWrapper, FieldTool, FieldChannels,
+		FieldExtraArgs, FieldPath, FieldSkipPermissions, FieldAutoMode,
+		FieldToolSessionID, // resume argv baked into next spawn
+	}
+	for _, f := range liveFields {
+		if got := RestartPolicyFor(f); got != FieldLive {
+			t.Errorf("RestartPolicyFor(%q) = %v, want FieldLive", f, got)
+		}
+	}
+	for _, f := range restartFields {
+		if got := RestartPolicyFor(f); got != FieldRestartRequired {
+			t.Errorf("RestartPolicyFor(%q) = %v, want FieldRestartRequired", f, got)
+		}
+	}
+}
+
+// Mirrors cmd-package coverage to ensure no permutations dropped during
+// the move from cmd/agent-deck/session_cmd.go to internal/session/.
+func TestIsValidSessionColor_Exported(t *testing.T) {
+	valid := []string{"", "#ff00aa", "#FF00AA", "#000000", "0", "255", "127"}
+	invalid := []string{"red", "#12", "#gggggg", "256", "-1", "  ", "#ff00aa00"}
+	for _, v := range valid {
+		if !IsValidSessionColor(v) {
+			t.Errorf("IsValidSessionColor(%q) = false, want true", v)
+		}
+	}
+	for _, v := range invalid {
+		if IsValidSessionColor(v) {
+			t.Errorf("IsValidSessionColor(%q) = true, want false", v)
+		}
+	}
+}
+
+// Fields without a tmux side effect must return nil postCommit. CLI/TUI
+// both branch on `if postCommit != nil`; a non-nil leak triggers a
+// pointless subprocess on every CLI invocation.
+func TestSetField_PostCommit_NilForSimpleFields(t *testing.T) {
+	cases := []struct {
+		field, value string
+	}{
+		{FieldTitle, "y"},
+		{FieldColor, "#aabbcc"},
+		{FieldNotes, "n"},
+		{FieldCommand, "claude"},
+		{FieldWrapper, ""},
+		{FieldTool, "claude"},
+		{FieldChannels, "a"},
+		{FieldExtraArgs, "--m"},
+		{FieldTitleLocked, "true"},
+		{FieldNoTransitionNotify, "false"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.field, func(t *testing.T) {
+			inst := &Instance{Title: "x", Tool: "claude"}
+			_, postCommit, err := SetField(inst, tc.field, tc.value, nil)
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if postCommit != nil {
+				t.Errorf("expected nil postCommit for %s, got non-nil", tc.field)
+			}
+		})
+	}
+}
+
+// Editing a session-id field on a not-running session must skip the tmux
+// subprocess (postCommit nil), not fire it speculatively.
+func TestSetField_PostCommit_NilWhenSessionNotRunning(t *testing.T) {
+	inst := &Instance{Title: "x", Tool: "claude"} // tmuxSession is nil
+	_, postCommit, err := SetField(inst, FieldClaudeSessionID, "abc-123", nil)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if postCommit != nil {
+		t.Error("expected nil postCommit when tmux session not running")
+	}
+}
+
+// SetField on a session with no prior ToolOptionsJSON must initialize a
+// fresh wrapper rather than failing — pre-existing claude sessions created
+// before any options panel touched them have nil ToolOptionsJSON, and the
+// dialog still needs to set skip/auto on them.
+func TestSetField_SkipPermissions_InitializesEmptyToolOptions(t *testing.T) {
+	inst := &Instance{Tool: "claude"} // ToolOptionsJSON is nil
+	_, _, err := SetField(inst, FieldSkipPermissions, "true", nil)
+	if err != nil {
+		t.Fatalf("SetField returned error: %v", err)
+	}
+	opts, err := UnmarshalClaudeOptions(inst.ToolOptionsJSON)
+	if err != nil || opts == nil {
+		t.Fatalf("ToolOptionsJSON not populated: %v / %v", err, opts)
+	}
+	if !opts.SkipPermissions {
+		t.Error("SkipPermissions = false after SetField(true)")
+	}
+}
+
+// A second SetField call must round-trip the prior bool through the JSON
+// blob without wiping it — both flags should coexist.
+func TestSetField_AutoMode_PreservesSkipPermissions(t *testing.T) {
+	inst := &Instance{Tool: "claude"}
+	if _, _, err := SetField(inst, FieldSkipPermissions, "true", nil); err != nil {
+		t.Fatalf("SetField(skip=true) failed: %v", err)
+	}
+	if _, _, err := SetField(inst, FieldAutoMode, "true", nil); err != nil {
+		t.Fatalf("SetField(auto=true) failed: %v", err)
+	}
+	opts, _ := UnmarshalClaudeOptions(inst.ToolOptionsJSON)
+	if opts == nil || !opts.SkipPermissions || !opts.AutoMode {
+		t.Errorf("expected both skip=true and auto=true after sequential edits; got %+v", opts)
+	}
+}
+
+// Skip/auto only make sense on claude-compatible tools; SetField must
+// reject them on shell/gemini sessions instead of silently encoding flags
+// that the launcher would never emit.
+func TestSetField_SkipPermissions_ClaudeOnly(t *testing.T) {
+	inst := &Instance{Tool: "shell"}
+	_, _, err := SetField(inst, FieldSkipPermissions, "true", nil)
+	if err == nil {
+		t.Fatal("expected error setting skip-permissions on non-claude session")
+	}
+}
+
+// claude→shell while skip_permissions=true is encoded must drop the stale
+// ClaudeOptions wrapper. Otherwise a later shell→claude switch would
+// silently resurrect skip=true even though the user toggled it off in
+// between sessions. The dialog applies Tool last, so this scenario is
+// reachable from a single Enter-submit.
+func TestSetField_Tool_ClearsClaudeOptionsOnLeaveClaude(t *testing.T) {
+	inst := &Instance{Tool: "claude"}
+	if _, _, err := SetField(inst, FieldSkipPermissions, "true", nil); err != nil {
+		t.Fatalf("SetField(skip=true) failed: %v", err)
+	}
+	if len(inst.ToolOptionsJSON) == 0 {
+		t.Fatal("ToolOptionsJSON not populated after skip toggle — test setup bug")
+	}
+	if _, _, err := SetField(inst, FieldTool, "shell", nil); err != nil {
+		t.Fatalf("SetField(tool=shell) failed: %v", err)
+	}
+	if len(inst.ToolOptionsJSON) != 0 {
+		t.Errorf("Tool=claude→shell must drop ClaudeOptions; got %s", inst.ToolOptionsJSON)
+	}
+}
+
+// Tool=claude→claude must be a no-op for ToolOptionsJSON (the dialog
+// re-emits Tool unchanged when only Skip/Auto were touched, since
+// fieldInitialValue compares pillOptions[cursor] to inst.Tool).
+func TestSetField_Tool_NoopForSameClaude(t *testing.T) {
+	inst := &Instance{Tool: "claude"}
+	if _, _, err := SetField(inst, FieldSkipPermissions, "true", nil); err != nil {
+		t.Fatalf("SetField(skip=true) failed: %v", err)
+	}
+	before := string(inst.ToolOptionsJSON)
+	if _, _, err := SetField(inst, FieldTool, "claude", nil); err != nil {
+		t.Fatalf("SetField(tool=claude) failed: %v", err)
+	}
+	if string(inst.ToolOptionsJSON) != before {
+		t.Errorf("ToolOptionsJSON changed across no-op tool set: before=%s after=%s",
+			before, inst.ToolOptionsJSON)
+	}
+}
+
+// A refactor that did `inst = &Instance{...}` would wipe Claude launch
+// options. Guards that with a Title edit + ToolOptionsJSON round-trip.
+func TestSetField_PreservesToolOptionsJSON(t *testing.T) {
+	inst := &Instance{
+		Title:           "before",
+		ToolOptionsJSON: json.RawMessage(`{"model":"opus"}`),
+	}
+	_, _, err := SetField(inst, FieldTitle, "after", nil)
+	if err != nil {
+		t.Fatalf("SetField returned error: %v", err)
+	}
+	if string(inst.ToolOptionsJSON) != `{"model":"opus"}` {
+		t.Errorf("ToolOptionsJSON clobbered by title edit: %s", inst.ToolOptionsJSON)
+	}
+}
+
+func TestSetField_OpenCodeSessionID_StampsDetectedAt(t *testing.T) {
+	inst := NewInstanceWithTool("oc", "/tmp/p", "opencode")
+	if _, _, err := SetField(inst, FieldOpenCodeSessionID, "ses_abc", nil); err != nil {
+		t.Fatalf("SetField: %v", err)
+	}
+	if inst.OpenCodeSessionID != "ses_abc" {
+		t.Fatalf("OpenCodeSessionID = %q, want ses_abc", inst.OpenCodeSessionID)
+	}
+	if inst.OpenCodeDetectedAt.IsZero() {
+		t.Fatal("OpenCodeDetectedAt must be stamped so CanForkOpenCode's recency gate passes")
+	}
+}
+
+func TestSetField_OpenCodeSessionID_RejectsShellMeta(t *testing.T) {
+	inst := NewInstanceWithTool("oc", "/tmp/p", "opencode")
+	inst.OpenCodeSessionID = "ses_safe"
+
+	if _, _, err := SetField(inst, FieldOpenCodeSessionID, "ses_abc;touch /tmp/pwned", nil); err == nil {
+		t.Fatal("SetField should reject OpenCode session IDs with shell metacharacters")
+	}
+	if inst.OpenCodeSessionID != "ses_safe" {
+		t.Fatalf("OpenCodeSessionID mutated on error: %q", inst.OpenCodeSessionID)
+	}
+}
+
+func TestSetField_CodexSessionID_StampsDetectedAt(t *testing.T) {
+	inst := NewInstanceWithTool("cx", "/tmp/p", "codex")
+	if _, _, err := SetField(inst, FieldCodexSessionID, "11111111-2222-3333-4444-555555555555", nil); err != nil {
+		t.Fatalf("SetField: %v", err)
+	}
+	if inst.CodexSessionID != "11111111-2222-3333-4444-555555555555" {
+		t.Fatalf("CodexSessionID = %q", inst.CodexSessionID)
+	}
+	if inst.CodexDetectedAt.IsZero() {
+		t.Fatal("CodexDetectedAt must be stamped")
+	}
+}
+
+func TestSetField_CodexSessionID_RejectsNonUUID(t *testing.T) {
+	inst := NewInstanceWithTool("cx", "/tmp/p", "codex")
+	inst.CodexSessionID = "11111111-2222-3333-4444-555555555555"
+
+	if _, _, err := SetField(inst, FieldCodexSessionID, "not-a-uuid", nil); err == nil {
+		t.Fatal("SetField should reject non-UUID Codex session IDs")
+	}
+	if inst.CodexSessionID != "11111111-2222-3333-4444-555555555555" {
+		t.Fatalf("CodexSessionID mutated on error: %q", inst.CodexSessionID)
+	}
+}
+
+func TestSetField_ToolSessionID_ClearStillAllowed(t *testing.T) {
+	oc := NewInstanceWithTool("oc", "/tmp/p", "opencode")
+	oc.OpenCodeSessionID = "ses_safe"
+	if _, _, err := SetField(oc, FieldOpenCodeSessionID, "", nil); err != nil {
+		t.Fatalf("SetField clear opencode-session-id: %v", err)
+	}
+	if oc.OpenCodeSessionID != "" {
+		t.Fatalf("OpenCodeSessionID should clear, got %q", oc.OpenCodeSessionID)
+	}
+
+	cx := NewInstanceWithTool("cx", "/tmp/p", "codex")
+	cx.CodexSessionID = "11111111-2222-3333-4444-555555555555"
+	if _, _, err := SetField(cx, FieldCodexSessionID, "  ", nil); err != nil {
+		t.Fatalf("SetField clear codex-session-id: %v", err)
+	}
+	if cx.CodexSessionID != "" {
+		t.Fatalf("CodexSessionID should clear, got %q", cx.CodexSessionID)
+	}
+}

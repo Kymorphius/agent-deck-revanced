@@ -1,0 +1,12 @@
+• Ran xx
+  └ x.xx
+
+• Xxxxxxxxxxxxx xxx xxxxx xxxx in xxx xxxx xxxxxxx (12m 03s • esc to interrupt)…
+• Queued follow-up inputs
+  ↳ xxxx xxxxxx xxx changelog
+    shift + ← edit last queued message
+
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol default · /xxx/xxxxxxx

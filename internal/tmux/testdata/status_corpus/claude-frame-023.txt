@@ -1,0 +1,138 @@
+
+❯ xxx-xxxxxxxxxx /xxxxx/x/xxxxxxxx/xxxx-xx-xx-xxxxxxxx-xxxxxx.xx
+
+⏺ xxxx(x=~/xxxxxxxx/xxxx-xx-xx-xxxxxxxx-xxxxxx.xx; xxx -x x,xx "$x"; xx -x < "$x"; xxxx "--- xxxxx ---"; xxxx -xxx 'xxxx|xxxxx|xxxx|xxxx|xxxxxxxx|xxxxx|xxxxx ?xxx+[xx]…)
+  ⎿  - **Xxxxxxxx:** 0000-00-00 00:00:00.000
+     - **xxx:** xxxxx
+     - **xxxxxxxx:** x.x xxx
+
+⏺ xxxx(x=/xxxxx/x/xxxxxxxx/xxxx-xx-xx-xxxxxxxx-xxxxxx.xx
+      xxx xxxxxxx "xxxxx -x ~/xxxxxxxx && xxx > ~/xxxxxxxx/$(xxxxxxxx "$x") && xx -x ~/xxxxxxxx/$(xxxxxxxx "$x"…)
+  ⎿  00000 /xxxx/x/xxxxxxxx/0000-00-00-xxxxxxxx-x0x0x0.xx
+     ✓ xxxx xxxxxxx xx 'xxxxxxxxx-xxxx-xxxxxx'
+     xxxx=x
+
+⏺ xxxx(xxx xxxxxxx 'xxxx xxxxxxx-xxxx -x "$(xxxxx-xxxx xxxx --xxxx | xx -x ".[]|xxxxxx(.xxxxx==\"xxxxxxxxx-xxxx-xxxxxx\")|.xxxxxxxxxxxx")" -x -x -xx | xxxx -x "^$" | x…)
+  ⎿    xxx Xxxxxx XxxXxxxx xx xxxxxxx/xxxx xxx xxxxxxxxxxxxxx xxxxxxx, xxxxxxxxx xxxxxxxx xxx xxx-xx-Xxxxxxxx XXX, ~00 xxx, 0000-00-00 00:00) - Xxxx: xxxxxx xxxx 0.0 xxx xxx x
+     ✶ Xxxxxxxxxxx… (3s · thinking)
+     … +x xxxxx (xxxx+x xx xxxxxx)
+
+⏺ xxxxxxxxx xx xxxxxxxxx-xxxx-xxxxxx xx xxxxxxx, xxxxxxxxx xx xxx xxxx xxx xxxxx xxxxxxxxx.
+
+  - xxxx: xxxx-xx-xx xx:xx, xxxxxxxx, xxxxx, xxxxx xx xxxxxxx, xxxxxx xxxxxx.
+  - xxxxxxx: xxxxxxxxxx xxxxxxx xx xxxxxxxx xxxxxxxxx xxxxxx. xxxx xxx xxx, xxxx xxxxxx xxx xxxxxx, xxxxxx xxx xxxx xxxx xxxxxxxxx xxxxx x xx xx xxx xxxxx xxxx xxx-xxxxxxxx xxxxxxxx — xxxxxxxxxxxx xxxxx xxxxxx xxx xxxxxx xxxxxxxx — xx
+    xxxxxxx xxx xxxx xxx xxxxxxxxxxxxxx xxxxxxx. xxxxxxxxx xxxxxxxx xxx xxx-xx-xxxxxxxx xxx.
+
+✻ Crunched for 21s · done 0:00 XX
+
+❯ xxx-xxxxxxxxxx /xxxxx/x/xxxxxxxx/xxxx-xx-xx-xxxxxxxx-xxxxxx.xx
+
+⏺ xxxx(x=~/xxxxxxxx/xxxx-xx-xx-xxxxxxxx-xxxxxx.xx; xxx -x x,xx "$x"; xx -x < "$x"; xxxx "--- xxxxx ---"; xxxx -xxx 'xxxx|xxxxx|xxxx|xxxx|xxxxxxxx|xxxxx|xxxxx ?xxx+[xx]…)
+  ⎿  - **Xxxxxxxx:** 0000-00-00 00:00:00.000
+     - **xxx:** xxxxx
+     - **xxxxxxxx:** x.x xxx
+     … +xx xxxxx (xxxx+x xx xxxxxx)
+
+⏺ xxx xxxxxxx xxxx xx xxxx xxx xxx xxx xxxx xxx xxx xxxxx — xxxxxxxx xxx xxxxxx xxxx xxx xxxxx-xxxx.
+
+⏺ xxxx(x=~/xxxxxxxx/xxxx-xx-xx-xxxxxxxx-xxxxxx.xx
+      xxxx "=== xxxxxxxxx xx xxx ==="; xxx 'xx<xxx && /^\*\*.*_\[/ {x=$x} xxx{xxxxx x}' "$x"…)
+  ⎿  === xxxxxxxxx xx xxx ===
+     **xxxxxxx x** _[xx:xx]_
+     === xxxxx xxxxx xxxx xxx ===
+     … +xx xxxxx (xxxx+x xx xxxxxx)
+     === xxxx xxxxxxxxx xxxxxx xxx ===
+     **xxx** _[xx:xx]_
+     … +x xxxxx (xxxx+x xx xxxxxx)
+
+⏺ xxxx(x=~/xxxxxxxx/xxxx-xx-xx-xxxxxxxx-xxxxxx.xx; xxx -x xxx,xxxx "$x" | xxx -xx-xxx)
+  ⎿  X'x xxxxx xx xxxx xxx in XX.
+     xxxxxxx
+     x xxxx xxx xxx'x
+     … +xx xxxxx (xxxx+x xx xxxxxx)
+
+⏺ xxxxxxxxx: xxx xxxx xxxxxxx xx xxxx xxxxx x xxxxxxx; xxxxxxxxxx xxxxx xx xxxxxxx xxxxxxxxxxxxxx xxxxxxx (xxx xxxxx "xxxxxxxxxx xxx" xxxxxxxx xx xxxxx, xxx x xxxxxx xxxxxxx). xxxxxxx xx xxxxxxx.
+
+⏺ xxxx(x=/xxxxx/x/xxxxxxxx/xxxx-xx-xx-xxxxxxxx-xxxxxx.xx
+      xxx xxxxxxx "xxxxx -x ~/xxxxxxxx && xxx > ~/xxxxxxxx/$(xxxxxxxx "$x") && xx -x ~/xxxxxxxx/$(xxxxxxxx "$x"…)
+  ⎿  00000 /xxxx/x/xxxxxxxx/0000-00-00-xxxxxxxx-0x0000.xx
+     ✓ xxxx xxxxxxx xx 'xxxxxxxxx-xxxx-xxxxxx'
+     xxxx=x
+
+⏺ xxxx(xxx xxxxxxx 'xxxx xxxxxxx-xxxx -x "$(xxxxx-xxxx xxxx --xxxx | xx -x ".[]|xxxxxx(.xxxxx==\"xxxxxxxxx-xxxx-xxxxxx\")|.xxxxxxxxxxxx")" -x -x -xx | xxxx -x "^$" | x…)
+  ⎿    XX xxxxxxxx left xx XXX, ~0 xxx xxxx xxxxxxx, 0000-00-00 00:00) - Xxxx: xxxx xxxxxxx xxxx xx [00:00]; xxxxxxxxxx xxxxx xxxx xx xxxxxxxxx xxxxxxx xxxxxxx xxxxxxxxxxxxxx
+     * Combobulating…
+     … +x xxxxx (xxxx+x xx xxxxxx)
+
+⏺ xxxxxxxxx xx xxxxxxxxx-xxxx-xxxxxx xx xxxxxxx, xxxxxxxxx xx xxx xxxx xxx xxxxx xxxxxxxxx.
+
+  - xxxx: xxxx-xx-xx xx:xx, xxxxxxxx, xxxxx — xxx xxxx xxxxx x xxxxxxx xx xxxx xxxxxxx.
+  - xxxxxxx: xxxxx xxx xxx xxxxxx xxxxxx-xx. xxxx xxx xxx xxxx xxxx xxx.xxx.xxxxx xxxxxxxx; xxxxxx xxxxxxxxx xxxxx xx xxx xxxxxx xxxxxxx xxx xxxxxx xxxxxxxxx; xx xxxxxxxx xxxxxxxxxxxx xxxx xx xxx xxxxxx xxxx xxxxx xx xx xxxxxxxxx.
+  - xxxxxxx xxx xxx xxxxxxxxx: xxx xxxx xx xxxx (xxx xxxxx) xxx xxx xxxxxxx xxxx xx [xx:xx]. xxxxxxxxxx xxxxx xx xxxxxxxxx xxxxxxx xxxxxxx xxxxxxxxxxxxxx xxxx xxxxx/xxxx, xxxxxxxxx x xxxxx "xxxxxxxxxx xxx" xxxxxxxx xxxx xx xxxxx, xxx x
+    xxxxx xxxxxxx.
+
+✻ Baked for 39s · done 00:00 XX
+
+❯ xxx-xxxxxxxxxx /xxxxx/x/xxxxxxxx/xxxx-xx-xx-xxxxxxxx-xxxxxx.xx
+
+⏺ xxxx(x=~/xxxxxxxx/xxxx-xx-xx-xxxxxxxx-xxxxxx.xx; xxx -x x,xx "$x"; xx -x < "$x"; xxxx "--- xxxxx ---"; xxxx -xxx 'xxxx|xxxxx|xxxx|xxxx|xxxxxxxx|xxxxx|xxxxx ?xxx+[xx]…)
+  ⎿  - **Xxxxxxxx:** 0000-00-00 00:00:00.000
+     - **xxx:** xxxxx
+     - **xxxxxxxx:** x.x xxx
+     … +xx xxxxx (xxxx+x xx xxxxxx)
+
+⏺ xxxxxxxxx xxxxxxx (xxxx, xxxxxxx, xxxxxxx xxxxx, xxxx xxxxxx, xxxxxxxxx). xxx xxxxxxx xx xxxxxxxxx — xx xxxxx xxx xxxxx xxxxxxxxx-xx, xxxxx xxxxx xxx xxx xxxxxxxxx-xx-xxxxxx. xxxxxxxx xxxxx xx xxxx.
+
+⏺ xxxx(xxxx "=== xxxxx xxxxxxxxx-xx ==="; xxxxx-xxxx -x xxxxxxxx xxxx x>&x | xxxx -x '^xxxxxxxxx-xx '
+      xxxx "=== xxxxx xx xxxxxxxx xxx (xxxxxx) ==="; xx -x ~/.xxxxx-xxx…)
+  ⎿  === xxxxx xxxxxxxxx-xx ===
+     === xxxxx xx xxxxxxxx xxx (xxxxxx) ===
+     xxxx-xx-xx-xxxxxx-xxxxxx.xxxxxxx.xx
+     … +x xxxxx (xxxx+x xx xxxxxx)
+
+⏺ xxxx(xxxxx-xxxx -x xxxxxxxx xxxx x>&x | xxxx -x 'xxxxxxxxx-xx'; xxxx "--- xxxx ---"; xxxx xx x>/xxx/xxxx | xxxx -x 'xxxxxxxxx-xx'; xxxx "--- xxxxx xx-xxxxxx xxxxxxxx…)
+  ⎿  --- xxxx ---
+     --- xxxxx xx-xxxxxx xxxxxxxxx xxx ---
+     ---
+     … +x xxxxx (xxxx+x xx xxxxxx)
+
+⏺ xxxxx xxxxxxxxx-xx xx xxxx (xx xxxxxxx, xx xxxx) — xx xxxx xxx xxxxxxxx xx xxxxx xxxx xxxxxxxxx xxx. xxxxxxxxxx xxx xxxxxx xxxxxx xxxxxxx.
+
+⏺ xxxx(xxx xxxxx 'xxxx "=== xxxxxx xxxxxxxxx xxx ==="; xx ~/.xxxxx/xxxxx/xxxxx-xxxx/xxxxxxxxx/xxxxxx/ | xxxx -xx; xxxx "=== xxxxxxxx ==="; xx -x ~/.xxxxx/xxxxx/xxxxx-x…)
+  ⎿  === xxxxx xxxxxxxxx xxx ===
+     xxxxxx.xx
+     xxxxxxxx
+     … +xx xxxxx (xxxx+x xx xxxxxx)
+
+⏺ xxxxxxxxx — xxx xx xxxxxxx xxxxxxx xxxxxxxx xx xxxxx (xxxx xxxxx, xxxxxxxxx xxx xxxx-xx-xx xxxxxx xxxxxx x xxxxxxxxx). xxxxxxxxx-xx-xxxxxx xx xxxxx xx xxx xxxxxxx xxxxxx. xxxxxxxxxx.
+
+⏺ xxxx(x=/xxxxx/x/xxxxxxxx/xxxx-xx-xx-xxxxxxxx-xxxxxx.xx
+      xxx xxxxx "xxxxx -x ~/xxxxxxxx && xxx > ~/xxxxxxxx/$(xxxxxxxx "$x") && xx -x ~/xxxxxxxx/$(xxxxxxxx "$x")"…)
+  ⎿  00000 /xxxx/x/xxxxxxxx/0000-00-00-xxxxxxxx-x00xx0.xx
+     xxxxx: xxxxxxx xxx xxxxxxxxx xx 'xxxxxxxxx-xx-xxxxxx': xxxxxxx xxx xxxx: xxxxxxxx xx xxxxxxxx xx xxxxxxxxxx; xxxxxxxx xxxxx xxxxxxxxx
+     xxxx=x
+
+⏺ xxxx xxxxxx, xxx xxxx xxxxxxxx-xxxxxxxx xxxxx xx xxxxxx. xxxxxxxx xxxx'x xx xx.
+
+⏺ xxxx(xxx xxxxx 'x=$(xxxxx-xxxx xxxx --xxxx | xx -x ".[]|xxxxxx(.xxxxx==\"xxxxxxxxx-xx-xxxxxx\")|.xxxxxxxxxxxx"); xxxx "xxxx=$x"; xxxx xxxxxxx-xxxx -x "$x" -x -x -xx…)
+  ⎿  xxxx=xxxxxxxxx_xxxxxxxxx-xxxxx_0xx000x0
+       - xxx xxxxxxx xxxx xxxxxxx xxxx xxxx xxxx'x xxxxxxxxx xxxx — xxx xxxxxxx xxxxx. xx xxxxxxx x xxxxxxxxxxxx'x xxxxxxx xxxx xxx xxxxxxxxxx xxx xxxxxxx xx xxxxx x xxx.
+       xxx xxxxxxxx xxxxxxxx xxxxxx xxxx xxxxxxx xxxxxx xxxx xxxxxxx xx — x xxxxxxx xxxx xxxxxxxxxxxx xx xxx xxxxxx. xxxx xx xxx xx xxx xxxxxxx: xxxxx xxxxxxxx, xxxxx xxxxx
+     … +x xxxxx (xxxx+x xx xxxxxx)
+
+⏺ xxxx xxxxx xx xxxxxx: xxxxxxxxx-xx-xxxxxx'x xxxxxxxx xx xxxxx xxxxx x xxxxx xxxxxx xxxxxxxxx x — xxxxxx xxxxxxxxx xx xxxxxxxxxx xxxxxxxxx, xxx xx'x xxxxxxxx xxxxxxxx.
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Xxxxx xxxxx?
+
+│ Xxxxx xxx xxxxx "x" in xxxxxxxxx-xx-xxxxx'x xxxxxxxx xx xxxxx (Xxxxxx, xxxxxxx xxxxxxxxx) xx xxx xxxx-x xxxxxxx xxxxxxx xxx xx xxxxxxx?
+
+❯ 0. xxx, xxxxx xx (xxxxxxxxxxx)
+     xxxx xxxxxx xx xxxxx xxx xxxxxxxx xxxxxxx xxxxxxxxxx, xxxx xxxxxxx xxx xxxxxxxxxx
+  0. xx, xxxxx xx
+     xxxxx xxx xxxxxxxx xxxxx; x'xx xxxxx xxx xxxx xxxxxxxxxxxx xxxxxxx
+  0. xxxx xxxxxxxxx.
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  0. xxxx xxxxx xxxx
+
+Enter to select · ↑/↓ xx xxxxxxxx · Esc to cancel
+

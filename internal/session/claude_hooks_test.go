@@ -1,0 +1,567 @@
+package session
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestInjectClaudeHooks_Fresh(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	installed, err := InjectClaudeHooks(tmpDir)
+	if err != nil {
+		t.Fatalf("InjectClaudeHooks failed: %v", err)
+	}
+	if !installed {
+		t.Error("Expected hooks to be newly installed")
+	}
+
+	// Read settings.json and verify hooks are present
+	data, err := os.ReadFile(filepath.Join(tmpDir, "settings.json"))
+	if err != nil {
+		t.Fatalf("Failed to read settings.json: %v", err)
+	}
+
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatalf("Failed to parse settings.json: %v", err)
+	}
+
+	hooksRaw, ok := settings["hooks"]
+	if !ok {
+		t.Fatal("settings.json missing 'hooks' key")
+	}
+
+	var hooks map[string]json.RawMessage
+	if err := json.Unmarshal(hooksRaw, &hooks); err != nil {
+		t.Fatalf("Failed to parse hooks: %v", err)
+	}
+
+	// Verify all expected events are present
+	expectedEvents := []string{"SessionStart", "UserPromptSubmit", "Stop", "PermissionRequest", "Notification", "SessionEnd", "PreCompact"}
+	for _, event := range expectedEvents {
+		if _, ok := hooks[event]; !ok {
+			t.Errorf("Missing hook event: %s", event)
+		}
+	}
+
+	// Verify the hook command is correct
+	var matchers []claudeHookMatcher
+	if err := json.Unmarshal(hooks["SessionStart"], &matchers); err != nil {
+		t.Fatalf("Failed to parse SessionStart matchers: %v", err)
+	}
+	if len(matchers) == 0 {
+		t.Fatal("SessionStart has no matchers")
+	}
+	if len(matchers[0].Hooks) == 0 {
+		t.Fatal("SessionStart matcher has no hooks")
+	}
+	if matchers[0].Hooks[0].Command != hookHandlerCommand() {
+		t.Errorf("Hook command = %q, want %q", matchers[0].Hooks[0].Command, hookHandlerCommand())
+	}
+	if !matchers[0].Hooks[0].Async {
+		t.Error("Hook should be async")
+	}
+}
+
+// TestStopHookIsSynchronousForActivation guards the issue #1225/#1226 ACTIVATION:
+// the Stop hook must install SYNCHRONOUSLY so Claude Code consults the hook's
+// stdout {decision:"block",reason} and injects busy-parent completions. An async
+// Stop hook makes Claude ignore stdout, so the durable-outbox engine ships inert.
+// The flip is provably safe for non-conductor sessions via the DrainForStopHook
+// InboxHasPending fast path (see TestB12_StopHook_LeafSessionNeverBlocksNorWritesLedger).
+func TestStopHookIsSynchronousForActivation(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	if _, err := InjectClaudeHooks(tmpDir); err != nil {
+		t.Fatalf("InjectClaudeHooks failed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, "settings.json"))
+	if err != nil {
+		t.Fatalf("Failed to read settings.json: %v", err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatalf("Failed to parse settings: %v", err)
+	}
+
+	var hooks map[string]json.RawMessage
+	if err := json.Unmarshal(settings["hooks"], &hooks); err != nil {
+		t.Fatalf("Failed to parse hooks: %v", err)
+	}
+
+	var matchers []claudeHookMatcher
+	if err := json.Unmarshal(hooks["Stop"], &matchers); err != nil {
+		t.Fatalf("Failed to parse Stop matchers: %v", err)
+	}
+	if len(matchers) == 0 || len(matchers[0].Hooks) == 0 {
+		t.Fatal("Stop has no hooks")
+	}
+
+	hook := matchers[0].Hooks[0]
+	if hook.Async {
+		t.Error("Stop hook must be synchronous (Async should be false) so Claude Code reads the busy-parent {decision:\"block\"} — see issue #1225/#1226 activation")
+	}
+	if want := StopHookSyncMarkerEnv + "=1 " + hookHandlerCommand(); hook.Command != want {
+		t.Errorf("Stop hook command = %q, want %q", hook.Command, want)
+	}
+}
+
+func TestPreCompactHookIsSynchronous(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	if _, err := InjectClaudeHooks(tmpDir); err != nil {
+		t.Fatalf("InjectClaudeHooks failed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, "settings.json"))
+	if err != nil {
+		t.Fatalf("Failed to read settings.json: %v", err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatalf("Failed to parse settings: %v", err)
+	}
+
+	var hooks map[string]json.RawMessage
+	if err := json.Unmarshal(settings["hooks"], &hooks); err != nil {
+		t.Fatalf("Failed to parse hooks: %v", err)
+	}
+
+	var matchers []claudeHookMatcher
+	if err := json.Unmarshal(hooks["PreCompact"], &matchers); err != nil {
+		t.Fatalf("Failed to parse PreCompact matchers: %v", err)
+	}
+
+	if len(matchers) == 0 || len(matchers[0].Hooks) == 0 {
+		t.Fatal("PreCompact has no hooks")
+	}
+
+	hook := matchers[0].Hooks[0]
+	if hook.Async {
+		t.Error("PreCompact hook must be synchronous (Async should be false)")
+	}
+	if hook.Command != hookHandlerCommand() {
+		t.Errorf("PreCompact hook command = %q, want %q", hook.Command, hookHandlerCommand())
+	}
+}
+
+// TestPermissionRequestHookIsSynchronous guards the fix for the headless /
+// /remote-control silent-deny: an async PermissionRequest hook with no UI
+// fallback was treated as a non-decision and Claude Code defaulted to deny.
+// Sync mode lets Claude Code consult the hook's stdout decision.
+func TestPermissionRequestHookIsSynchronous(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	if _, err := InjectClaudeHooks(tmpDir); err != nil {
+		t.Fatalf("InjectClaudeHooks failed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, "settings.json"))
+	if err != nil {
+		t.Fatalf("Failed to read settings.json: %v", err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatalf("Failed to parse settings: %v", err)
+	}
+
+	var hooks map[string]json.RawMessage
+	if err := json.Unmarshal(settings["hooks"], &hooks); err != nil {
+		t.Fatalf("Failed to parse hooks: %v", err)
+	}
+
+	var matchers []claudeHookMatcher
+	if err := json.Unmarshal(hooks["PermissionRequest"], &matchers); err != nil {
+		t.Fatalf("Failed to parse PermissionRequest matchers: %v", err)
+	}
+
+	if len(matchers) == 0 || len(matchers[0].Hooks) == 0 {
+		t.Fatal("PermissionRequest has no hooks")
+	}
+
+	hook := matchers[0].Hooks[0]
+	if hook.Async {
+		t.Error("PermissionRequest hook must be synchronous (Async should be false) so Claude Code consults the hook's stdout decision")
+	}
+	if hook.Command != hookHandlerCommand() {
+		t.Errorf("PermissionRequest hook command = %q, want %q", hook.Command, hookHandlerCommand())
+	}
+}
+
+func TestInjectClaudeHooks_PreservesExisting(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Write existing settings with a custom setting and user hook
+	existing := map[string]json.RawMessage{
+		"apiKey": json.RawMessage(`"sk-test-123"`),
+		"hooks": json.RawMessage(`{
+			"SessionStart": [{"hooks": [{"type": "command", "command": "my-custom-hook"}]}]
+		}`),
+	}
+	data, _ := json.MarshalIndent(existing, "", "  ")
+	if err := os.WriteFile(filepath.Join(tmpDir, "settings.json"), data, 0644); err != nil {
+		t.Fatalf("Failed to write settings.json: %v", err)
+	}
+
+	installed, err := InjectClaudeHooks(tmpDir)
+	if err != nil {
+		t.Fatalf("InjectClaudeHooks failed: %v", err)
+	}
+	if !installed {
+		t.Error("Expected hooks to be installed")
+	}
+
+	// Verify existing setting is preserved
+	readData, err := os.ReadFile(filepath.Join(tmpDir, "settings.json"))
+	if err != nil {
+		t.Fatalf("Failed to read settings.json: %v", err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(readData, &settings); err != nil {
+		t.Fatalf("Failed to parse settings: %v", err)
+	}
+
+	if string(settings["apiKey"]) != `"sk-test-123"` {
+		t.Errorf("apiKey was not preserved: %s", settings["apiKey"])
+	}
+
+	// Verify user hook is preserved alongside agent-deck hook
+	var hooks map[string]json.RawMessage
+	if err := json.Unmarshal(settings["hooks"], &hooks); err != nil {
+		t.Fatalf("Failed to parse hooks: %v", err)
+	}
+
+	var matchers []claudeHookMatcher
+	if err := json.Unmarshal(hooks["SessionStart"], &matchers); err != nil {
+		t.Fatalf("Failed to parse SessionStart matchers: %v", err)
+	}
+
+	// Should have the original matcher with user hook, plus agent-deck's hook appended
+	foundCustom := false
+	foundAgentDeck := false
+	for _, m := range matchers {
+		for _, h := range m.Hooks {
+			if h.Command == "my-custom-hook" {
+				foundCustom = true
+			}
+			if isAgentDeckHookCommand(h.Command) {
+				foundAgentDeck = true
+			}
+		}
+	}
+
+	if !foundCustom {
+		t.Error("User's custom hook was not preserved")
+	}
+	if !foundAgentDeck {
+		t.Error("Agent-deck hook was not added")
+	}
+}
+
+func TestInjectClaudeHooks_Idempotent(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// First install
+	installed1, err := InjectClaudeHooks(tmpDir)
+	if err != nil {
+		t.Fatalf("First install failed: %v", err)
+	}
+	if !installed1 {
+		t.Error("First install should return true")
+	}
+
+	// Second install should be a no-op
+	installed2, err := InjectClaudeHooks(tmpDir)
+	if err != nil {
+		t.Fatalf("Second install failed: %v", err)
+	}
+	if installed2 {
+		t.Error("Second install should return false (already installed)")
+	}
+
+	// Verify no duplicate hooks
+	data, err := os.ReadFile(filepath.Join(tmpDir, "settings.json"))
+	if err != nil {
+		t.Fatalf("Failed to read settings.json: %v", err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatalf("Failed to parse settings: %v", err)
+	}
+
+	var hooks map[string]json.RawMessage
+	if err := json.Unmarshal(settings["hooks"], &hooks); err != nil {
+		t.Fatalf("Failed to parse hooks: %v", err)
+	}
+
+	var matchers []claudeHookMatcher
+	if err := json.Unmarshal(hooks["SessionStart"], &matchers); err != nil {
+		t.Fatalf("Failed to parse SessionStart matchers: %v", err)
+	}
+
+	hookCount := 0
+	for _, m := range matchers {
+		for _, h := range m.Hooks {
+			if isAgentDeckHookCommand(h.Command) {
+				hookCount++
+			}
+		}
+	}
+	if hookCount != 1 {
+		t.Errorf("Expected 1 agent-deck hook, got %d (duplication bug)", hookCount)
+	}
+}
+
+func TestRemoveClaudeHooks(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Install first
+	if _, err := InjectClaudeHooks(tmpDir); err != nil {
+		t.Fatalf("InjectClaudeHooks failed: %v", err)
+	}
+
+	// Remove
+	removed, err := RemoveClaudeHooks(tmpDir)
+	if err != nil {
+		t.Fatalf("RemoveClaudeHooks failed: %v", err)
+	}
+	if !removed {
+		t.Error("Expected hooks to be removed")
+	}
+
+	// Verify hooks are gone
+	if CheckClaudeHooksInstalled(tmpDir) {
+		t.Error("Hooks should not be installed after removal")
+	}
+}
+
+func TestRemoveClaudeHooks_PreservesUserHooks(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Write settings with both user and agent-deck hooks
+	existing := map[string]json.RawMessage{
+		"hooks": json.RawMessage(`{
+			"SessionStart": [
+				{"hooks": [{"type": "command", "command": "my-custom-hook"}, {"type": "command", "command": "agent-deck hook-handler", "async": true}]}
+			]
+		}`),
+	}
+	data, _ := json.MarshalIndent(existing, "", "  ")
+	if err := os.WriteFile(filepath.Join(tmpDir, "settings.json"), data, 0644); err != nil {
+		t.Fatalf("Failed to write settings.json: %v", err)
+	}
+
+	// Remove agent-deck hooks
+	removed, err := RemoveClaudeHooks(tmpDir)
+	if err != nil {
+		t.Fatalf("RemoveClaudeHooks failed: %v", err)
+	}
+	if !removed {
+		t.Error("Expected hooks to be removed")
+	}
+
+	// Verify user hook is preserved
+	readData, err := os.ReadFile(filepath.Join(tmpDir, "settings.json"))
+	if err != nil {
+		t.Fatalf("Failed to read settings.json: %v", err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(readData, &settings); err != nil {
+		t.Fatalf("Failed to parse settings: %v", err)
+	}
+
+	var hooks map[string]json.RawMessage
+	if err := json.Unmarshal(settings["hooks"], &hooks); err != nil {
+		t.Fatalf("Failed to parse hooks: %v", err)
+	}
+
+	var matchers []claudeHookMatcher
+	if err := json.Unmarshal(hooks["SessionStart"], &matchers); err != nil {
+		t.Fatalf("Failed to parse SessionStart matchers: %v", err)
+	}
+
+	foundCustom := false
+	foundAgentDeck := false
+	for _, m := range matchers {
+		for _, h := range m.Hooks {
+			if h.Command == "my-custom-hook" {
+				foundCustom = true
+			}
+			if isAgentDeckHookCommand(h.Command) {
+				foundAgentDeck = true
+			}
+		}
+	}
+
+	if !foundCustom {
+		t.Error("User hook should be preserved")
+	}
+	if foundAgentDeck {
+		t.Error("Agent-deck hook should be removed")
+	}
+}
+
+func TestCheckClaudeHooksInstalled(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Not installed yet
+	if CheckClaudeHooksInstalled(tmpDir) {
+		t.Error("Hooks should not be installed initially")
+	}
+
+	// Install
+	if _, err := InjectClaudeHooks(tmpDir); err != nil {
+		t.Fatalf("InjectClaudeHooks failed: %v", err)
+	}
+
+	// Should be installed
+	if !CheckClaudeHooksInstalled(tmpDir) {
+		t.Error("Hooks should be installed after InjectClaudeHooks")
+	}
+
+	// Remove
+	if _, err := RemoveClaudeHooks(tmpDir); err != nil {
+		t.Fatalf("RemoveClaudeHooks failed: %v", err)
+	}
+
+	// Should not be installed
+	if CheckClaudeHooksInstalled(tmpDir) {
+		t.Error("Hooks should not be installed after RemoveClaudeHooks")
+	}
+}
+
+func TestNotificationMatcher(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	if _, err := InjectClaudeHooks(tmpDir); err != nil {
+		t.Fatalf("InjectClaudeHooks failed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, "settings.json"))
+	if err != nil {
+		t.Fatalf("Failed to read settings.json: %v", err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatalf("Failed to parse settings: %v", err)
+	}
+
+	var hooks map[string]json.RawMessage
+	if err := json.Unmarshal(settings["hooks"], &hooks); err != nil {
+		t.Fatalf("Failed to parse hooks: %v", err)
+	}
+
+	// Notification event should have a matcher pattern
+	var matchers []claudeHookMatcher
+	if err := json.Unmarshal(hooks["Notification"], &matchers); err != nil {
+		t.Fatalf("Failed to parse Notification matchers: %v", err)
+	}
+
+	if len(matchers) == 0 {
+		t.Fatal("Notification has no matchers")
+	}
+	if matchers[0].Matcher != "permission_prompt|elicitation_dialog" {
+		t.Errorf("Notification matcher = %q, want %q", matchers[0].Matcher, "permission_prompt|elicitation_dialog")
+	}
+}
+
+// TestHooksAlreadyInstalled_DetectsAsyncDrift guards the binary-upgrade
+// case: settings.json may have an agent-deck hook with stale Async config
+// from a previous version. hooksAlreadyInstalled must return false so
+// InjectClaudeHooks rewrites the entry to match the current config.
+func TestHooksAlreadyInstalled_DetectsAsyncDrift(t *testing.T) {
+	// Build a hooks map that has every required event but with PermissionRequest
+	// stuck at Async=true (the pre-2026-04-29 config). The current code wants
+	// Async=false. This must register as drift.
+	staleHooks := map[string]json.RawMessage{}
+	for _, cfg := range hookEventConfigs {
+		stale := claudeHookMatcher{
+			Matcher: cfg.Matcher,
+			Hooks:   []claudeHookEntry{{Type: "command", Command: agentDeckHookCommand, Async: true}},
+		}
+		raw, _ := json.Marshal([]claudeHookMatcher{stale})
+		staleHooks[cfg.Event] = raw
+	}
+
+	if hooksAlreadyInstalled(staleHooks) {
+		t.Errorf("hooksAlreadyInstalled returned true on stale Async; expected false to trigger reinstall")
+	}
+}
+
+// TestInjectClaudeHooks_UpdatesStaleAsync verifies the integration: a
+// settings.json that already contains the agent-deck PermissionRequest hook
+// but with the old Async=true gets rewritten to Async=false on the next
+// InjectClaudeHooks call.
+func TestInjectClaudeHooks_UpdatesStaleAsync(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Hand-craft a settings.json mimicking the post-mitigation pre-fix
+	// state: PermissionRequest present with Async=true (stale).
+	stalePermissionRequest := []claudeHookMatcher{
+		{Hooks: []claudeHookEntry{{Type: "command", Command: agentDeckHookCommand, Async: true}}},
+	}
+	staleRaw, _ := json.Marshal(stalePermissionRequest)
+	hooks := map[string]json.RawMessage{"PermissionRequest": staleRaw}
+
+	// Add the rest of the events with whatever Async flags hookEventConfigs
+	// expects so only PermissionRequest is the drift point.
+	for _, cfg := range hookEventConfigs {
+		if cfg.Event == "PermissionRequest" {
+			continue
+		}
+		entry := claudeHookMatcher{
+			Matcher: cfg.Matcher,
+			Hooks:   []claudeHookEntry{{Type: "command", Command: agentDeckHookCommand, Async: cfg.Async}},
+		}
+		raw, _ := json.Marshal([]claudeHookMatcher{entry})
+		hooks[cfg.Event] = raw
+	}
+
+	settings := map[string]json.RawMessage{}
+	hooksRaw, _ := json.Marshal(hooks)
+	settings["hooks"] = hooksRaw
+	data, _ := json.MarshalIndent(settings, "", "  ")
+	if err := os.WriteFile(filepath.Join(tmpDir, "settings.json"), data, 0644); err != nil {
+		t.Fatalf("Failed to seed settings.json: %v", err)
+	}
+
+	// Run InjectClaudeHooks; it should detect drift and rewrite.
+	installed, err := InjectClaudeHooks(tmpDir)
+	if err != nil {
+		t.Fatalf("InjectClaudeHooks failed: %v", err)
+	}
+	if !installed {
+		t.Errorf("InjectClaudeHooks returned installed=false; expected true because stale Async should trigger reinstall")
+	}
+
+	// Verify the post-write Async flag is now false.
+	postData, err := os.ReadFile(filepath.Join(tmpDir, "settings.json"))
+	if err != nil {
+		t.Fatalf("Failed to read settings.json after reinstall: %v", err)
+	}
+	var postSettings map[string]json.RawMessage
+	if err := json.Unmarshal(postData, &postSettings); err != nil {
+		t.Fatalf("Failed to parse settings: %v", err)
+	}
+	var postHooks map[string]json.RawMessage
+	if err := json.Unmarshal(postSettings["hooks"], &postHooks); err != nil {
+		t.Fatalf("Failed to parse hooks: %v", err)
+	}
+	var postPR []claudeHookMatcher
+	if err := json.Unmarshal(postHooks["PermissionRequest"], &postPR); err != nil {
+		t.Fatalf("Failed to parse PermissionRequest: %v", err)
+	}
+	if len(postPR) == 0 || len(postPR[0].Hooks) == 0 {
+		t.Fatal("PermissionRequest has no hooks after reinstall")
+	}
+	if postPR[0].Hooks[0].Async {
+		t.Errorf("Post-reinstall PermissionRequest still has Async=true; expected false")
+	}
+	if postPR[0].Hooks[0].Command != hookHandlerCommand() {
+		t.Errorf("Post-reinstall command = %q, want %q", postPR[0].Hooks[0].Command, hookHandlerCommand())
+	}
+}

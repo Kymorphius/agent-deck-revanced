@@ -1,0 +1,50 @@
+
+  Ran 3 shell xxxxxxxx
+
+⏺ xxxxxxxxxx* xxxx xxxx xxxx xxx xxxxxxx (xxxxxxx 'xxxxxxxx'), xx x'xx xxxxxx xx x xxxxx xxx -x xxxxxxxxxxx.
+
+  Ran 2 shell xxxxxxxx
+
+⏺ xxxxxxx xxx xxxxxxx xxxxxxx (xxx -x, xxxxxxx xxxx/xxx, xxxxxxxx xx x xxxxxxx xxxx xxxxxx, xxxx xxxxxxxxxxx xxxxxx).
+
+  Ran 2 shell xxxxxxxx
+
+⏺ xxx xxxxxxxxx xxxxx xx xxx xxxxxxx xxxxxx. xxx x xxxxxx xxxxxxx, xxxx xxx xxx xx xx xxxxx xxxxxxx xxxx xxx xxxxxx.
+
+  Ran 2 shell xxxxxxxx
+
+⏺ xxx xxxxxxx; xxxxxxxxxxx xxxxxx xxxxx xx "xxxxxxxxxxx". xxxxxxxxx xxxxxxx, xxxxxx, xxxx+x, xxxxxx/xxxxxx xxxxxx xx xxx xxxx.
+
+  Ran 3 shell xxxxxxxx
+
+⏺ xxx-xxxxxxxx xx xxxx (xx xxxx, xxx x xxxxxxx). xxxxxxxxxx xxx xxxxxxxxx xxxxxx xxx xxxxxxxx xxxx+x.
+
+  Ran 1 shell xxxxxxx
+
+⏺ xxxx+x xxxx xx xxxxxxx xxxxxx xx x xxxxx xx-xx. xxxx: xxxxxx/xxxxxx xxx xxx xxxxxx-xxxx xxxxxx xxxxx.
+
+  Ran 2 shell xxxxxxxx
+
+⏺ xxxxxx/xxxxxx xxxxx, xxxxx xxxxxxx xxx xxxx, xx xxxxx xx xxxxx xxxxx. xxx xxx xxx-xxxxxx xxxxxx xxxx xxxxx.
+
+  Ran 1 shell xxxxxxx
+
+⏺ xxxxxx xxxxxxx xxx xxxxxx xxxx xxxxxx; xxx xxxxxxx xxxxxx xxxxx xxxxx xx. xxx xxx-xxx xxxxxx.
+
+  Ran 2 shell xxxxxxxx
+
+⏺ xxxxxx xxx xxxxxxx (xxxx = xxxxxx, xxxxx ≤ xxxx). xxxxxx x xxxxxxxxxx xxxxxxx xxxxx xxx xxx xxxxx xxxxx xxxx.
+
+  Running xx /xxx/xxxx-xxxxxx-xxxx-x00x0000 && read IN OUT … · 5s
+  ⎿  $ xx /xxx/xxxx-xxxxxx-xxxx-x00x0000 && read IN OUT < xxx-xxxxxxx; X=$(xxxx -X $IN xx -X '#{xxxxxxx_xxxx}' | grep xxxxx); xxxx -X $IN xxxx-xxxx -x $X "xxxx 'xxx́x́ x́x́x́ x́x́x́́ x́x́x́ ́ ́ ́ ́ xx́x́x́ ｘｘ done'"
+     xxxxx; x(){ xxxx -x $xxx xxxx-xxxx -x xxxx "$@"; }; x xx xx xx xx xx xx xx xx; xxxxx … (xx)
+     (xxxx+x xxxx+x (xxxxx) xx xxx in background)
+
+✳ Pondering… (5m 11s · ↓ 00.0k tokens)
+  ⎿  Tip: Xxx /xxx xx xxx x xxxxx xxxx xxxxxxxx xxxxxxx xxxxxxxxxxxx Xxxxxx'x xxxxxxx xxxx
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xxxxxx-xxxx-x00x0000 ─
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [xxxxxxxx] x@xxxx:/xxxxxxx/xxx/xxxx-xxxxxx-xxxx-x00x0000/xxxxxxx | [Xxxx 0.0] ctx:00% in:000.0k out:000 5h:0% 7d:0%
+  ⏵⏵ bypass permissions on · 1 shell · ← for agents

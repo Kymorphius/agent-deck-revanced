@@ -1,0 +1,48 @@
+
+
+                    ╭────────────────────────────────────────────────────────────╮╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+                    │ 🔍 Recall                                                  ││ 📄 recall-hit-00                                                                               │
+                    │ refreshing the index (bounded: 150 ms / 32 MB per pass)... ││ claude  aaaaaaaa-000                                                                           │
+                    │                                                            ││ 📁 /Users/x/proj                                                                               │
+                    │ ╭────────────────────────────────────────────────────────╮ ││ 未管理（当前列表）                                                                             │
+                    │ │ > Search every conversation on this machine...         │ ││                                                                                                │
+                    │ ╰────────────────────────────────────────────────────────╯ ││ loading turns...                                                                               │
+                    │                                                            ││                                                                                                │
+                    │   0 matching message(s)                                    ││                                                                                                │
+                    │   › recall-hit-00                                          ││                                                                                                │
+                    │     [未管理] claude • 1 in body                            ││                                                                                                │
+                    │     recall-hit-01                                          ││                                                                                                │
+                    │     [未管理] claude • 1 in body                            ││                                                                                                │
+                    │     recall-hit-02                                          ││                                                                                                │
+                    │     [未管理] claude • 1 in body                            ││                                                                                                │
+                    │     recall-hit-03                                          ││                                                                                                │
+                    │     [未管理] claude • 1 in body                            ││                                                                                                │
+                    │     recall-hit-04                                          ││                                                                                                │
+                    │     [未管理] claude • 1 in body                            ││                                                                                                │
+                    │     recall-hit-05                                          ││                                                                                                │
+                    │     [未管理] claude • 1 in body                            ││                                                                                                │
+                    │     recall-hit-06                                          ││                                                                                                │
+                    │     [未管理] claude • 1 in body                            ││                                                                                                │
+                    │     recall-hit-07                                          ││                                                                                                │
+                    │     [未管理] claude • 1 in body                            ││                                                                                                │
+                    │     recall-hit-08                                          ││                                                                                                │
+                    │     [未管理] claude • 1 in body                            ││                                                                                                │
+                    │     recall-hit-09                                          ││                                                                                                │
+                    │     [未管理] claude • 1 in body                            ││                                                                                                │
+                    │     recall-hit-10                                          ││                                                                                                │
+                    │     [未管理] claude • 1 in body                            ││                                                                                                │
+                    │     recall-hit-11                                          ││                                                                                                │
+                    │     [未管理] claude • 1 in body                            ││                                                                                                │
+                    │     recall-hit-12                                          ││                                                                                                │
+                    │     [未管理] claude • 1 in body                            ││                                                                                                │
+                    │     recall-hit-13                                          ││                                                                                                │
+                    │     [未管理] claude • 1 in body                            ││                                                                                                │
+                    │     recall-hit-14                                          ││                                                                                                │
+                    │     [未管理] claude • 1 in body                            ││                                                                                                │
+                    │                                                            ││                                                                                                │
+                    │ [↑↓] Select  [Enter] Open  [Tab] Local                     ││                                                                                                │
+                    │ [Ctrl+R/F5] Refresh  [Esc] Cancel  [ ] scroll preview      ││                                                                                                │
+                    │                                                            ││                                                                                                │
+                    │                                                            ││                                                                                                │
+                    │                                                            ││                                                                                                │
+                    ╰────────────────────────────────────────────────────────────╯╰────────────────────────────────────────────────────────────────────────────────────────────────╯

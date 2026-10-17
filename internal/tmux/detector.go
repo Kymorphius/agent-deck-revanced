@@ -1,0 +1,951 @@
+package tmux
+
+import (
+	"regexp"
+	"strings"
+	"unicode/utf8"
+)
+
+// SessionState represents the detected state of a session
+type SessionState string
+
+const (
+	StateIdle    SessionState = "idle"    // No activity, waiting for user
+	StateBusy    SessionState = "busy"    // Actively working (output changing)
+	StateWaiting SessionState = "waiting" // Showing a prompt, needs input
+)
+
+// =============================================================================
+// Prompt Detector - Detects tool-specific prompts (from Claude Squad source)
+// =============================================================================
+
+// PromptDetector checks for tool-specific prompts in terminal content
+// Based on Claude Squad's exact implementation:
+// https://github.com/smtg-ai/claude-squad/blob/main/session/tmux/tmux.go
+type PromptDetector struct {
+	tool string
+}
+
+// NewPromptDetector creates a detector for the specified tool
+func NewPromptDetector(tool string) *PromptDetector {
+	return &PromptDetector{tool: strings.ToLower(tool)}
+}
+
+// HasPrompt checks if the terminal content contains a prompt waiting for input
+// These patterns are derived from Claude Squad + additional research for edge cases
+func (d *PromptDetector) HasPrompt(content string) bool {
+	switch d.tool {
+	case "claude":
+		return d.hasClaudePrompt(content)
+
+	case "opencode":
+		// OpenCode TUI - the UI is always visible (input box, mode tabs, logo),
+		// so we MUST check busy indicators first. If opencode is actively working,
+		// return false to let the busy detector handle status correctly.
+		//
+		// Busy indicators (from opencode source: internal/tui/components/chat/list.go):
+		//   - Help bar shows "esc" when busy (to cancel), vs "enter" when idle (to send)
+		//   - Pulse spinner: █ ▓ ▒ ░ (spinner.Pulse, 125ms cycle)
+		//   - Task strings: "Thinking...", "Generating...", "Building tool call...",
+		//     "Waiting for tool response...", "Loading..."
+		if d.hasOpencodeBusyIndicator(content) {
+			return false
+		}
+		// Idle: check for opencode-specific prompt patterns
+		// "press enter to send" only appears when idle (help bar text)
+		// "Ask anything" is the input placeholder
+		return strings.Contains(content, "press enter to send") ||
+			strings.Contains(content, "Ask anything") ||
+			strings.Contains(content, "open code") ||
+			strings.Contains(content, "enter submit") ||
+			strings.Contains(content, "esc dismiss") ||
+			d.hasLineEndingWith(content, ">")
+
+	case "gemini":
+		return d.hasGeminiPrompt(content)
+
+	case "codex":
+		// Codex/OpenAI CLI patterns.
+		// Busy indicators take priority over prompt markers, but only when the
+		// phrase has the shape of Codex's live status UI. Assistant prose and
+		// quoted examples remain in the pane above the current composer.
+		if codexLiveStatusLine(content) ||
+			hasCodexInterruptBusyProvenance(content, codexInterruptPhrases...) {
+			return false
+		}
+		// Direct prompt strings
+		if strings.Contains(content, "codex>") ||
+			strings.Contains(content, "Continue?") ||
+			strings.Contains(content, "How can I help") {
+			return true
+		}
+		// Codex uses › (U+203A) as its prompt marker, similar to Claude's ❯.
+		// The prompt appears as "› suggestion text" near the bottom of the pane
+		// with a status bar (model · path · branch · usage) below it.
+		return d.hasCodexPromptMarker(content)
+
+	case "cursor":
+		return d.hasCursorPrompt(content)
+
+	case "deepseek":
+		return d.hasDeepSeekPrompt(content)
+
+	case "omp":
+		return d.hasOMPPrompt(content)
+
+	default:
+		// Generic shell - check for common prompts
+		return d.hasShellPrompt(content)
+	}
+}
+
+func (d *PromptDetector) hasOMPPrompt(content string) bool {
+	if strings.Contains(content, "⟨esc⟩") {
+		return false
+	}
+	if ompApprovalPrompt.MatchString(content) {
+		return true
+	}
+	return d.hasShellPrompt(content)
+}
+
+var ompApprovalPrompt = regexp.MustCompile(`(?m)^\s*Allow tool:\s`)
+
+// hasDeepSeekPrompt detects a DeepSeek Harness pane that is waiting.
+//
+// Without this arm deepseek fell through to hasShellPrompt, which looks for
+// "$ ", "# " and "% " — shell prompt glyphs a dsh pane never prints, so the
+// detector and the deepseek pattern preset disagreed about the same pane
+// (PR #1942 adversarial review).
+//
+// "Waiting" for the shipped profiles means the web server has announced itself
+// and is serving nothing: `dsh web: http://127.0.0.1:3080`. Busy is checked
+// first so a working turn on an installed interactive profile is never read as
+// idle. The headless profile has no waiting state at all — it answers and exits.
+//
+// This arm strictly ADDS to the previous behaviour rather than replacing it. An
+// INSTALLED interactive profile brings a prompt glyph agent-deck cannot know in
+// advance, so anything the web banner does not explain falls through to the same
+// generic heuristic deepseek used before this arm existed. Answering a hard
+// "not ready" for those panes would deny the startup-window fast path forever
+// and make readiness strictly worse than having no arm at all.
+func (d *PromptDetector) hasDeepSeekPrompt(content string) bool {
+	lower := strings.ToLower(content)
+	if strings.Contains(lower, "esc to interrupt") ||
+		strings.Contains(lower, "ctrl+c to interrupt") {
+		return false
+	}
+	if deepSeekWebReadyLine.MatchString(content) {
+		return true
+	}
+	return d.hasShellPrompt(content)
+}
+
+// deepSeekWebReadyLine matches the single line `dsh web` prints once it is
+// serving. Mirrors the prompt pattern in the deepseek preset (patterns.go) so
+// the two cannot drift.
+var deepSeekWebReadyLine = regexp.MustCompile(`(?mi)^dsh web:\s+https?://`)
+
+// isHorizontalRuleLine reports whether line is one of the box rules Claude
+// draws above and below its input box (optionally carrying the session title
+// at the right edge: "──────── account ─").
+func isHorizontalRuleLine(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(StripANSI(line)), "─────")
+}
+
+// hasClaudePrompt detects if Claude Code is waiting for input
+// Handles BOTH normal mode AND --dangerously-skip-permissions mode
+//
+// Claude Code UI States (from research):
+// - BUSY: Shows "ctrl+c to interrupt" (2024+) or "esc to interrupt" (older) with spinner
+// - WAITING (normal mode): Shows permission dialogs with Yes/No options
+// - WAITING (--dangerously-skip-permissions): Shows just ">" prompt
+// - THINKING: Extended reasoning mode with "think"/"think harder" keywords
+// - AUTO-ACCEPT: Toggled via Shift+Tab, auto-applies edits
+//
+// References:
+// - Claude Squad: github.com/smtg-ai/claude-squad
+// - CCManager state detection
+// - cli-spinners: github.com/sindresorhus/cli-spinners (dots spinner)
+func (d *PromptDetector) hasClaudePrompt(content string) bool {
+	if hasClaudeLiveSpinner(content) {
+		return false
+	}
+	// Get last 15 lines for analysis (increased from 10 for better context)
+	lines := strings.Split(content, "\n")
+	var lastLines []string
+	for i := len(lines) - 1; i >= 0 && len(lastLines) < 15; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			lastLines = append([]string{lines[i]}, lastLines...)
+		}
+	}
+	recentContent := strings.Join(lastLines, "\n")
+	recentLower := strings.ToLower(recentContent)
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// BUSY indicators (if these are present, Claude is NOT waiting)
+	// Priority: Check busy state FIRST - if busy, definitely not waiting
+	// ═══════════════════════════════════════════════════════════════════════
+	busyIndicators := []string{
+		"ctrl+c to interrupt", // PRIMARY - current Claude Code (2024+)
+		"esc to interrupt",    // FALLBACK - older versions
+	}
+	for _, indicator := range busyIndicators {
+		if strings.Contains(recentLower, indicator) {
+			return false // Claude is BUSY, not waiting
+		}
+	}
+
+	// Check for spinner characters in last 3 lines (indicates active processing)
+	// Includes braille spinner chars (cli-spinners "dots") AND asterisk spinners (Claude 2.1.25+)
+	spinnerChars := []string{
+		"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+		"✳", "✽", "✶", "✢", // Claude 2.1.25+ asterisk spinner chars
+	}
+	// Check last 10 lines (spinner can be further up due to tip lines, borders, status bar)
+	last10Lines := lastLines
+	if len(last10Lines) > 10 {
+		last10Lines = last10Lines[len(last10Lines)-10:]
+	}
+	for _, line := range last10Lines {
+		// Skip lines starting with box-drawing characters (UI borders)
+		trimmedLine := strings.TrimSpace(line)
+		if len(trimmedLine) > 0 {
+			r := []rune(trimmedLine)[0]
+			if r == '│' || r == '├' || r == '└' || r == '─' || r == '┌' || r == '┐' || r == '┘' || r == '┤' || r == '┬' || r == '┴' || r == '┼' || r == '╭' || r == '╰' || r == '╮' || r == '╯' {
+				continue
+			}
+		}
+		for _, spinner := range spinnerChars {
+			if strings.Contains(line, spinner) {
+				// Spinner present in recent output = actively working
+				return false
+			}
+		}
+	}
+
+	// Check for timing indicators that show Claude is processing
+	// Claude 2.1.25+ uses whimsical words (90+ words like "Hullaballooing", "Clauding", etc.)
+	// with unicode ellipsis: "✢ Hullaballooing… (53s · ↓ 749 tokens)"
+	// The ellipsis and "tokens" must share a LINE: the idle footer carries both
+	// on separate lines ("… +24 lines (ctrl+o to expand)" + "new task? /clear
+	// to save 380k tokens"), which is not work (status-light audit, defect F).
+	if hasSameLineTimingCue(recentLower) {
+		return false // Actively processing (any whimsical word with timing info)
+	}
+	// Legacy patterns (pre-2.1.25)
+	if strings.Contains(recentLower, "thinking") && strings.Contains(recentLower, "tokens") {
+		return false // Actively thinking
+	}
+	if strings.Contains(recentLower, "connecting") && strings.Contains(recentLower, "tokens") {
+		return false // Connecting state
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// WAITING indicators - Permission prompts (normal mode)
+	// ═══════════════════════════════════════════════════════════════════════
+	permissionPrompts := []string{
+		// From Claude Squad (most reliable indicator)
+		"No, and tell Claude what to do differently",
+		// Permission dialog options
+		"Yes, allow once",
+		"Yes, allow always",
+		"Allow once",
+		"Allow always",
+		// Box-drawing permission dialogs
+		"│ Do you want",
+		"│ Would you like",
+		"│ Allow",
+		// Selection indicators
+		"❯ Yes",
+		"❯ No",
+		"❯ Allow",
+		// Trust prompt on startup
+		"Do you trust the files in this folder?",
+		// MCP permission prompts
+		"Allow this MCP server",
+		// Tool permission prompts
+		"Run this command?",
+		"Do you want to proceed?",
+		"Execute this?",
+		"Action Required",
+		"Waiting for user confirmation",
+		"Allow execution of",
+		// Numbered menu footer (present in all Claude Code permission dialogs)
+		"Esc to cancel",
+		// AskUserQuestion / interactive question UI
+		// Claude Code renders selection options with these indicators
+		"Use arrow keys to navigate",
+		"Press Enter to select",
+		// End-of-session feedback survey ("1: Bad 2: Fine 3: Good 0: Dismiss"):
+		// an open picker awaiting a choice (status-light audit, defect D).
+		"How is Claude doing this session?",
+	}
+	for _, prompt := range permissionPrompts {
+		if strings.Contains(content, prompt) {
+			return true
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// WAITING indicators - Input prompt (--dangerously-skip-permissions mode)
+	// In this mode, Claude just shows ">" when waiting for next input
+	// This is the PRIMARY detection method for skip-permissions mode
+	// ═══════════════════════════════════════════════════════════════════════
+
+	// Check if last non-empty line is the input prompt
+	if len(lastLines) > 0 {
+		lastLine := strings.TrimSpace(lastLines[len(lastLines)-1])
+
+		// Strip ANSI codes from last line for accurate matching
+		cleanLastLine := StripANSI(lastLine)
+		cleanLastLine = strings.TrimSpace(cleanLastLine)
+
+		// Claude Code shows just ">" or "❯" when waiting for input
+		// Note: Claude Code uses "❯" (Unicode U+276F), not ASCII ">"
+		// This is the standard prompt in --dangerously-skip-permissions mode
+		if cleanLastLine == ">" || cleanLastLine == "❯" {
+			return true
+		}
+
+		// Also check for "> " or "❯ " (with trailing space/cursor position)
+		if cleanLastLine == "> " || cleanLastLine == "❯ " {
+			return true
+		}
+
+		// Check for prompt with partial user input (user started typing)
+		// Pattern: "> some text" or "❯ some text" where user is typing
+		if (strings.HasPrefix(cleanLastLine, "> ") || strings.HasPrefix(cleanLastLine, "❯ ")) && !strings.Contains(cleanLastLine, "esc") {
+			// Make sure it's not a quote or output line
+			// Real prompts are short (user input in progress)
+			if len(cleanLastLine) < 100 {
+				return true
+			}
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// WAITING indicators - Prompt in recent lines (not just last line)
+	// Claude Code's UI has status bar AFTER the prompt, so check last 8 lines:
+	// the footer under the input box runs up to seven lines (rule, status
+	// line, mode line, update notice, compaction hint, /rc), as captured on
+	// live sessions in the status-light audit.
+	// ═══════════════════════════════════════════════════════════════════════
+	checkLines := lastLines
+	if len(checkLines) > 8 {
+		checkLines = checkLines[len(checkLines)-8:]
+	}
+	for idx, line := range checkLines {
+		cleanLine := strings.TrimSpace(StripANSI(line))
+		// Normalize non-breaking spaces (U+00A0) to regular spaces
+		// Claude Code uses NBSP after the prompt character
+		cleanLine = strings.ReplaceAll(cleanLine, "\u00A0", " ")
+		// Check for standalone prompt character (user hasn't typed yet)
+		if cleanLine == ">" || cleanLine == "❯" || cleanLine == "> " || cleanLine == "❯ " {
+			return true
+		}
+		// Prompt with an unsent draft: "❯ migrate all" drawn between the two
+		// horizontal rules of the input box. The rules tell it apart from an
+		// echoed earlier prompt ("❯ text" followed by a ⏺ reply) and from a
+		// menu option ("❯ 1. Leave it"). 11 of 46 audited idle Claude panes
+		// carried a draft; without this they had no prompt verdict at all.
+		if strings.HasPrefix(cleanLine, "❯ ") && idx > 0 && idx+1 < len(checkLines) &&
+			isHorizontalRuleLine(checkLines[idx-1]) && isHorizontalRuleLine(checkLines[idx+1]) {
+			return true
+		}
+		// Check for prompt with suggestion (Claude shows "❯ Try..." when waiting)
+		// This is Claude's suggestion feature - still means waiting for input
+		if strings.HasPrefix(cleanLine, "❯ Try ") || strings.HasPrefix(cleanLine, "> Try ") {
+			return true
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// WAITING indicators - Completion/question prompts
+	// ═══════════════════════════════════════════════════════════════════════
+	questionPrompts := []string{
+		"Continue?",
+		"Proceed?",
+		"(Y/n)",
+		"(y/N)",
+		"[Y/n]",
+		"[y/N]",
+		"(yes/no)",
+		"[yes/no]",
+		// Plan mode prompts
+		"Approve this plan?",
+		"Execute plan?",
+	}
+	for _, prompt := range questionPrompts {
+		if strings.Contains(recentContent, prompt) {
+			return true
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// WAITING indicators - Task completion signals
+	// When Claude finishes a task, it shows summary and waits for next input
+	// ═══════════════════════════════════════════════════════════════════════
+	completionIndicators := []string{
+		"Task completed",
+		"Done!",
+		"Finished",
+		"What would you like",
+		"What else",
+		"Anything else",
+		"Let me know if",
+	}
+	// Only check completion indicators if we also have the ">" prompt nearby
+	hasCompletionIndicator := false
+	for _, indicator := range completionIndicators {
+		if strings.Contains(recentLower, strings.ToLower(indicator)) {
+			hasCompletionIndicator = true
+			break
+		}
+	}
+	if hasCompletionIndicator {
+		// Check if there's a ">" or "❯" in the last few lines
+		completionCheckLines := lastLines
+		if len(completionCheckLines) > 3 {
+			completionCheckLines = completionCheckLines[len(completionCheckLines)-3:]
+		}
+		for _, line := range completionCheckLines {
+			cleanLine := strings.TrimSpace(StripANSI(line))
+			if cleanLine == ">" || cleanLine == "> " || cleanLine == "❯" || cleanLine == "❯ " {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// =============================================================================
+// Error Banner Detector (issue #1400)
+// =============================================================================
+
+// HasErrorBanner reports whether the terminal content shows an error banner
+// rendered by the tool itself — NOT conversation text discussing an error.
+// Used by status detection to classify a visibly broken session (auth failure,
+// dead connection) as "error" instead of "waiting": after such a failure the
+// tool redraws its input prompt below the banner, so prompt detection alone
+// reports waiting while the session cannot actually make progress (#1400).
+//
+// Implemented for Claude Code and codex; other tools return false.
+func (d *PromptDetector) HasErrorBanner(content string) bool {
+	switch d.tool {
+	case "claude":
+		return hasClaudeErrorBanner(content)
+	case "codex":
+		kind, _ := scanCodexErrorBanner(content)
+		return kind != ""
+	default:
+		return false
+	}
+}
+
+// claudeErrorBannerSubstrings are fragments of error banners Claude Code
+// actually renders in the pane. Observed shapes (field evidence, #1400):
+//
+//	Please run /login · API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"},...}
+//	API Error: 401 ... · Please run /login
+//	API Error (Connection error.) · socket connection closed
+//
+// Patterns are intentionally anchored on the rendered banner text ("API
+// Error: 401", the verbatim "Please run /login" instruction, the socket
+// failure message) rather than bare tokens like "401", so ordinary
+// conversation about errors does not match.
+var claudeErrorBannerSubstrings = []string{
+	// Auth failure (expired/invalid OAuth token or API key).
+	"API Error: 401",
+	"API Error (401",
+	"Please run /login",
+	// Connection failure banner.
+	"socket connection closed",
+}
+
+// claudeQuotedLinePrefixes mark pane lines that carry QUOTED or user-typed
+// content rather than a banner Claude Code itself rendered:
+//
+//	"⎿"      — tool-result connector: output of a command (e.g. a conductor
+//	           reading an errored child's pane via `session output`) may quote
+//	           another session's 401 banner verbatim. Genuine API-error retry
+//	           notices also render behind "⎿", but those panes show a busy
+//	           indicator, which takes precedence over error detection anyway.
+//	"❯", ">" — the input prompt: the user typing ABOUT a 401.
+//	"│"      — box-drawing UI (dialog/input-box content).
+//
+// Real banners render at message level (standalone line or assistant-style
+// "⏺" line — field evidence shows auth failures stored and rendered as the
+// turn's reply), so those stay matchable.
+var claudeQuotedLinePrefixes = []string{"⎿", "❯", ">", "│"}
+
+// claudeAssistantLinePrefix marks a line as an assistant-turn reply. Genuine
+// auth/connection banners can render on such a line, but so can ordinary
+// conversation that merely MENTIONS the banner text (e.g. a conductor
+// explaining "the worker showed API Error: 401 · Please run /login"). To avoid
+// a false error verdict on prose, an assistant line must ALSO carry a
+// structural banner co-signal (see claudeBannerStructuralMarkers) to match;
+// standalone banner lines (no assistant glyph) keep matching on the substring
+// alone.
+const claudeAssistantLinePrefix = "⏺"
+
+// claudeBannerStructuralMarkers are shapes the rendered banner reliably carries
+// but conversational prose about an error generally does not: the "·" segment
+// separator Claude uses to join banner parts, and the structured error JSON
+// payload. Required as a co-signal on assistant-glyph lines.
+var claudeBannerStructuralMarkers = []string{" · ", `{"type":"error"`}
+
+// hasClaudeErrorBanner scans the last 15 non-empty lines (same window as
+// hasClaudePrompt) for a banner-shaped error line.
+func hasClaudeErrorBanner(content string) bool {
+	return scanClaudeBannerLines(content, claudeErrorBannerSubstrings)
+}
+
+// scanClaudeBannerLines reports whether any of the last 15 non-empty lines is a
+// banner-shaped line containing one of patterns. It carries the over-match
+// guards that make banner detection trustworthy — quoted/input lines are
+// skipped, and an assistant-turn line must also show a structural banner marker
+// so prose merely mentioning the text does not match.
+//
+// The scan only reads the LAST turn (forEachCurrentTurnLine): it walks up from
+// the bottom and stops at the first submitted prompt below which a later turn
+// ran, so a banner the session has since moved past is history, not state
+// (audit C). A banner inside the last turn — including one printed just above
+// that turn's own "✻ Worked for 45s · done" summary, the mid-turn 401 shape
+// #1400 exists for — is current and still matches.
+//
+// Shared by hasClaudeErrorBanner (any tool-rendered failure banner) and the
+// auth-specific scan (authFailureBannerPatterns) so the two can never drift
+// apart on the guards.
+func scanClaudeBannerLines(content string, patterns []string) bool {
+	return forEachCurrentTurnLine(content, 15, func(line string) bool {
+		if hasAnyPrefix(line, claudeQuotedLinePrefixes) {
+			return false
+		}
+		// On an assistant-turn line, require a structural banner marker so
+		// prose mentioning the banner text is not misread as a live banner.
+		if strings.HasPrefix(line, claudeAssistantLinePrefix) && !containsAny(line, claudeBannerStructuralMarkers) {
+			return false
+		}
+		return containsAny(line, patterns)
+	})
+}
+
+// containsAny reports whether s contains any of the given substrings.
+func containsAny(s string, subs []string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasAnyPrefix reports whether s starts with any of the given prefixes.
+func hasAnyPrefix(s string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasCodexPromptMarker detects the › (U+203A) prompt marker used by Codex CLI.
+// Codex renders its prompt as:
+//
+//	› Run /review on my current changes
+//	  gpt-5.4 · ~/path/to/project · branch · 100% left · 0% used
+//
+// The marker appears at (or near) the start of a line in the last few lines.
+func (d *PromptDetector) hasCodexPromptMarker(content string) bool {
+	lines := strings.Split(content, "\n")
+	// Check last 10 non-empty lines (prompt may not be the very last line
+	// due to the status bar below it).
+	var lastLines []string
+	for i := len(lines) - 1; i >= 0 && len(lastLines) < 10; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			lastLines = append(lastLines, line)
+		}
+	}
+	for _, line := range lastLines {
+		clean := strings.TrimSpace(StripANSI(line))
+		if clean == "›" || clean == "› " ||
+			strings.HasPrefix(clean, "› ") {
+			return true
+		}
+	}
+	return false
+}
+
+var codexInterruptPhrases = []string{"esc to interrupt", "ctrl+c to interrupt"}
+
+const codexLegacySpinnerGlyphs = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+// hasCodexInterruptBusyProvenance reports whether a recent line is a live
+// Codex busy status rather than assistant/user prose that merely repeats an
+// interrupt phrase. Codex renders either an older standalone instruction
+// ("esc to interrupt" / "press esc to interrupt") or an activity label with
+// a parenthesized elapsed/interrupt status, optionally followed by inline
+// context ("Working (3s • esc to interrupt) · 1 background terminal running").
+//
+// Current Codex renders this structure in status_indicator_widget.rs: a
+// user-facing header, fmt_elapsed_compact output, a bullet and interrupt hint,
+// then optional ` · `-prefixed inline messages. A legacy braille-spinner form
+// without elapsed time is retained. Requiring one of those structures avoids
+// treating arbitrary "-ing" prose as activity.
+func hasCodexInterruptBusyProvenance(content string, phrases ...string) bool {
+	return hasCodexInterruptBusyProvenanceLines(lastNLines(content, 3), phrases...)
+}
+
+func hasCodexInterruptBusyProvenanceLines(lines []string, phrases ...string) bool {
+	for _, line := range lines {
+		clean := strings.ToLower(strings.TrimSpace(StripANSI(line)))
+		if clean == "" {
+			continue
+		}
+
+		for _, phrase := range phrases {
+			phrase = strings.ToLower(strings.TrimSpace(phrase))
+			if phrase == "" || !strings.Contains(clean, phrase) {
+				continue
+			}
+			if clean == phrase || clean == "press "+phrase {
+				return true
+			}
+
+			for searchFrom := 0; searchFrom < len(clean); {
+				phraseStart := strings.Index(clean[searchFrom:], phrase)
+				if phraseStart < 0 {
+					break
+				}
+				phraseStart += searchFrom
+				phraseEnd := phraseStart + len(phrase)
+				searchFrom = phraseEnd
+
+				if phraseEnd >= len(clean) || clean[phraseEnd] != ')' {
+					continue
+				}
+				remainder := clean[phraseEnd+1:]
+				if remainder != "" && !strings.HasPrefix(remainder, " · ") {
+					continue
+				}
+
+				openParen := strings.LastIndex(clean[:phraseStart], "(")
+				if openParen <= 0 {
+					continue
+				}
+				lead := strings.TrimSpace(clean[:openParen])
+				if lead == "" {
+					continue
+				}
+				interruptPrefix := strings.TrimSpace(clean[openParen+1 : phraseStart])
+				if isCodexElapsedInterruptPrefix(interruptPrefix) {
+					return true
+				}
+
+				first, _ := utf8.DecodeRuneInString(lead)
+				if strings.ContainsRune(codexLegacySpinnerGlyphs, first) &&
+					strings.TrimSpace(strings.TrimPrefix(lead, string(first))) != "" &&
+					interruptPrefix == "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func isCodexElapsedInterruptPrefix(prefix string) bool {
+	prefix = strings.TrimSpace(prefix)
+	separator := strings.LastIndexAny(prefix, "•·")
+	if separator <= 0 {
+		return false
+	}
+	if trailing := strings.TrimSpace(prefix[separator:]); trailing != "•" && trailing != "·" {
+		return false
+	}
+
+	elapsed := strings.TrimSpace(prefix[:separator])
+	first, rest, found := strings.Cut(elapsed, " ")
+	if !found {
+		return isCodexElapsedPart(first, 's', 0)
+	}
+	second, third, found := strings.Cut(rest, " ")
+	if !found {
+		return isCodexElapsedPart(first, 'm', 0) &&
+			isCodexElapsedPart(second, 's', 2)
+	}
+	return !strings.Contains(third, " ") &&
+		isCodexElapsedPart(first, 'h', 0) &&
+		isCodexElapsedPart(second, 'm', 2) &&
+		isCodexElapsedPart(third, 's', 2)
+}
+
+func isCodexElapsedPart(part string, unit byte, exactDigits int) bool {
+	if len(part) < 2 || part[len(part)-1] != unit {
+		return false
+	}
+	digits := part[:len(part)-1]
+	if exactDigits > 0 && len(digits) != exactDigits {
+		return false
+	}
+	for i := range len(digits) {
+		if digits[i] < '0' || digits[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// hasCursorPrompt detects when the Cursor Agent CLI is waiting for input.
+// Patterns mirror internal/tmux/patterns.go (cursor tool defaults).
+func (d *PromptDetector) hasCursorPrompt(content string) bool {
+	lower := strings.ToLower(content)
+	if strings.Contains(lower, "esc to interrupt") ||
+		strings.Contains(lower, "ctrl+c to interrupt") {
+		return false
+	}
+	if strings.Contains(content, "How can I help") ||
+		strings.Contains(content, "Ask questions") ||
+		strings.Contains(content, "Plan mode") ||
+		strings.Contains(content, "Switch modes") {
+		return true
+	}
+	return d.hasCodexPromptMarker(content)
+}
+
+// hasGeminiPrompt detects if Gemini CLI is waiting for input.
+// Checks last 10 non-blank lines for known Gemini prompt patterns.
+func (d *PromptDetector) hasGeminiPrompt(content string) bool {
+	lines := strings.Split(content, "\n")
+	var lastLines []string
+	for i := len(lines) - 1; i >= 0 && len(lastLines) < 10; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			lastLines = append([]string{line}, lastLines...)
+		}
+	}
+
+	for _, line := range lastLines {
+		// Direct prompt patterns
+		if line == "gemini>" || strings.Contains(line, "gemini>") {
+			return true
+		}
+		if strings.Contains(line, "Yes, allow once") {
+			return true
+		}
+		if strings.Contains(line, "Type your message") {
+			return true
+		}
+		// Generic trailing ">" prompt (common Gemini waiting state)
+		if strings.HasSuffix(line, ">") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hasLineEndingWith checks if any recent line ends with the given suffix
+func (d *PromptDetector) hasLineEndingWith(content string, suffix string) bool {
+	lines := strings.Split(content, "\n")
+	// Check last 5 lines
+	start := len(lines) - 5
+	if start < 0 {
+		start = 0
+	}
+	for i := len(lines) - 1; i >= start; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == suffix || strings.HasSuffix(line+" ", suffix+" ") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasShellPrompt checks for generic shell prompts
+func (d *PromptDetector) hasShellPrompt(content string) bool {
+	// Check last few lines for shell prompt patterns
+	lines := strings.Split(content, "\n")
+	if len(lines) == 0 {
+		return false
+	}
+
+	// Get last non-empty line
+	var lastLine string
+	for i := len(lines) - 1; i >= 0; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed != "" {
+			lastLine = trimmed
+			break
+		}
+	}
+
+	// Common shell prompt endings
+	shellPrompts := []string{"$ ", "# ", "% ", "❯ ", "➜ ", "> "}
+	for _, prompt := range shellPrompts {
+		if strings.HasSuffix(lastLine+" ", prompt) {
+			return true
+		}
+	}
+
+	// Yes/No confirmation prompts anywhere in recent output
+	confirmPatterns := []string{
+		"(Y/n)", "[Y/n]", "(y/N)", "[y/N]",
+		"(yes/no)", "[yes/no]",
+		"Continue?", "Proceed?",
+	}
+	// Check last 5 lines for confirmation prompts
+	checkLines := lines
+	if len(checkLines) > 5 {
+		checkLines = checkLines[len(checkLines)-5:]
+	}
+	recentContent := strings.Join(checkLines, "\n")
+	for _, pattern := range confirmPatterns {
+		if strings.Contains(recentContent, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hasOpencodeBusyIndicator checks if opencode's TUI shows signs of active processing.
+// OpenCode uses a Bubble Tea TUI with these busy signals:
+//   - Help bar: "esc interrupt" / "esc to exit" (only during processing)
+//   - Pulse spinner: █ ▓ ▒ ░ (cycles at 125ms)
+//   - Task text: "Thinking...", "Generating...", etc.
+func (d *PromptDetector) hasOpencodeBusyIndicator(content string) bool {
+	// Authoritative busy indicators: always override prompt detection.
+	if strings.Contains(content, "esc interrupt") || strings.Contains(content, "esc to exit") {
+		return true
+	}
+	// Authoritative busy task text.
+	busyStrings := []string{
+		"Thinking...",
+		"Generating...",
+		"Building tool call...",
+		"Waiting for tool response...",
+	}
+	for _, s := range busyStrings {
+		if strings.Contains(content, s) {
+			return true
+		}
+	}
+	// Pulse spinner chars: only indicate busy when no prompt-indicating strings
+	// are present. This prevents false positives when pulse chars appear in
+	// static UI elements (progress bars, decorative borders) alongside
+	// question tool prompts. (#255)
+	hasPromptIndicator := strings.Contains(content, "enter submit") ||
+		strings.Contains(content, "esc dismiss") ||
+		strings.Contains(content, "press enter to send") ||
+		strings.Contains(content, "Ask anything")
+	if !hasPromptIndicator {
+		pulseChars := []string{"█", "▓", "▒", "░"}
+		for _, ch := range pulseChars {
+			if strings.Contains(content, ch) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// =============================================================================
+// ANSI Stripping Utility
+// =============================================================================
+
+// StripANSI removes ANSI escape codes from content using O(n) single-pass algorithm.
+// This is important because terminal output contains color codes.
+//
+// PERFORMANCE: Uses strings.Builder with pre-allocation for O(n) time complexity.
+// Previous implementation used string concatenation in loops which was O(n²)
+// and caused 2-11 second UI freezes on large terminal output (Issue #39).
+//
+// NOTE: We intentionally avoid regex here because complex ANSI regex patterns
+// can cause catastrophic backtracking on malformed escape sequences.
+func StripANSI(content string) string {
+	// Fast path: if no escape chars, return as-is
+	// Note: Using IndexByte instead of ContainsAny to avoid UTF-8 validation issues
+	// \x1b is ESC, \x9B is CSI (C1 control character)
+	if strings.IndexByte(content, '\x1b') < 0 && strings.IndexByte(content, '\x9B') < 0 {
+		return content
+	}
+
+	var b strings.Builder
+	b.Grow(len(content)) // Pre-allocate to avoid reallocations
+
+	i := 0
+	for i < len(content) {
+		// Check for ESC character
+		if content[i] == '\x1b' {
+			// CSI sequence: ESC [ ... letter
+			if i+1 < len(content) && content[i+1] == '[' {
+				j := i + 2
+				// Skip until we find the terminating letter
+				for j < len(content) {
+					c := content[j]
+					if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+						j++
+						break
+					}
+					j++
+				}
+				i = j
+				continue
+			}
+			// OSC sequence: ESC ] ... BEL
+			if i+1 < len(content) && content[i+1] == ']' {
+				// Find BEL terminator
+				bellPos := strings.Index(content[i:], "\x07")
+				if bellPos != -1 {
+					i += bellPos + 1
+					continue
+				}
+				// No BEL found - find ST (ESC \) as alternative terminator
+				stPos := strings.Index(content[i:], "\x1b\\")
+				if stPos != -1 {
+					i += stPos + 2
+					continue
+				}
+			}
+			// Other escape sequence: ESC followed by single char
+			if i+1 < len(content) {
+				i += 2
+				continue
+			}
+		}
+		// Check for CSI without ESC (8-bit CSI: 0x9B)
+		if content[i] == '\x9B' {
+			j := i + 1
+			for j < len(content) {
+				c := content[j]
+				if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+					j++
+					break
+				}
+				j++
+			}
+			i = j
+			continue
+		}
+		// Copy a whole UTF-8 character so a continuation byte such as 0x9B
+		// cannot be mistaken for a standalone 8-bit CSI introducer. ASCII
+		// takes the byte path: decoding every rune costs ~40% on ANSI-heavy
+		// captures that are almost entirely ASCII.
+		if content[i] < utf8.RuneSelf {
+			b.WriteByte(content[i])
+			i++
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(content[i:])
+		b.WriteString(content[i : i+size])
+		i += size
+	}
+
+	return b.String()
+}

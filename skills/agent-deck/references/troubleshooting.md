@@ -1,0 +1,527 @@
+# Troubleshooting Guide
+
+Common issues and solutions for agent-deck.
+
+## Quick Fixes
+
+| Issue | Solution |
+|-------|----------|
+| Session shows `✕` error | `agent-deck session start <name>` |
+| MCPs not loading | `agent-deck session restart <name>` |
+| CLI changes not in TUI | Press `Ctrl+R` to refresh |
+| Flag not working | Put flags BEFORE arguments |
+| Fork fails | Check Claude session has a valid session ID, or Pi session has JSONL history under Agent Deck's Pi session dir |
+| Status stuck | Wait 2 seconds or press `u` to mark unread |
+
+## Common Issues
+
+### Cannot Select or Copy Terminal Text
+
+On the agent-deck home screen, select a local session and press `V` to copy its
+current visible terminal text, including links, as plain text.
+
+When attached to a session, tmux mouse mode owns normal drag gestures. Hold
+Option while dragging in iTerm2. Hold Shift while dragging in most Linux
+terminals and Windows Terminal, including WSL2. This bypasses application mouse
+reporting and lets the terminal perform native selection.
+
+The full explanation of why mouse capture blocks selection, plus the complete
+copy-key table (`c` / `C` / `V` / `Y`), lives in
+[Terminal shortcuts](../../../docs/terminal-shortcuts.md#text-selection-and-copying)
+and the [TUI Reference](tui-reference.md#copy--text-selection).
+
+If your terminal has no selection bypass, disable mouse mode for new and
+reconnected sessions:
+
+```toml
+[tmux]
+mouse = false
+```
+
+This restores native drag selection, but disables tmux mouse scrolling, pane
+resizing, and mouse copy mode.
+
+### Flags Ignored
+
+**Problem:** Flags after positional arguments are silently ignored.
+
+```bash
+# WRONG - message not sent
+agent-deck session start my-project -m "Hello"
+
+# CORRECT
+agent-deck session start -m "Hello" my-project
+```
+
+### MCP Not Available
+
+1. Check if attached: `agent-deck mcp attached <session>`
+2. Restart session: `agent-deck session restart <session>`
+3. Verify in config: `agent-deck mcp list`
+
+### Session ID Not Detected
+
+Claude session ID needed for fork/resume. Check:
+
+```bash
+agent-deck session show <name> --json | jq '.claude_session_id'
+```
+
+If null, restart session and interact with Claude.
+
+### Conductor Keeps Asking for Permissions
+
+If a conductor repeatedly pauses on permission prompts, set Claude permission mode
+explicitly in `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`) and restart the conductor session:
+
+```toml
+[claude]
+# Safer default for automation-heavy conductors:
+allow_dangerous_mode = true
+
+# Or fully non-interactive (least safe):
+# dangerous_mode = true
+```
+
+Then restart the conductor:
+
+```bash
+agent-deck session restart conductor-<name>
+```
+
+If you use multiple profiles, set the same under the profile override:
+
+```toml
+[profiles.work.claude]
+allow_dangerous_mode = true
+```
+
+### Atuin Pty-Proxy Incompatibility
+
+**Problem:** TUI shows a blank screen or fails to render when `eval "$(atuin pty-proxy init zsh)"` is in `.zshrc`.
+
+**Cause:** Atuin pty-proxy acts as a PTY MITM between the terminal and the shell. Agent Deck's Bubble Tea TUI requires direct terminal access for alternate screen mode, mouse tracking, and raw-mode I/O. These all break when stdin/stdout are proxied pipes.
+
+**Fix:** Replace the pty-proxy init line with standard atuin init:
+
+```bash
+# REMOVE this line:
+eval "$(atuin pty-proxy init zsh)"
+
+# REPLACE with this:
+eval "$(atuin init zsh)"
+```
+
+For bash:
+```bash
+eval "$(atuin init bash)"
+```
+
+For fish:
+```fish
+atuin init fish | source
+```
+
+Atuin pty-proxy is only needed for the atuin TUI overlay feature and is not required for normal shell history functionality. Agent Deck works fine with standard `atuin init`.
+
+### High CPU Usage
+
+**With many sessions:** Normal if batched updates. Check:
+```bash
+agent-deck status  # Should show ~0.5% CPU when idle
+```
+
+**With active session:** Normal (live preview updates).
+
+### Log Files Too Large
+
+Add to `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`):
+```toml
+[logs]
+max_size_mb = 1
+max_lines = 2000
+```
+
+### Global Search Not Working
+
+Check config:
+```toml
+[global_search]
+enabled = true
+```
+
+Also verify `~/.claude/projects/` exists and has content.
+
+### Shift+Enter Submits Instead of Inserting a Newline (Kitty)
+
+In **kitty**, Shift+Enter (and other modified keys) may submit immediately
+inside agent-deck even though they insert a newline when the agent runs
+natively. This is a kitty-specific quirk: tmux negotiates extended keys with
+the outer terminal using xterm's *modifyOtherKeys* protocol, which kitty does
+not implement (kitty only speaks its own CSI-u keyboard protocol). So kitty
+keeps sending a bare carriage return and the agent submits.
+
+agent-deck already sets `extended-keys-format csi-u` on its tmux sessions so
+that, *once the terminal sends a distinct Shift+Enter*, it reaches the agent in
+the form Claude Code understands. The remaining piece must be set in kitty
+itself — make kitty emit the CSI-u Shift+Enter unconditionally:
+
+```conf
+# ~/.config/kitty/kitty.conf
+map shift+enter send_text all \x1b[13;2u
+```
+
+Reload kitty's config (`Ctrl+Shift+F5`) and Shift+Enter will insert a newline,
+both natively and inside agent-deck. iTerm2, Ghostty, WezTerm and xterm honor
+modifyOtherKeys and do not need this mapping.
+
+### Progressive Display Corruption Inside tmux (duplicated rows, mojibake, junk after scroll)
+
+Symptoms: rows duplicated or shifted down, stray escape characters, leftover
+junk after a scroll or resize. It builds up over days, affects every session on
+the machine, reproduces under any agent, and does **not** reproduce in a bare
+terminal without tmux.
+
+Check the tmux server's `terminal-features` array:
+
+```bash
+tmux show-options -s terminal-features | wc -l          # default socket
+tmux -L <socket_name> show-options -s terminal-features | wc -l   # if [tmux].socket_name is set
+```
+
+A healthy server reports a handful of lines. Thousands mean the array is
+inflated (issue #2061): agent-deck versions up to v1.15.0 appended
+`*:hyperlinks:extkeys` to that **server-wide** option on every session
+configuration pass, with no membership check. `*` matches every terminal and
+tmux walks the array on every capability lookup, so the duplicates turn into
+display corruption. Reported counts reached 5,018 entries (219.8 KB) after weeks
+of uptime.
+
+Two things matter about where the damage lives:
+
+- It is in the **tmux server**, not in the agent-deck binary. That is why
+  downgrading or upgrading agent-deck changes nothing while the server keeps
+  running, and why nobody notices the cause — restarting the tmux server would
+  destroy every live agent session.
+- The fix for #2061 reads exact indexed entries, installs through a shared
+  no-overwrite slot and removes duplicates with guarded indexed deletions.
+  Another client's appended or changed entries are preserved. Cleanup is
+  conservative: comma-bearing or blank values leave existing duplicates alone,
+  and concurrent changes or a timeout may leave work for a later pass. See the
+  [configuration reference](config-reference.md) for the shared slot
+  `terminal-features[2147483647]`. A foreign or empty occupant is preserved;
+  `terminal_features_installation_deferred` reports observed absence after an
+  installation attempt. Free that slot or set an explicit override to install
+  the feature, and do not interpret a quiet no-overwrite exit as proof of presence. The new binary must be the one running sessions;
+  while an old binary is still driving them, the array keeps growing.
+
+To reset the array immediately, without restarting the server:
+
+```bash
+tmux set -su terminal-features      # back to tmux's built-in defaults
+tmux source-file ~/.tmux.conf       # re-apply your own terminal-features lines, if any
+```
+
+Add `-L <socket_name>` to both commands when `[tmux].socket_name` is set. The
+first command is safe on a live server: it resets one option and touches no
+session, window or pane. If you prefer to pin the value yourself and have
+agent-deck never write it, set it in config.toml — an explicit key opts out of
+agent-deck's default entirely:
+
+```toml
+[tmux.options]
+terminal-features = "*:hyperlinks:extkeys"
+```
+
+### One tmux Window Stuck at 80x24 While Its Siblings Are Full Width
+
+`window-size` and `aggressive-resize` are tmux **window** options. Agent Deck
+applies `window-size latest` (`largest` on a tmux older than 3.1, which has no
+`latest`) and `aggressive-resize on` to every window of a Deck session: the
+initial window at session start, windows created by **Open Shell Here** in
+window mode, windows opened any other way inside the session (`prefix c`, an
+agent's own `tmux new-window`, a control client; since v1.16.11), and, again,
+every existing window right before each attach (TUI Enter, `session attach` on
+a remote, the web and embedded clients), because `resize-window` pins a window
+to `manual` and a session created by an older build keeps the `smallest` it
+was given. Explicit `[tmux.options]` values replace those defaults on every
+path. For a new shell window, a local option installed by your
+`after-new-window` hook takes precedence.
+
+With two people on one session under `latest`, the window follows whoever
+attached, typed or resized last: the person using the session sees it
+full-size, and the idle terminal shows the other person's size (clipped if it
+is smaller, the pane in the top-left corner with dots around it if it is
+larger) until they type or resize. That is tmux's one-size-per-window rule,
+not a stuck window. The deck's `👁️ N` row badge and `session viewers` say who
+else has the session open.
+
+Windows opened by hand get the policy from one `after-new-window` hook that
+Deck keeps in a reserved slot (`after-new-window[2259]`) of the server's
+global hook array. Your own global `after-new-window` hook keeps running in
+Deck sessions, and a `window-size` or `aggressive-resize` value it installs
+takes precedence over Deck's (Deck applies its values with `set-option -o`).
+Sessions Deck did not start are not touched. `tmux show-hooks -g` shows both
+entries; `set-hook -g after-new-window ...` without `-a` replaces the whole
+array, including Deck's slot, until the next Deck session starts.
+
+What persists, and how to remove it. The hook lives on the tmux **server**
+(the default one, or `[tmux].socket_name`), so it outlives every Deck
+process and stays after Deck is uninstalled, until the server restarts or
+you remove it. It is inert on its own: with no `@agentdeck_*` option on the
+session every `if-shell -F` test is false and nothing is written. The
+`@agentdeck_window_size` / `@agentdeck_aggressive_resize` options are
+per-session and disappear with the session. To inspect or remove the hook:
+
+```bash
+agent-deck tmux-hooks status      # absent, agent-deck's, or foreign
+agent-deck tmux-hooks uninstall   # removes after-new-window[2259] only if it is agent-deck's
+tmux set-hook -gu 'after-new-window[2259]'   # the same by hand (add -L <socket_name> if set)
+```
+
+Run the uninstall before `agent-deck uninstall` if you want the server clean;
+the next Deck session start reinstalls it. If something else already occupies
+index 2259, Deck leaves it alone, logs `window_policy_hook_slot_foreign`, and
+hand-opened windows keep tmux's own defaults until the slot is free. Hooks are
+array options from tmux 3.0; on an older server Deck logs
+`window_policy_hook_skipped` and only the initial window and Deck-opened
+windows get the policy. A `[tmux.options]` value tmux would reject (say
+`window-size = "biggest"`) is logged as `window_policy_override_invalid` and
+never published to the hook, so it cannot make `new-window` fail; the
+generic override pass reports it as before.
+
+Note that the hook only reaches windows created after the session started on
+the new binary; a session created before v1.16.11 keeps whatever its windows
+had until the next attach re-applies the policy to all of them. If a window is
+still stuck, fix it in place with `tmux set-option -w -t <session>:<window>
+window-size latest`, or restart the session.
+
+A size policy difference does not by itself establish that a size-less control
+client caused a collapse to 80x24; capture window dimensions and client flags
+when diagnosing that symptom.
+
+To choose a different policy for all windows, including native tmux windows,
+set it in config.toml:
+
+```toml
+[tmux.options]
+window-size = "smallest"
+```
+
+or set your own global default in `~/.tmux.conf` (`set -wg window-size
+smallest`) for sessions Deck does not manage.
+
+## Debugging
+
+Enable debug logging:
+```bash
+AGENTDECK_DEBUG=1 agent-deck
+```
+
+Check session logs:
+```bash
+tail -100 ~/.agent-deck/logs/agentdeck_<session>_*.log
+```
+
+## Report a Bug
+
+If something isn't working, please create a GitHub issue with all relevant context.
+
+### Step 1: Gather Information
+
+Run these commands and save output:
+
+```bash
+# Version info
+agent-deck version
+
+# Current status
+agent-deck status --json
+
+# Session details (if session-related)
+agent-deck session show <session-name> --json
+
+# Config (sanitized - removes secrets)
+cat ~/.config/agent-deck/config.toml | grep -v "KEY\|TOKEN\|SECRET\|PASSWORD"  # (legacy: ~/.agent-deck/config.toml)
+
+# Recent logs (if error occurred)
+tail -100 ~/.agent-deck/logs/agentdeck_<session>_*.log 2>/dev/null
+
+# System info
+uname -a
+echo "tmux: $(tmux -V 2>/dev/null || echo 'not installed')"
+```
+
+### Step 2: Describe the Issue
+
+Prepare clear answers to:
+
+1. **What did you try?** (exact command or TUI action)
+2. **What happened?** (error message, unexpected behavior)
+3. **What did you expect?** (correct behavior)
+4. **Can you reproduce it?** (steps to trigger)
+
+### Step 3: Create GitHub Issue
+
+Go to: **https://github.com/asheshgoplani/agent-deck/issues/new**
+
+Use this template:
+
+```markdown
+## Description
+
+[Brief description of the issue]
+
+## Steps to Reproduce
+
+1. [First step]
+2. [Second step]
+3. [What happened]
+
+## Expected Behavior
+
+[What should have happened]
+
+## Environment
+
+- agent-deck version: [output of `agent-deck version`]
+- OS: [macOS/Linux/WSL]
+- tmux version: [output of `tmux -V`]
+
+## Debug Output
+
+<details>
+<summary>Status JSON</summary>
+
+```json
+[paste agent-deck status --json]
+```
+
+</details>
+
+<details>
+<summary>Config (sanitized)</summary>
+
+```toml
+[paste sanitized config]
+```
+
+</details>
+
+<details>
+<summary>Logs</summary>
+
+```
+[paste relevant log lines]
+```
+
+</details>
+```
+
+### Step 4: Follow Up
+
+- Check for responses on your issue
+- Test any suggested fixes
+- Update issue with results
+- Join [Discord](https://discord.gg/e4xSs6NBN8) for quick help and community support
+- Run `agent-deck feedback` to submit a rating and optional comment
+
+## Recovery
+
+### Every Session Died At Once
+
+Symptom: the whole deck flips to red (or the panes are simply gone) after a tmux
+server was killed, the host rebooted, or an auth failure cascaded through the
+fleet.
+
+```bash
+agent-deck fleet status          # read-only: what is actually down?
+agent-deck fleet recover         # dry run: the plan, in order, with waits
+agent-deck fleet recover --yes   # run it
+```
+
+`fleet recover` restarts the down sessions **one at a time** with ~5s between
+boots and verifies each boot before starting the next. Do not replace it with a
+loop that restarts everything at once: simultaneous agent boots are what fork a
+shared rotating OAuth refresh token, which turns a recoverable outage into a
+fleet-wide 401.
+
+The sweep stops on its own if three restarts fail in a row, or if sessions come
+up showing an auth-failure banner (re-authenticate first, then re-run). Sessions
+you stopped or archived are never touched.
+
+If the panes are still ALIVE and only agent-deck thinks they are broken (a
+killed control pipe, e.g. after an SSH logout), the cheaper fix is:
+
+```bash
+agent-deck session revive --all
+```
+
+### Session Metadata Lost
+
+Data stored in SQLite:
+```bash
+~/.agent-deck/profiles/default/state.db
+```
+
+Note: new installs store profiles under `$XDG_DATA_HOME/agent-deck/profiles/` (default `~/.local/share/agent-deck/profiles/`); a legacy `~/.agent-deck/` directory is still honored when present.
+
+Recovery (if state.db is corrupted):
+```bash
+# If sessions.json.migrated still exists, delete state.db and restart.
+# agent-deck will auto-migrate from the .migrated file.
+rm ~/.agent-deck/profiles/default/state.db
+mv ~/.agent-deck/profiles/default/sessions.json.migrated \
+   ~/.agent-deck/profiles/default/sessions.json
+# Restart agent-deck to trigger auto-migration into a fresh state.db
+```
+
+### tmux Sessions Lost
+
+Session logs preserved:
+```bash
+tail -500 ~/.agent-deck/logs/agentdeck_<session>_*.log
+```
+
+### Profile Corrupted
+
+Create fresh:
+```bash
+agent-deck profile create fresh
+agent-deck profile default fresh
+```
+
+## Uninstalling
+
+Remove agent-deck from your system:
+
+```bash
+agent-deck uninstall              # Interactive uninstall
+agent-deck uninstall --dry-run    # Preview what would be removed
+agent-deck uninstall --keep-data  # Remove binary only, keep sessions
+```
+
+Or use the standalone script:
+```bash
+curl -fsSL https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/uninstall.sh | bash
+```
+
+**What gets removed:**
+- **Binary:** `~/.local/bin/agent-deck` or `/usr/local/bin/agent-deck`
+- **Homebrew:** `agent-deck` package (if installed via brew)
+- **tmux config:** The `# agent-deck configuration` block in `~/.tmux.conf`
+- **Data directory:** `~/.agent-deck/` (sessions, logs, config)
+
+Use `--keep-data` to preserve your sessions and configuration.
+
+## Critical Warnings
+
+**NEVER run these commands - they destroy ALL agent-deck sessions:**
+
+```bash
+# DO NOT RUN
+tmux kill-server
+tmux ls | grep agentdeck | xargs tmux kill-session
+```
+
+**Recovery impossible** - metadata backups exist but tmux sessions are gone.

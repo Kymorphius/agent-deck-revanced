@@ -1,0 +1,1570 @@
+package ui
+
+import (
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/telemetry"
+)
+
+// SettingType identifies which setting is being edited
+type SettingType int
+
+const (
+	SettingTheme SettingType = iota // Theme must be first (index 0)
+	SettingDefaultTool
+	SettingDangerousMode
+	SettingClaudeConfigDir
+	SettingGeminiYoloMode
+	SettingCodexYoloMode
+	SettingHermesYoloMode
+	SettingCheckForUpdates
+	SettingAutoUpdate
+	SettingAutoInstall
+	SettingAutoRestart
+	SettingLogMaxSize
+	SettingLogMaxLines
+	SettingRemoveOrphans
+	SettingClearSearchOnOpen // matrix/hardened: local-search reopening preference
+	SettingGlobalSearchEnabled
+	SettingSearchTier
+	SettingRecentDays
+	SettingShowOutput
+	SettingShowAnalytics
+	SettingShowNotes
+	SettingNotesOutputSplit
+	SettingMaintenanceEnabled
+	SettingStatsEnabled
+	SettingStatsRefresh
+	SettingStatsFormat
+	SettingStatsShowCPU
+	SettingStatsShowRAM
+	SettingStatsShowDisk
+	SettingStatsShowNetwork
+	SettingStatsShowGPU
+	SettingStatsShowLoad
+	SettingSyncTitle
+	SettingShowSessionTimestamps
+	SettingShowPaneTitles
+	SettingShowOnlyInstalledTools
+	SettingVisibleTools
+	SettingEmbeddedTerminal
+	SettingSidebarDensity
+	SettingPrivacy
+	SettingAIUpdates // matrix/hardened: explicit local AI update management
+)
+
+// Total number of navigable settings.
+const settingsCount = 41 // matrix/hardened: append AI updates without renumbering existing settings
+
+// SettingsPanel displays and edits user configuration
+type SettingsPanel struct {
+	visible      bool
+	width        int
+	height       int
+	cursor       int // Current setting index
+	scrollOffset int // Scroll offset when content overflows terminal height
+	profile      string
+
+	// Dynamic tool lists (built-in + custom tools from config)
+	toolNames  []string
+	toolValues []string
+
+	// Setting values
+	selectedTheme       int // 0=dark, 1=light, 2=system
+	selectedTool        int // index into toolNames/toolValues
+	dangerousMode       bool
+	claudeConfigDir     string
+	claudeConfigIsScope bool // true = profile override, false = global [claude]
+	geminiYoloMode      bool
+	codexYoloMode       bool
+	hermesYoloMode      bool
+	checkForUpdates     bool
+	autoUpdate          bool
+	autoInstall         bool
+	autoRestart         bool
+	logMaxSizeMB        int
+	logMaxLines         int
+	removeOrphans       bool
+	clearSearchOnOpen   bool // matrix/hardened: clear / and Alt+/ on each open
+	globalSearchEnabled bool
+	searchTier          int // 0=auto, 1=instant, 2=balanced
+	recentDays          int
+	showOutput          bool
+	showAnalytics       bool
+	showNotes           bool
+	syncTitle           bool // global: let the agent rename the session (off = keep your title)
+	notesOutputSplit    int  // percentage 10-90 (displayed as %, stored as 0.10-0.90)
+	maintenanceEnabled  bool
+	statsEnabled        bool
+	statsRefreshSecs    int
+	statsFormat         int // 0=compact, 1=full, 2=minimal
+	statsShowCPU        bool
+	statsShowRAM        bool
+	statsShowDisk       bool
+	statsShowNetwork    bool
+	statsShowGPU        bool
+	statsShowLoad       bool
+
+	showSessionTimestamps  bool
+	showPaneTitles         bool
+	showOnlyInstalledTools bool
+	embeddedLayout         bool
+	sidebarDensity         int // index into sidebarDensityValues
+	pendingToolVisibility  bool
+	pendingPrivacy         bool   // Enter/Space on the Privacy row: home opens consent or turns it off
+	pendingAIUpdates       bool   // matrix/hardened: opens the local AI updates panel
+	privacyTickLabel       string // daily tick acknowledgment, read on Show
+	privacyLabel           string // "on (full)" / "off", read from telemetry state on Show
+
+	// Text input state
+	editingText bool
+	textBuffer  string
+
+	// Track if global search settings changed (requires restart)
+	needsRestart bool
+
+	// Original config for detecting changes
+	originalConfig *session.UserConfig
+}
+
+// builtinToolNames and builtinToolValues are the built-in tools. Custom tools
+// from config are appended dynamically in LoadConfig.
+var (
+	builtinToolNames  = []string{"Claude", "Gemini", "OpenCode", "Codex", "Pi", "Copilot", "Crush", "Muse", "Cursor", "Hermes", "DeepSeek", "Oh My Pi"}
+	builtinToolValues = []string{"claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "muse", "cursor", "hermes", "deepseek", "omp"}
+)
+
+// Search tier names for radio selection
+var (
+	tierNames  = []string{"Auto", "Instant", "Balanced"}
+	tierValues = []string{"auto", "instant", "balanced"}
+)
+
+// Theme names for radio selection
+var (
+	themeNames  = []string{"Dark", "Light", "System"}
+	themeValues = []string{"dark", "light", "system"}
+)
+
+// Embedded sidebar density names for radio selection. Index order must match
+// sidebarDensityValues.
+var (
+	sidebarDensityNames  = []string{"Full", "Compact", "Minimal", "Auto"}
+	sidebarDensityValues = []string{
+		session.SidebarDensityFull,
+		session.SidebarDensityCompact,
+		session.SidebarDensityMinimal,
+		session.SidebarDensityAuto,
+	}
+)
+
+// defaultSidebarDensityIndex is the radio index of session.DefaultSidebarDensity.
+func defaultSidebarDensityIndex() int {
+	for i, val := range sidebarDensityValues {
+		if val == session.DefaultSidebarDensity {
+			return i
+		}
+	}
+	return 0
+}
+
+// Stats format names for radio selection
+var (
+	statsFormatNames  = []string{"Compact", "Full", "Minimal"}
+	statsFormatValues = []string{"compact", "full", "minimal"}
+)
+
+// NewSettingsPanel creates a new settings panel
+func NewSettingsPanel() *SettingsPanel {
+	return &SettingsPanel{
+		toolNames:           append(append([]string{}, builtinToolNames...), "None"),
+		toolValues:          append(append([]string{}, builtinToolValues...), ""),
+		logMaxSizeMB:        10,
+		logMaxLines:         10000,
+		removeOrphans:       true,
+		clearSearchOnOpen:   true,  // matrix/hardened: fresh local-search query by default
+		checkForUpdates:     false, // matrix/hardened: no update polling by default
+		autoInstall:         false, // matrix/hardened: no unattended installs by default
+		autoRestart:         true,
+		globalSearchEnabled: true,
+		recentDays:          90,
+		showOutput:          true,  // Default: output ON (shows launch animation)
+		showAnalytics:       false, // Default: analytics OFF (opt-in)
+		syncTitle:           true,  // Default: title sync ON (matches GetSyncTitle default)
+		notesOutputSplit:    33,    // Default: 33%
+		statsEnabled:        true,  // Default: stats ON
+		statsRefreshSecs:    5,     // Default: 5 seconds
+		statsShowCPU:        true,
+		statsShowRAM:        true,
+		statsShowDisk:       true,
+		statsShowNetwork:    true,
+		embeddedLayout:      false,
+		sidebarDensity:      defaultSidebarDensityIndex(),
+	}
+}
+
+// Show displays the settings panel and loads current config
+func (s *SettingsPanel) Show() {
+	s.visible = true
+	s.cursor = 0
+	s.scrollOffset = 0
+	s.editingText = false
+	s.needsRestart = false
+	s.privacyLabel = telemetryPrivacyLabel()
+	s.privacyTickLabel = telemetry.ReadInstallTickStatus().Summary()
+
+	// Load current config
+	config, _ := session.LoadUserConfig()
+	if config != nil {
+		s.LoadConfig(config)
+		s.originalConfig = config
+	}
+}
+
+// Hide hides the settings panel
+func (s *SettingsPanel) Hide() {
+	s.visible = false
+	s.editingText = false
+}
+
+// IsVisible returns whether the panel is visible
+func (s *SettingsPanel) IsVisible() bool {
+	return s.visible
+}
+
+// NeedsRestart returns true if changes require a restart
+func (s *SettingsPanel) NeedsRestart() bool {
+	return s.needsRestart
+}
+
+// ScrollUp moves the settings cursor up by one (mouse wheel support).
+func (s *SettingsPanel) ScrollUp() {
+	if s.visible && s.cursor > 0 {
+		s.cursor--
+	}
+}
+
+// ScrollDown moves the settings cursor down by one (mouse wheel support).
+func (s *SettingsPanel) ScrollDown() {
+	if s.visible && s.cursor < settingsCount-1 {
+		s.cursor++
+	}
+}
+
+// SetSize sets the panel dimensions
+func (s *SettingsPanel) SetSize(width, height int) {
+	s.width = width
+	s.height = height
+}
+
+// SetProfile sets the active profile for profile-aware settings.
+func (s *SettingsPanel) SetProfile(profile string) {
+	s.profile = profile
+}
+
+// LoadConfig populates panel values from a UserConfig
+func (s *SettingsPanel) LoadConfig(config *session.UserConfig) {
+	// Load theme
+	switch config.Theme {
+	case "light":
+		s.selectedTheme = 1
+	case "system":
+		s.selectedTheme = 2
+	default:
+		s.selectedTheme = 0
+	}
+
+	// Rebuild tool lists: built-ins + custom tools + "None".
+	s.buildToolLists(config)
+
+	// Default tool
+	s.selectedTool = len(s.toolValues) - 1 // None by default
+	for i, val := range s.toolValues {
+		if val == config.DefaultTool {
+			s.selectedTool = i
+			break
+		}
+	}
+
+	// Claude settings
+	s.dangerousMode = config.Claude.GetDangerousMode()
+	s.claudeConfigDir = config.Claude.ConfigDir
+	s.claudeConfigIsScope = false
+	if s.profile != "" && config.Profiles != nil {
+		if profileCfg, ok := config.Profiles[s.profile]; ok && profileCfg.Claude.ConfigDir != "" {
+			s.claudeConfigDir = profileCfg.Claude.ConfigDir
+			s.claudeConfigIsScope = true
+		}
+	}
+
+	// Gemini settings
+	s.geminiYoloMode = config.Gemini.YoloMode
+
+	// Codex settings
+	s.codexYoloMode = config.Codex.YoloMode
+
+	// Hermes settings
+	s.hermesYoloMode = config.Hermes.YoloMode
+
+	// Update settings
+	s.checkForUpdates = config.Updates.GetCheckEnabled()
+	s.autoUpdate = config.Updates.AutoUpdate
+	s.autoInstall = config.Updates.GetAutoInstall()
+	s.autoRestart = config.Updates.GetAutoRestart()
+
+	// Log settings
+	s.logMaxSizeMB = config.Logs.MaxSizeMB
+	if s.logMaxSizeMB <= 0 {
+		s.logMaxSizeMB = 10
+	}
+	s.logMaxLines = config.Logs.MaxLines
+	if s.logMaxLines <= 0 {
+		s.logMaxLines = 10000
+	}
+	s.removeOrphans = config.Logs.GetRemoveOrphans()
+
+	// matrix/hardened: local search is separate from G's conversation search.
+	s.clearSearchOnOpen = config.UI.GetClearSearchOnOpen()
+
+	// Global search settings
+	s.globalSearchEnabled = config.GlobalSearch.GetEnabled()
+	s.searchTier = 0 // auto by default
+	for i, val := range tierValues {
+		if val == config.GlobalSearch.Tier {
+			s.searchTier = i
+			break
+		}
+	}
+	s.recentDays = config.GlobalSearch.RecentDays
+	if s.recentDays < 0 {
+		s.recentDays = 90
+	}
+
+	// Preview settings
+	s.showOutput = config.GetShowOutput()
+	s.showAnalytics = config.GetShowAnalytics()
+	s.showNotes = config.GetShowNotes()
+
+	// Session settings
+	s.syncTitle = config.GetSyncTitle()
+	split := config.Preview.GetNotesOutputSplit()
+	s.notesOutputSplit = int(split * 100)
+	if s.notesOutputSplit < 10 {
+		s.notesOutputSplit = 10
+	} else if s.notesOutputSplit > 90 {
+		s.notesOutputSplit = 90
+	}
+
+	// Maintenance settings.
+	s.maintenanceEnabled = config.Maintenance.Enabled
+
+	// System stats settings
+	s.statsEnabled = config.SystemStats.GetEnabled()
+	s.statsRefreshSecs = config.SystemStats.GetRefreshSeconds()
+	s.statsFormat = 0 // compact by default
+	for i, val := range statsFormatValues {
+		if val == config.SystemStats.GetFormat() {
+			s.statsFormat = i
+			break
+		}
+	}
+	showSet := make(map[string]bool)
+	for _, stat := range config.SystemStats.GetShow() {
+		showSet[stat] = true
+	}
+	s.statsShowCPU = showSet["cpu"]
+	s.statsShowRAM = showSet["ram"]
+	s.statsShowDisk = showSet["disk"]
+	s.statsShowNetwork = showSet["network"]
+	s.statsShowGPU = showSet["gpu"]
+	s.statsShowLoad = showSet["load"]
+
+	// Display settings
+	s.showSessionTimestamps = config.Display.ShowSessionTimestamps
+	s.showPaneTitles = config.Display.ShowPaneTitles
+
+	// UI settings
+	s.embeddedLayout = config.UI.GetEmbeddedTerminal()
+	s.sidebarDensity = defaultSidebarDensityIndex()
+	for i, val := range sidebarDensityValues {
+		if val == config.UI.GetSidebarDensity() {
+			s.sidebarDensity = i
+			break
+		}
+	}
+	s.showOnlyInstalledTools = config.UI.ShowOnlyInstalledTools
+}
+
+func (s *SettingsPanel) buildToolLists(config *session.UserConfig) {
+	names := append([]string{}, builtinToolNames...)
+	values := append([]string{}, builtinToolValues...)
+
+	if len(config.Tools) > 0 {
+		builtins := map[string]bool{
+			"claude": true, "gemini": true, "opencode": true,
+			"codex": true, "pi": true, "crush": true, "copilot": true,
+			"shell": true, "cursor": true, "aider": true, "hermes": true,
+			"deepseek": true, "muse": true, "omp": true,
+		}
+		var custom []string
+		for name := range config.Tools {
+			if !builtins[name] {
+				custom = append(custom, name)
+			}
+		}
+		sort.Strings(custom)
+		for _, name := range custom {
+			display := strings.ToUpper(name[:1]) + name[1:]
+			names = append(names, display)
+			values = append(values, name)
+		}
+	}
+
+	names = append(names, "None")
+	values = append(values, "")
+
+	s.toolNames = names
+	s.toolValues = values
+}
+
+// GetConfig returns a UserConfig with current panel values
+func (s *SettingsPanel) GetConfig() *session.UserConfig {
+	config := &session.UserConfig{
+		DefaultTool: "",
+		Tools:       make(map[string]session.ToolDef),
+		MCPs:        make(map[string]session.MCPDef),
+	}
+
+	// Theme
+	if s.selectedTheme < len(themeValues) {
+		config.Theme = themeValues[s.selectedTheme]
+	}
+
+	// Default tool
+	if s.selectedTool >= 0 && s.selectedTool < len(s.toolValues) {
+		config.DefaultTool = s.toolValues[s.selectedTool]
+	}
+
+	// Claude settings
+	dangerousModeVal := s.dangerousMode
+	config.Claude.DangerousMode = &dangerousModeVal
+	if !s.claudeConfigIsScope {
+		config.Claude.ConfigDir = s.claudeConfigDir
+	}
+
+	// Gemini settings
+	config.Gemini.YoloMode = s.geminiYoloMode
+
+	// Codex settings
+	config.Codex.YoloMode = s.codexYoloMode
+
+	// Hermes settings
+	config.Hermes.YoloMode = s.hermesYoloMode
+
+	// Update settings
+	checkForUpdates := s.checkForUpdates
+	config.Updates.CheckEnabled = &checkForUpdates
+	config.Updates.AutoUpdate = s.autoUpdate
+	autoInstall := s.autoInstall
+	config.Updates.AutoInstall = &autoInstall
+	autoRestart := s.autoRestart
+	config.Updates.AutoRestart = &autoRestart
+	// matrix/hardened: turning either on in this build's panel is the
+	// explicit consent GetCheckEnabled/GetAutoInstall require.
+	if checkForUpdates || autoInstall {
+		config.Updates.MatrixOptIn = true
+	}
+
+	// Log settings
+	config.Logs.MaxSizeMB = s.logMaxSizeMB
+	config.Logs.MaxLines = s.logMaxLines
+	removeOrphans := s.removeOrphans
+	config.Logs.RemoveOrphans = &removeOrphans
+
+	// matrix/hardened: keep explicit false so the user's retention choice persists.
+	clearSearchOnOpen := s.clearSearchOnOpen
+	config.UI.ClearSearchOnOpen = &clearSearchOnOpen
+
+	// Global search settings
+	globalSearchEnabled := s.globalSearchEnabled
+	config.GlobalSearch.Enabled = &globalSearchEnabled
+	if s.searchTier >= 0 && s.searchTier < len(tierValues) {
+		config.GlobalSearch.Tier = tierValues[s.searchTier]
+	}
+	config.GlobalSearch.RecentDays = s.recentDays
+
+	// Preview settings
+	showOutput := s.showOutput
+	config.Preview.ShowOutput = &showOutput
+	showAnalytics := s.showAnalytics
+	config.Preview.ShowAnalytics = &showAnalytics
+	showNotes := s.showNotes
+	config.Preview.ShowNotes = &showNotes
+	config.Preview.NotesOutputSplit = float64(s.notesOutputSplit) / 100.0
+
+	// Session settings
+	syncTitle := s.syncTitle
+	config.SyncTitle = &syncTitle
+
+	// Maintenance settings.
+	config.Maintenance.Enabled = s.maintenanceEnabled
+
+	// System stats settings
+	statsEnabled := s.statsEnabled
+	config.SystemStats.Enabled = &statsEnabled
+	config.SystemStats.RefreshSeconds = s.statsRefreshSecs
+	if s.statsFormat >= 0 && s.statsFormat < len(statsFormatValues) {
+		config.SystemStats.Format = statsFormatValues[s.statsFormat]
+	}
+	var showStats []string
+	if s.statsShowCPU {
+		showStats = append(showStats, "cpu")
+	}
+	if s.statsShowRAM {
+		showStats = append(showStats, "ram")
+	}
+	if s.statsShowDisk {
+		showStats = append(showStats, "disk")
+	}
+	if s.statsShowNetwork {
+		showStats = append(showStats, "network")
+	}
+	if s.statsShowGPU {
+		showStats = append(showStats, "gpu")
+	}
+	if s.statsShowLoad {
+		showStats = append(showStats, "load")
+	}
+	config.SystemStats.Show = showStats
+
+	// Display settings
+	config.Display.ShowSessionTimestamps = s.showSessionTimestamps
+	config.Display.ShowPaneTitles = s.showPaneTitles
+
+	// UI settings
+	embeddedLayout := s.embeddedLayout
+	config.UI.EmbeddedTerminal = &embeddedLayout
+	if s.sidebarDensity >= 0 && s.sidebarDensity < len(sidebarDensityValues) {
+		config.UI.SidebarDensity = sidebarDensityValues[s.sidebarDensity]
+	}
+	config.UI.ShowOnlyInstalledTools = s.showOnlyInstalledTools
+
+	// Preserve original MCPs, Tools, and Docker settings.
+	if s.originalConfig != nil {
+		config.MCPs = s.originalConfig.MCPs
+		config.Tools = s.originalConfig.Tools
+		config.MCPPool = s.originalConfig.MCPPool
+		config.Docker = s.originalConfig.Docker
+		config.Preview.Analytics = s.originalConfig.Preview.Analytics
+		config.Profiles = s.originalConfig.Profiles
+		config.Worktree = s.originalConfig.Worktree
+		// Tmux settings (#710): preserve [tmux] table — Settings TUI does not
+		// expose these fields, so without this copy the entire [tmux] block
+		// (inject_status_line, launch_in_user_scope, detach_key, options …)
+		// vanishes on save. Same class of bug as #584 (Worktree).
+		config.Tmux = s.originalConfig.Tmux
+		// Fork settings are not exposed in SettingsPanel; preserve the whole
+		// [fork] table so saving visible settings cannot reset quick-fork defaults.
+		config.Fork = s.originalConfig.Fork
+		// Keep global Claude config when editing profile-specific override.
+		if s.claudeConfigIsScope {
+			config.Claude.ConfigDir = s.originalConfig.Claude.ConfigDir
+		}
+	}
+
+	// Apply profile-specific Claude override after original profile map is restored.
+	if s.claudeConfigIsScope && s.profile != "" {
+		if config.Profiles == nil {
+			config.Profiles = make(map[string]session.ProfileSettings)
+		}
+		profileCfg := config.Profiles[s.profile]
+		profileCfg.Claude.ConfigDir = s.claudeConfigDir
+		config.Profiles[s.profile] = profileCfg
+	}
+
+	return config
+}
+
+// Update handles input and returns (panel, cmd, valueChanged)
+func (s *SettingsPanel) Update(msg tea.KeyMsg) (*SettingsPanel, tea.Cmd, bool) {
+	if !s.visible {
+		return s, nil, false
+	}
+
+	// Handle text editing mode
+	if s.editingText {
+		return s.handleTextEdit(msg)
+	}
+
+	valueChanged := false
+	key := msg.String()
+
+	switch key {
+	case "esc", "S":
+		s.Hide()
+		return s, nil, false
+
+	case "up", "k":
+		if s.cursor > 0 {
+			s.cursor--
+		}
+
+	case "down", "j":
+		if s.cursor < settingsCount-1 {
+			s.cursor++
+		}
+
+	case "left", "h":
+		valueChanged = s.adjustValue(-1)
+
+	case "right", "l":
+		valueChanged = s.adjustValue(1)
+
+	case " ":
+		if SettingType(s.cursor) == SettingAIUpdates { // matrix/hardened
+			s.pendingAIUpdates = true
+			s.Hide()
+			break
+		}
+		if SettingType(s.cursor) == SettingPrivacy {
+			s.pendingPrivacy = true
+			s.Hide()
+			break
+		}
+		valueChanged = s.toggleValue()
+
+	case "enter":
+		if SettingType(s.cursor) == SettingAIUpdates { // matrix/hardened
+			s.pendingAIUpdates = true
+			s.Hide()
+		} else if SettingType(s.cursor) == SettingPrivacy {
+			s.pendingPrivacy = true
+			s.Hide()
+		} else if s.isTextSetting() {
+			s.startTextEdit()
+		} else if SettingType(s.cursor) == SettingVisibleTools {
+			s.pendingToolVisibility = true
+			s.Hide()
+		}
+	}
+
+	return s, nil, valueChanged
+}
+
+// ConsumeToolVisibilityRequest reports whether the user chose "Visible tools…"
+// and clears the latch.
+func (s *SettingsPanel) ConsumeToolVisibilityRequest() bool {
+	if !s.pendingToolVisibility {
+		return false
+	}
+	s.pendingToolVisibility = false
+	return true
+}
+
+// ConsumePrivacyRequest reports whether the user activated the Privacy row
+// and clears the latch.
+func (s *SettingsPanel) ConsumePrivacyRequest() bool {
+	if !s.pendingPrivacy {
+		return false
+	}
+	s.pendingPrivacy = false
+	return true
+}
+
+// ConsumeAIUpdatesRequest consumes the explicit settings action only.
+// matrix/hardened: opening settings itself never checks AI releases.
+func (s *SettingsPanel) ConsumeAIUpdatesRequest() bool {
+	requested := s.pendingAIUpdates
+	s.pendingAIUpdates = false
+	return requested
+}
+
+// telemetryPrivacyLabel renders the Privacy row value from telemetry state.
+func telemetryPrivacyLabel() string {
+	st := telemetry.LoadState()
+	if ok, _ := telemetry.Enabled(st); ok {
+		return "on (" + string(telemetry.EffectiveLevel(st)) + ")"
+	}
+	return "off"
+}
+
+// adjustValue changes a radio or number value by delta
+func (s *SettingsPanel) adjustValue(delta int) bool {
+	setting := SettingType(s.cursor)
+	changed := false
+
+	switch setting {
+	case SettingTheme:
+		newVal := s.selectedTheme + delta
+		if newVal >= 0 && newVal < len(themeNames) {
+			s.selectedTheme = newVal
+			changed = true
+		}
+
+	case SettingDefaultTool:
+		newVal := s.selectedTool + delta
+		if newVal >= 0 && newVal < len(s.toolNames) {
+			s.selectedTool = newVal
+			changed = true
+		}
+
+	case SettingSearchTier:
+		newVal := s.searchTier + delta
+		if newVal >= 0 && newVal < len(tierNames) {
+			oldTier := s.searchTier
+			s.searchTier = newVal
+			changed = true
+			if oldTier != newVal {
+				s.needsRestart = true
+			}
+		}
+
+	case SettingLogMaxSize:
+		newVal := s.logMaxSizeMB + delta
+		if newVal >= 1 {
+			s.logMaxSizeMB = newVal
+			changed = true
+		}
+
+	case SettingLogMaxLines:
+		// Adjust by 1000 for lines
+		newVal := s.logMaxLines + (delta * 1000)
+		if newVal >= 1000 {
+			s.logMaxLines = newVal
+			changed = true
+		}
+
+	case SettingRecentDays:
+		newVal := s.recentDays + (delta * 10)
+		if newVal >= 0 {
+			s.recentDays = newVal
+			changed = true
+			s.needsRestart = true
+		}
+
+	case SettingNotesOutputSplit:
+		newVal := s.notesOutputSplit + (delta * 5)
+		if newVal >= 10 && newVal <= 90 {
+			s.notesOutputSplit = newVal
+			changed = true
+		}
+
+	case SettingStatsRefresh:
+		newVal := s.statsRefreshSecs + delta
+		if newVal >= 2 && newVal <= 300 {
+			s.statsRefreshSecs = newVal
+			changed = true
+		}
+
+	case SettingStatsFormat:
+		newVal := s.statsFormat + delta
+		if newVal >= 0 && newVal < len(statsFormatNames) {
+			s.statsFormat = newVal
+			changed = true
+		}
+
+	case SettingSidebarDensity:
+		newVal := s.sidebarDensity + delta
+		if newVal >= 0 && newVal < len(sidebarDensityNames) {
+			s.sidebarDensity = newVal
+			changed = true
+		}
+	}
+
+	return changed
+}
+
+// toggleValue toggles a checkbox value
+func (s *SettingsPanel) toggleValue() bool {
+	setting := SettingType(s.cursor)
+
+	switch setting {
+	case SettingDangerousMode:
+		s.dangerousMode = !s.dangerousMode
+		return true
+
+	case SettingGeminiYoloMode:
+		s.geminiYoloMode = !s.geminiYoloMode
+		return true
+
+	case SettingCodexYoloMode:
+		s.codexYoloMode = !s.codexYoloMode
+		return true
+
+	case SettingHermesYoloMode:
+		s.hermesYoloMode = !s.hermesYoloMode
+		return true
+
+	case SettingCheckForUpdates:
+		s.checkForUpdates = !s.checkForUpdates
+		return true
+
+	case SettingAutoUpdate:
+		s.autoUpdate = !s.autoUpdate
+		return true
+
+	case SettingAutoInstall:
+		s.autoInstall = !s.autoInstall
+		return true
+
+	case SettingAutoRestart:
+		s.autoRestart = !s.autoRestart
+		return true
+
+	case SettingRemoveOrphans:
+		s.removeOrphans = !s.removeOrphans
+		return true
+
+	// matrix/hardened: local-search changes apply on the next open, without a restart.
+	case SettingClearSearchOnOpen:
+		s.clearSearchOnOpen = !s.clearSearchOnOpen
+		return true
+
+	case SettingGlobalSearchEnabled:
+		s.globalSearchEnabled = !s.globalSearchEnabled
+		s.needsRestart = true
+		return true
+
+	case SettingShowOutput:
+		s.showOutput = !s.showOutput
+		return true
+
+	case SettingShowAnalytics:
+		s.showAnalytics = !s.showAnalytics
+		return true
+
+	case SettingShowNotes:
+		s.showNotes = !s.showNotes
+		return true
+
+	case SettingSyncTitle:
+		s.syncTitle = !s.syncTitle
+		return true
+
+	case SettingMaintenanceEnabled:
+		s.maintenanceEnabled = !s.maintenanceEnabled
+		return true
+
+	case SettingStatsEnabled:
+		s.statsEnabled = !s.statsEnabled
+		return true
+
+	case SettingStatsShowCPU:
+		s.statsShowCPU = !s.statsShowCPU
+		return true
+
+	case SettingStatsShowRAM:
+		s.statsShowRAM = !s.statsShowRAM
+		return true
+
+	case SettingStatsShowDisk:
+		s.statsShowDisk = !s.statsShowDisk
+		return true
+
+	case SettingStatsShowNetwork:
+		s.statsShowNetwork = !s.statsShowNetwork
+		return true
+
+	case SettingStatsShowGPU:
+		s.statsShowGPU = !s.statsShowGPU
+		return true
+
+	case SettingStatsShowLoad:
+		s.statsShowLoad = !s.statsShowLoad
+		return true
+
+	case SettingShowSessionTimestamps:
+		s.showSessionTimestamps = !s.showSessionTimestamps
+		return true
+
+	case SettingShowPaneTitles:
+		s.showPaneTitles = !s.showPaneTitles
+		return true
+
+	case SettingShowOnlyInstalledTools:
+		s.showOnlyInstalledTools = !s.showOnlyInstalledTools
+		return true
+
+	case SettingEmbeddedTerminal:
+		s.embeddedLayout = !s.embeddedLayout
+		return true
+
+	case SettingSidebarDensity:
+		// Space cycles the radio group, so the density is reachable without
+		// remembering that h/l adjust multi-value settings.
+		s.sidebarDensity = (s.sidebarDensity + 1) % len(sidebarDensityNames)
+		return true
+	}
+
+	return false
+}
+
+// isTextSetting returns true if current setting uses text input
+func (s *SettingsPanel) isTextSetting() bool {
+	return SettingType(s.cursor) == SettingClaudeConfigDir
+}
+
+// startTextEdit begins text editing for current setting
+func (s *SettingsPanel) startTextEdit() {
+	setting := SettingType(s.cursor)
+	if setting == SettingClaudeConfigDir {
+		s.textBuffer = s.claudeConfigDir
+		s.editingText = true
+	}
+}
+
+// handleTextEdit processes keys during text editing
+func (s *SettingsPanel) handleTextEdit(msg tea.KeyMsg) (*SettingsPanel, tea.Cmd, bool) {
+	key := msg.String()
+
+	switch key {
+	case "enter":
+		// Save the text
+		if SettingType(s.cursor) == SettingClaudeConfigDir {
+			s.claudeConfigDir = s.textBuffer
+		}
+		s.editingText = false
+		return s, nil, true
+
+	case "esc":
+		// Cancel editing
+		s.editingText = false
+		return s, nil, false
+
+	case "backspace":
+		if len(s.textBuffer) > 0 {
+			s.textBuffer = s.textBuffer[:len(s.textBuffer)-1]
+		}
+
+	default:
+		// Add character
+		if len(key) == 1 {
+			s.textBuffer += key
+		}
+	}
+
+	return s, nil, false
+}
+
+// View renders the settings panel
+func (s *SettingsPanel) View() string {
+	if !s.visible {
+		return ""
+	}
+
+	// Styles
+	titleStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(ColorCyan)
+
+	sectionStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(ColorAccent)
+
+	labelStyle := lipgloss.NewStyle().
+		Foreground(ColorText)
+
+	dimStyle := lipgloss.NewStyle().
+		Foreground(ColorComment)
+
+	highlightStyle := lipgloss.NewStyle().
+		Background(ColorSurface)
+
+	warningStyle := lipgloss.NewStyle().
+		Foreground(ColorYellow)
+
+	// Dialog dimensions
+	dialogWidth := 64
+	if s.width > 0 && s.width < dialogWidth+10 {
+		dialogWidth = s.width - 10
+		if dialogWidth < 50 {
+			dialogWidth = 50
+		}
+	}
+
+	var content strings.Builder
+
+	// Title
+	content.WriteString(titleStyle.Render("Settings"))
+	content.WriteString(dimStyle.Render("                                    [Esc] Close"))
+	content.WriteString("\n")
+	content.WriteString(strings.Repeat("-", dialogWidth-4))
+	content.WriteString("\n\n")
+
+	// Theme section
+	content.WriteString(sectionStyle.Render("THEME"))
+	if s.needsRestart {
+		content.WriteString(warningStyle.Render(" (restart required)"))
+	}
+	content.WriteString("\n")
+	themeRow := s.renderRadioGroup(themeNames, s.selectedTheme, s.cursor == int(SettingTheme))
+	if s.cursor == int(SettingTheme) {
+		themeRow = highlightStyle.Render(themeRow)
+	}
+	content.WriteString("  " + themeRow + "\n\n")
+
+	// DEFAULT TOOL
+	content.WriteString(sectionStyle.Render("DEFAULT TOOL"))
+	content.WriteString("\n")
+	line := s.renderRadioGroup(s.toolNames, s.selectedTool, s.cursor == int(SettingDefaultTool))
+	if s.cursor == int(SettingDefaultTool) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + line + "\n")
+	content.WriteString(dimStyle.Render("  Pre-selected when creating new sessions"))
+	content.WriteString("\n\n")
+
+	// CLAUDE
+	content.WriteString(sectionStyle.Render("CLAUDE"))
+	content.WriteString("\n")
+
+	// Dangerous mode checkbox
+	line = s.renderCheckbox("Dangerous mode", s.dangerousMode) + " - Skip permission prompts"
+	if s.cursor == int(SettingDangerousMode) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	// Config directory
+	line = "Config directory"
+	if s.claudeConfigIsScope && s.profile != "" {
+		line += " (" + s.profile + " profile)"
+	}
+	line += ": "
+	if s.editingText && s.cursor == int(SettingClaudeConfigDir) {
+		line += "[" + s.textBuffer + "|]"
+	} else if s.claudeConfigDir == "" {
+		line += dimStyle.Render("~/.claude (default)")
+	} else {
+		line += s.claudeConfigDir
+	}
+	if s.cursor == int(SettingClaudeConfigDir) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// GEMINI
+	content.WriteString(sectionStyle.Render("GEMINI"))
+	content.WriteString("\n")
+
+	// YOLO mode checkbox
+	line = s.renderCheckbox("YOLO mode", s.geminiYoloMode) + " - Auto-approve all actions"
+	if s.cursor == int(SettingGeminiYoloMode) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// CODEX
+	content.WriteString(sectionStyle.Render("CODEX"))
+	content.WriteString("\n")
+
+	// YOLO mode checkbox
+	line = s.renderCheckbox("YOLO mode", s.codexYoloMode) + " - Bypass approvals and sandbox"
+	if s.cursor == int(SettingCodexYoloMode) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// HERMES
+	content.WriteString(sectionStyle.Render("HERMES"))
+	content.WriteString("\n")
+
+	// YOLO mode checkbox
+	line = s.renderCheckbox("YOLO mode", s.hermesYoloMode) + " - Auto-approve all tool calls"
+	if s.cursor == int(SettingHermesYoloMode) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// UPDATES
+	content.WriteString(sectionStyle.Render("UPDATES"))
+	content.WriteString("\n")
+
+	line = s.renderCheckbox("Check for updates on startup", s.checkForUpdates)
+	if s.cursor == int(SettingCheckForUpdates) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = s.renderCheckbox("Offer to install on startup", s.autoUpdate)
+	if s.cursor == int(SettingAutoUpdate) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = s.renderCheckbox("Install updates automatically", s.autoInstall)
+	if s.cursor == int(SettingAutoInstall) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = s.renderCheckbox("Restart automatically after update", s.autoRestart)
+	if s.cursor == int(SettingAutoRestart) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// LOGS
+	content.WriteString(sectionStyle.Render("LOGS"))
+	content.WriteString("\n")
+
+	line = s.renderNumber("Max file size:", s.logMaxSizeMB, "MB")
+	if s.cursor == int(SettingLogMaxSize) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line))
+
+	line = s.renderNumber("    Lines to keep:", s.logMaxLines, "")
+	if s.cursor == int(SettingLogMaxLines) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString(labelStyle.Render(line) + "\n")
+
+	line = s.renderCheckbox("Remove orphan logs", s.removeOrphans)
+	if s.cursor == int(SettingRemoveOrphans) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// matrix/hardened: distinguish / and Alt+/ from the G conversation-search controls.
+	content.WriteString(sectionStyle.Render("LOCAL SEARCH"))
+	content.WriteString("\n")
+	line = s.renderCheckbox("Clear search on open (/)", s.clearSearchOnOpen) + " - /, Alt+/; off keeps query"
+	if s.cursor == int(SettingClearSearchOnOpen) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// GLOBAL SEARCH
+	content.WriteString(sectionStyle.Render("GLOBAL SEARCH"))
+	if s.needsRestart {
+		content.WriteString(warningStyle.Render("  (changes require restart)"))
+	}
+	content.WriteString("\n")
+
+	line = s.renderCheckbox("Enabled", s.globalSearchEnabled)
+	if s.cursor == int(SettingGlobalSearchEnabled) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = "Search tier: " + s.renderRadioGroup(tierNames, s.searchTier, s.cursor == int(SettingSearchTier))
+	if s.cursor == int(SettingSearchTier) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = s.renderNumber("Recent days:", s.recentDays, "(0 = all)")
+	if s.cursor == int(SettingRecentDays) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// PREVIEW
+	content.WriteString(sectionStyle.Render("PREVIEW"))
+	content.WriteString("\n")
+
+	line = s.renderCheckbox("Show Output", s.showOutput) + " - Terminal output in preview"
+	if s.cursor == int(SettingShowOutput) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = s.renderCheckbox("Show Analytics", s.showAnalytics) + " - Claude analytics panel"
+	if s.cursor == int(SettingShowAnalytics) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = s.renderCheckbox("Show Notes", s.showNotes) + " - Session notes in preview"
+	if s.cursor == int(SettingShowNotes) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = s.renderNumber("Notes/Output split:", s.notesOutputSplit, "%")
+	if s.cursor == int(SettingNotesOutputSplit) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// MAINTENANCE
+	content.WriteString(sectionStyle.Render("MAINTENANCE"))
+	content.WriteString("\n")
+
+	line = s.renderCheckbox(
+		"Auto-maintenance",
+		s.maintenanceEnabled,
+	) + " - Prune logs, clean backups, archive large sessions"
+	if s.cursor == int(SettingMaintenanceEnabled) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// SYSTEM STATS
+	content.WriteString(sectionStyle.Render("SYSTEM STATS"))
+	content.WriteString("\n")
+
+	line = s.renderCheckbox("Enabled", s.statsEnabled) + " - Show CPU, RAM, etc. in status bar"
+	if s.cursor == int(SettingStatsEnabled) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = s.renderNumber("Refresh interval:", s.statsRefreshSecs, "sec")
+	if s.cursor == int(SettingStatsRefresh) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = "Format: " + s.renderRadioGroup(statsFormatNames, s.statsFormat, s.cursor == int(SettingStatsFormat))
+	if s.cursor == int(SettingStatsFormat) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	content.WriteString(dimStyle.Render("  Visible stats:") + "\n")
+
+	line = s.renderCheckbox("CPU", s.statsShowCPU)
+	if s.cursor == int(SettingStatsShowCPU) {
+		line = highlightStyle.Render(line)
+	}
+	cpuCol := "  " + labelStyle.Render(line)
+
+	line = s.renderCheckbox("RAM", s.statsShowRAM)
+	if s.cursor == int(SettingStatsShowRAM) {
+		line = highlightStyle.Render(line)
+	}
+	ramCol := "  " + labelStyle.Render(line)
+
+	line = s.renderCheckbox("Disk", s.statsShowDisk)
+	if s.cursor == int(SettingStatsShowDisk) {
+		line = highlightStyle.Render(line)
+	}
+	diskCol := "  " + labelStyle.Render(line)
+
+	content.WriteString(cpuCol + ramCol + diskCol + "\n")
+
+	line = s.renderCheckbox("Network", s.statsShowNetwork)
+	if s.cursor == int(SettingStatsShowNetwork) {
+		line = highlightStyle.Render(line)
+	}
+	netCol := "  " + labelStyle.Render(line)
+
+	line = s.renderCheckbox("GPU", s.statsShowGPU)
+	if s.cursor == int(SettingStatsShowGPU) {
+		line = highlightStyle.Render(line)
+	}
+	gpuCol := "  " + labelStyle.Render(line)
+
+	line = s.renderCheckbox("Load", s.statsShowLoad)
+	if s.cursor == int(SettingStatsShowLoad) {
+		line = highlightStyle.Render(line)
+	}
+	loadCol := "  " + labelStyle.Render(line)
+
+	content.WriteString(netCol + gpuCol + loadCol + "\n\n")
+
+	// SESSIONS
+	content.WriteString(sectionStyle.Render("SESSIONS"))
+	content.WriteString("\n")
+
+	line = s.renderCheckbox(
+		"Sync session title",
+		s.syncTitle,
+	) + " - Let the agent rename the session (off = keep your title)"
+	if s.cursor == int(SettingSyncTitle) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// DISPLAY
+	content.WriteString(sectionStyle.Render("DISPLAY"))
+	content.WriteString("\n")
+
+	line = s.renderCheckbox("Show session timestamps", s.showSessionTimestamps) + " - Last activity per row"
+	if s.cursor == int(SettingShowSessionTimestamps) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = s.renderCheckbox("Show pane titles", s.showPaneTitles) + " - Task description per row"
+	if s.cursor == int(SettingShowPaneTitles) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// UI / TOOL PICKER
+	content.WriteString(sectionStyle.Render("TOOL PICKER"))
+	content.WriteString("\n")
+
+	line = s.renderCheckbox(
+		"Show only installed tools",
+		s.showOnlyInstalledTools,
+	) + " - Hide tools whose command is not on PATH"
+	if s.cursor == int(SettingShowOnlyInstalledTools) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = "Visible tools…  (Enter to edit checklist)"
+	if s.cursor == int(SettingVisibleTools) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// INTERFACE
+	content.WriteString(sectionStyle.Render("INTERFACE"))
+	content.WriteString("\n")
+
+	line = s.renderCheckbox("Embedded terminal", s.embeddedLayout) + " - Persistent sidebar with an interactive tmux pane (applies at next launch)"
+	if s.cursor == int(SettingEmbeddedTerminal) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = "Sidebar density: " + s.renderRadioGroup(sidebarDensityNames, s.sidebarDensity, s.cursor == int(SettingSidebarDensity))
+	if s.cursor == int(SettingSidebarDensity) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+	content.WriteString(dimStyle.Render("    Lines per session in the embedded sidebar: 3 / 2 / 1 (1 keeps the tool marker)") + "\n")
+	content.WriteString(dimStyle.Render("    Auto: the most lines that still fit every open session on screen") + "\n\n")
+
+	// PRIVACY
+	content.WriteString(sectionStyle.Render("PRIVACY"))
+	content.WriteString("\n")
+	line = "Usage data: " + s.privacyLabel + "  (Enter to change)"
+	if s.cursor == int(SettingPrivacy) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+	content.WriteString(dimStyle.Render("    "+s.privacyTickLabel) + "\n\n")
+
+	// matrix/hardened: append a local, explicitly opened AI update manager.
+	content.WriteString(sectionStyle.Render("AI UPDATES"))
+	content.WriteString("\n")
+	line = "Manage AI updates…  (Enter to open)"
+	if s.cursor == int(SettingAIUpdates) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
+	// MCP & TOOLS
+	content.WriteString(sectionStyle.Render("MCP SERVERS & CUSTOM TOOLS"))
+	content.WriteString("\n")
+	content.WriteString(dimStyle.Render("  Edit " + userConfigPathForDisplay() + " to configure MCPs and tools."))
+	content.WriteString("\n")
+	hotkeys := resolveHotkeys(session.GetHotkeyOverrides())
+	mcpKey := actionHotkey(hotkeys, hotkeyMCPManager)
+	mcpHint := "  MCP Manager hotkey is unbound."
+	if mcpKey != "" {
+		mcpHint = fmt.Sprintf("  Press %s on any Claude, Gemini, or Cursor session to attach MCPs.", mcpKey)
+	}
+	content.WriteString(dimStyle.Render(mcpHint))
+	content.WriteString("\n\n")
+
+	// Help bar, broken between hints (never mid-hint) when the box is
+	// narrower than the bar.
+	helpBar := dimStyle.Render(renderDialogFooterRows(dialogWidth-4, 2, "  ",
+		[]string{"j/k Navigate", "Space Toggle", "h/l Adjust", "Enter Edit", "Esc Close"}))
+	content.WriteString(helpBar)
+
+	// Apply scroll windowing if content overflows available terminal height.
+	// The dialog box adds 4 lines of chrome: border (top+bottom) + padding (top+bottom).
+	contentStr := content.String()
+	const dialogChrome = 4
+	availHeight := s.height - dialogChrome
+	if availHeight < 5 {
+		availHeight = 5
+	}
+
+	// Window the rows the box actually draws: a long line (the DEFAULT TOOL
+	// pills, the embedded-terminal hint) wraps inside the box, so counting
+	// source lines let the box grow past the screen and lose its top rows.
+	// rowOf maps a source line to its first drawn row.
+	sourceLines := strings.Split(strings.TrimRight(contentStr, "\n"), "\n")
+	wrapStyle := lipgloss.NewStyle().Width(dialogWidth - 4) // the box's Padding(1, 2)
+	rowOf := make([]int, len(sourceLines))
+	var contentLines []string
+	for i, line := range sourceLines {
+		rowOf[i] = len(contentLines)
+		contentLines = append(contentLines, strings.Split(wrapStyle.Render(line), "\n")...)
+	}
+	totalLines := len(contentLines)
+
+	if totalLines > availHeight && s.height > 0 {
+		// The help bar (the last source lines) is pinned below the window,
+		// so Esc stays on screen however far the settings scroll.
+		helpStart := rowOf[len(sourceLines)-lipgloss.Height(helpBar)]
+		helpRows := contentLines[helpStart:]
+		contentLines = contentLines[:helpStart]
+		totalLines = len(contentLines)
+		availHeight = max(availHeight-len(helpRows), 3)
+
+		// Map cursor index to content line number (based on the fixed layout above).
+		// Update this mapping if settings are added/removed/reordered.
+		cursorToLine := [settingsCount]int{
+			4,  // SettingTheme
+			7,  // SettingDefaultTool
+			11, // SettingDangerousMode
+			12, // SettingClaudeConfigDir
+			15, // SettingGeminiYoloMode
+			18, // SettingCodexYoloMode
+			21, // SettingHermesYoloMode
+			24, // SettingCheckForUpdates
+			25, // SettingAutoUpdate
+			26, // SettingAutoInstall
+			27, // SettingAutoRestart
+			30, // SettingLogMaxSize
+			30, // SettingLogMaxLines (shares line with LogMaxSize)
+			31, // SettingRemoveOrphans
+			34, // SettingClearSearchOnOpen (matrix/hardened: LOCAL SEARCH adds three lines)
+			37, // SettingGlobalSearchEnabled
+			38, // SettingSearchTier
+			39, // SettingRecentDays
+			42, // SettingShowOutput
+			43, // SettingShowAnalytics
+			44, // SettingShowNotes
+			45, // SettingNotesOutputSplit
+			48, // SettingMaintenanceEnabled
+			51, // SettingStatsEnabled
+			52, // SettingStatsRefresh
+			53, // SettingStatsFormat
+			55, // SettingStatsShowCPU (row with RAM, Disk)
+			55, // SettingStatsShowRAM
+			55, // SettingStatsShowDisk
+			56, // SettingStatsShowNetwork (row with GPU, Load)
+			56, // SettingStatsShowGPU
+			56, // SettingStatsShowLoad
+			59, // SettingSyncTitle (SESSIONS section, after stats)
+			62, // SettingShowSessionTimestamps (DISPLAY section, after SESSIONS)
+			63, // SettingShowPaneTitles (DISPLAY section, after timestamps)
+			66, // SettingShowOnlyInstalledTools (TOOL PICKER section)
+			67, // SettingVisibleTools
+			70, // SettingEmbeddedTerminal (INTERFACE section)
+			71, // SettingSidebarDensity
+			76, // SettingPrivacy (PRIVACY section)
+			80, // SettingAIUpdates (matrix/hardened: AI UPDATES section)
+		}
+		cursorLine := rowOf[cursorToLine[s.cursor]]
+
+		// Ensure cursor is visible with 2 lines of context
+		if cursorLine-2 < s.scrollOffset {
+			s.scrollOffset = cursorLine - 2
+		}
+		if cursorLine+2 >= s.scrollOffset+availHeight {
+			s.scrollOffset = cursorLine - availHeight + 3
+		}
+		if s.scrollOffset < 0 {
+			s.scrollOffset = 0
+		}
+		maxOff := totalLines - availHeight
+		if s.scrollOffset > maxOff {
+			s.scrollOffset = maxOff
+		}
+		// When the cursor sits on the last navigable setting, scroll all the
+		// way to the bottom so the trailing info lines (MCP config-path hint)
+		// come into view and the "▼ more below" indicator clears.
+		// Scrolling is cursor-anchored, so without this the tail is
+		// unreachable (issue #1659). Never scroll the cursor's row out of
+		// view (it may sit right under "▲ more above"), in case the tail
+		// ever grows taller than the viewport.
+		if s.cursor == settingsCount-1 && s.scrollOffset < maxOff {
+			bottomOff := maxOff
+			if lim := cursorLine - 1; bottomOff > lim {
+				bottomOff = lim
+			}
+			if s.scrollOffset < bottomOff {
+				s.scrollOffset = bottomOff
+			}
+		}
+
+		// Determine visible window, replacing edge content lines with scroll indicators
+		startLine := s.scrollOffset
+		endLine := s.scrollOffset + availHeight
+		if endLine > totalLines {
+			endLine = totalLines
+		}
+		showScrollUp := startLine > 0
+		showScrollDown := endLine < totalLines
+		if showScrollUp {
+			startLine++
+		}
+		if showScrollDown {
+			endLine--
+		}
+
+		var scrolled strings.Builder
+		if showScrollUp {
+			scrolled.WriteString(dimStyle.Render("  ▲ more above") + "\n")
+		}
+		scrolled.WriteString(strings.Join(contentLines[startLine:endLine], "\n"))
+		if showScrollDown {
+			scrolled.WriteString("\n" + dimStyle.Render("  ▼ more below"))
+		}
+		scrolled.WriteString("\n" + strings.Join(helpRows, "\n"))
+		contentStr = scrolled.String()
+	}
+
+	// Wrap in dialog box
+	dialogStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(ColorCyan).
+		Background(ColorBg).
+		Padding(1, 2).
+		Width(dialogWidth)
+
+	dialog := dialogStyle.Render(contentStr)
+
+	// Center the dialog
+	return lipgloss.Place(
+		s.width,
+		s.height,
+		lipgloss.Center,
+		lipgloss.Center,
+		dialog,
+	)
+}
+
+// renderCheckbox renders a checkbox with label
+func (s *SettingsPanel) renderCheckbox(label string, checked bool) string {
+	box := "[ ]"
+	if checked {
+		box = "[x]"
+	}
+	return box + " " + label
+}
+
+// renderRadioGroup renders a group of radio options
+func (s *SettingsPanel) renderRadioGroup(options []string, selected int, focused bool) string {
+	var parts []string
+	for i, opt := range options {
+		if i == selected {
+			style := lipgloss.NewStyle().Bold(true).Foreground(ColorAccent)
+			parts = append(parts, style.Render(">"+opt))
+		} else {
+			style := lipgloss.NewStyle().Foreground(ColorTextDim)
+			parts = append(parts, style.Render(" "+opt))
+		}
+	}
+	return strings.Join(parts, "  ")
+}
+
+// renderNumber renders a number input with label and suffix
+func (s *SettingsPanel) renderNumber(label string, value int, suffix string) string {
+	numStyle := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
+	valueStr := strconv.Itoa(value)
+	result := label + " [" + numStyle.Render(valueStr) + "]"
+	if suffix != "" {
+		result += " " + suffix
+	}
+	return result
+}

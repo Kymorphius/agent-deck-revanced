@@ -1,0 +1,140 @@
+// uiState.js -- UI-only signals for the redesigned shell.
+// Keeps state.js (data signals) clean from view-state churn.
+//
+// Persistence: tab/accent/density/rail/rightRailPanels persist to localStorage
+// so a reload restores the user's chosen layout. Status filters and palette
+// open/close are session-scoped (don't persist).
+import { signal, effect } from '@preact/signals'
+
+function loadJSON(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key)
+    if (raw == null) return fallback
+    return JSON.parse(raw)
+  } catch (_) {
+    return fallback
+  }
+}
+function persist(sig, key) {
+  effect(() => {
+    try { localStorage.setItem(key, JSON.stringify(sig.value)) } catch (_) { /* private mode */ }
+  })
+}
+
+// Active tab in main work surface.
+// Bundle ships 8 tabs: fleet, terminal, mcp, skills, conductor, watchers, costs, search.
+// Only `fleet | terminal | costs | search` have data (search filters local sessions only).
+// MCP/Skills/Conductor/Watchers render informative stubs because the API doesn't expose them.
+// Whether the VIEWER had already chosen a pane. Captured BEFORE persist()
+// below, which writes the default back immediately — after that, "is the key
+// set?" cannot tell a real choice from our own write. App.js reads this to
+// decide whether a /s/{id} link may steer the pane (only on a cold visit).
+export const hadStoredTab = (() => {
+  try {
+    return localStorage.getItem('agentdeck.tab') != null
+  } catch (_) {
+    return false   // private mode: treat as cold rather than trapping the link
+  }
+})()
+
+export const activeTabSignal = signal(loadJSON('agentdeck.tab', 'fleet'))
+persist(activeTabSignal, 'agentdeck.tab')
+
+// Command palette + tweaks panel open/close.
+export const paletteOpenSignal = signal(false)
+export const tweaksOpenSignal = signal(false)
+
+// Accent color (drives body[data-accent]).
+export const accentSignal = signal(loadJSON('agentdeck.accent', 'blue'))
+persist(accentSignal, 'agentdeck.accent')
+
+// Density (drives body[data-density]).
+export const densitySignal = signal(loadJSON('agentdeck.density', 'balanced'))
+persist(densitySignal, 'agentdeck.density')
+
+// Right rail visible/hidden (drives body[data-rail] and grid-template-columns).
+export const railSignal = signal(loadJSON('agentdeck.rail', 'visible'))
+persist(railSignal, 'agentdeck.rail')
+
+// matrix/hardened: session drawer for touch tablets / an unfolded foldable
+// (coarse pointer, 721-1100px), where the fixed 300px sidebar left the terminal
+// ~45 columns. Drives body[data-sdrawer]; the CSS ignores it at other sizes.
+// Not persisted: every load starts with the terminal at full width.
+export const sessionDrawerOpenSignal = signal(false)
+effect(() => {
+  if (typeof document === 'undefined') return
+  document.body.dataset.sdrawer = sessionDrawerOpenSignal.value ? 'open' : 'closed'
+})
+
+// Right rail panel toggles (which cards are shown).
+export const rightRailPanelsSignal = signal(loadJSON('agentdeck.rightRailPanels', {
+  overview: true, usage: true, mcps: true, skills: true, children: true, events: true,
+}))
+persist(rightRailPanelsSignal, 'agentdeck.rightRailPanels')
+
+// Sidebar status filter chips (running/waiting/error/idle).
+export const statusFiltersSignal = signal([])
+
+// Mobile bottom tab (mirror of activeTab on phones).
+export const mobileTabSignal = signal('fleet')
+
+// Sidebar column show/hide menu state.
+// Options added after a viewer persisted their choice are merged in with
+// their default, so the menu checkbox matches what the row renders; an
+// explicitly saved value (annotations: false) still wins.
+export const showColsSignal = signal({
+  annotations: true,
+  ...loadJSON('agentdeck.showCols', {
+    tool: true, cost: true, branch: false, attach: false, sandbox: false, lastSeen: false,
+  }),
+})
+persist(showColsSignal, 'agentdeck.showCols')
+
+// Fleet board layout: 'groups' (the one-card-per-group grid, the default) or
+// 'status' (opt-in kanban by the semantic status hint).
+export const fleetViewSignal = signal(loadJSON('agentdeck.fleetView', 'groups'))
+persist(fleetViewSignal, 'agentdeck.fleetView')
+
+// Whether the pinned conductor banner shows its fleet summary (default open).
+export const conductorBannerOpenSignal = signal(loadJSON('agentdeck.conductorBannerOpen', true))
+persist(conductorBannerOpenSignal, 'agentdeck.conductorBannerOpen')
+
+// Profile selector. Initialized to empty so cold loads don't flash a
+// hardcoded default before /api/profiles resolves. AppShell seeds this
+// from `current` on the first /api/profiles response; consumers
+// (Topbar, Footer, AppShell.WorkHead) treat empty as "not yet known"
+// and render a neutral placeholder.
+export const profileSignal = signal('')
+
+// Apply accent/density/rail dataset attributes for CSS variable swap.
+// design-tokens.css uses `:root[data-*]` selectors; we also mirror to
+// <body> so bundle-derived rules using `body[data-rail="hidden"]` still match.
+effect(() => {
+  if (typeof document === 'undefined') return
+  document.documentElement.dataset.accent = accentSignal.value
+  document.documentElement.dataset.density = densitySignal.value
+  document.documentElement.dataset.rail = railSignal.value
+  document.body.dataset.accent = accentSignal.value
+  document.body.dataset.density = densitySignal.value
+  document.body.dataset.rail = railSignal.value
+})
+
+// Sidebar `/ filter` text. Lifted out of Sidebar.js useState so
+// sidebarRowsSignal — and therefore keyboard nav — sees the same filter the
+// user does. Session-scoped, as before.
+export const sidebarFilterSignal = signal('')
+
+// Group collapse map: { [groupPath]: false }. Only collapsed groups appear;
+// an absent entry means open (the predicate Sidebar.js already used).
+//
+// The SERVER is authoritative: dataModel.js reconcileGroupExpanded adopts
+// MenuGroup.Expanded from each menu snapshot, and toggleGroupOpen PATCHes
+// changes back, so the TUI and the browser now agree. (This used to be
+// local-only precisely because no endpoint could write it back — see
+// PATCH /api/groups/{path} and WebMutator.SetGroupExpanded.)
+//
+// localStorage is still worth keeping: it paints the right collapse state on
+// the very first frame, before the initial snapshot lands, and it remains the
+// only persistence on a read-only server, where toggleGroupOpen stays local.
+export const groupExpandedSignal = signal(loadJSON('agentdeck.groupExpanded', {}))
+persist(groupExpandedSignal, 'agentdeck.groupExpanded')

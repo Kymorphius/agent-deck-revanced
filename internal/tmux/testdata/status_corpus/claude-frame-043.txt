@@ -1,0 +1,50 @@
+        x +        "xxxxxxx"
+        x +        "xxxx"
+        x +        "xxxxxxx"
+        x +        "xxxx"
+        x +        "xxxxxxx"
+       xx +
+       xx +        xxx "xxxxxx.xxx/xxxxxxxxxxxxx/xxxxxxxxx"
+       xx +        "xxxxxx.xxx/xxxxxxxxxxxxx/x/xxxx"
+       xx +        "xxxxxx.xxx/xxxxx/xx-xxxxxxxxx"
+       xx +)
+       xx +
+       xx +// xxxxxxxxxxxxxxx xx xxx x xxxxxxxx xxxxx xxx xxxx xx xxxxxx.
+       xx +xxxx xxxxxxxxxxxxxxx xxx
+       xx +
+       xx +xxxxx (
+       xx +        // xxxxxxxxxxx xxxxx x xxxxxxxx xxxxxxx xx xxx xxxx, xx xxxx.xxxxxxxxxxx,
+       xx +        // xxxxxx xxxx'x xxx.xxxxxxxxxxx xxx xxxxxxxx xxxx xx.
+       xx +        xxxxxxxxxxx xxxxxxxxxxxxxxx = xxxx
+       xx +        // xxxxxxxxxxxxxxxx xxxxxxxx xxx xxxx xxxxx xx xxxxxxx, xx xxxxx,
+       xx +        // xxxxx-xxxxx xxxx xxx xxxxxxx'x xxxxxx xxxx xx.
+       xx +        xxxxxxxxxxxxxxxx
+       xx +        // xxxxxxxxxxxxx xx xxxxxxx x.x'x xxxxxxx xxxxxxx xxxx (xxxxxx x.x.x): x
+       xx +        // xxxxxxx xxxxxx xx xxx xxxx'x xxxxx xxx xxxxxxx x xxxxx xxxx x xxxxxx
+       xx +        // xxxx xx xxx xxxx-xxxxx-xx-xxxxxxxx (x xxxxxxx xxxxx xxxx, x xxxxxx
+       xx +        // xxxxxxxxx) xxxxx xx; xxxx xxxxxx, xxxx xxxxxxx.
+       xx +        xxxxxxxxxxxxx
+       xx +        // xxxxxxxxxxxxxxxxx xx x xxxxxxxx xxx xx xxxx xxxx xxxxx xxxxxxxxx
+       xx +        // xxxxxxxxxx (● ○ ◐ ■ x │ ─ … ↓ ↑ ▶ · •) xx x xxxxx: xxx xxxxxxx, xxx
+       xx +        // xxxxxx "xxxxxxxxx xxxxxxxxxx xxx xxxxxx-xxxxx" xxxxxx. xx xxxxx xxx
+       xx +        // xxx xx (xxx xxxxxxx xxxxxx xxx); xxxx xxxx-xxxx xxx xxxxx xxxx xx xxxxx.
+       xx +        xxxxxxxxxxxxxxxxx
+       xx +)
+       xx +
+       xx +xxx xxxxxxxxxxxxx = xxxx() *xxxxxxxxx.xxxxxxxxx {
+       xx +        x := xxxxxxxxx.xxxxxxxxxxxx()
+       xx +        x.xxxxxxxxxxxxxx = xxxx
+     … xxx xxxx xxxxx
+  ⎿  (xxxx xxxx xxxxxxx xxxxxxx; x xxxxxxxxxxx xxxx, xxx x xxxxxx xx xxxxx xx xxx xxxxxxx)
+
+  Running xxxxx xxxx xx main xxx xxxx xxx
+  ⎿  $ xx /xxx/xxxx-xxxxxx-xxx-xxx/xxx && XXXX=0000 /Xxxxx/x/.agent-xxxx/xxxxxxxxx/agent-xxxx/xxx/x00-xxxx.xx . -xxxxx=0 -xxx 'XxxxXxxXxxXxxxx' -x ./xxxxxxxx/xx/ 0>&0 | xxxx -000
+
+✢ Deliberating… (7m 14s · ↓ 00.0k tokens · thinking)
+  ⎿  Tip: Xxx /xxx xx xxx x xxxxx xxxx xxxxxxxx xxxxxxx xxxxxxxxxxxx Xxxxxx'x xxxxxxx xxxx
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xxxxxx-xxx-xxx ─
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [xxxxxxxx] x@xxxx:/xxxxxxx/xxx/xxxx-xxxxxx-xxx-xxx/xxx | [Xxxx 0.0] ctx:00% in:000.0k out:000 5h:0% 7d:0%
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

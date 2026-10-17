@@ -1,0 +1,15 @@
+Telemetry: OFF
+  Reason:        telemetry is removed in this build (matrix/hardened)
+  Consent:       undecided
+  Install id:    -
+  Level:         full
+  Endpoint:      https://eu.i.posthog.com
+  Upload:        not configured (no PostHog project key; events stay local)
+  Project key:   none
+  Spool:         0 event(s), 0 bytes, oldest day -
+  Next upload:   -
+  Last upload:   -
+  Daily cap:     0/60 events, 0 dropped
+  Daily tick:    install.tick: never; last sent never
+  State file:    <SANDBOX_HOME>/.local/share/agent-deck/telemetry-state.json
+  Docs:          https://github.com/asheshgoplani/agent-deck/blob/main/TELEMETRY.md

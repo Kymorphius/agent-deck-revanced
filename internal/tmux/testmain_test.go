@@ -1,0 +1,217 @@
+package tmux
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/testutil"
+)
+
+// bootstrapSessionName is the idle tmux session kept alive for the lifetime
+// of this test binary so skipIfNoTmuxBinary doesn't silently no-op regression
+// tests. See .planning/v1716-cleanup/PLAN.md concern 3.
+const bootstrapSessionName = "agent-deck-tmux-test-bootstrap"
+
+// skipIfNoTmuxBinary skips the test only when the tmux binary is absent from
+// PATH. Previously skipIfNoTmuxServer ALSO skipped on "server not running",
+// which silently no-op'd #610/#618 regression tests inside isolated
+// TMUX_TMPDIR. TestMain now bootstraps a server so the server check is no
+// longer needed -- we skip only when tmux itself is missing.
+func skipIfNoTmuxBinary(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+}
+
+// skipIfNoTmuxServer preserves pre-bootstrap semantics for legacy tests
+// (see the session package's testmain_test.go for full rationale). Skips
+// when only the bootstrap session is present so tests that need a real
+// external live session still silent-skip as before.
+func skipIfNoTmuxServer(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+	out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
+	if err != nil {
+		t.Skip("tmux server not running")
+	}
+	hasReal := false
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == bootstrapSessionName {
+			continue
+		}
+		hasReal = true
+		break
+	}
+	if !hasReal {
+		t.Skip("tmux server has only the bootstrap session; legacy test requires a real live session")
+	}
+}
+
+// TestMain ensures all tmux tests use the _test profile to prevent
+// accidental modification of production data.
+// CRITICAL: This was missing and caused test data to overwrite production sessions!
+func TestMain(m *testing.M) {
+	// Child-helper mode for softkill_test.go (#737). When SOFTKILL_TEST_HELPER
+	// is set the test binary re-executes as a small SIGTERM-handling program
+	// instead of running tests. Must come first — before any tmux setup — so
+	// the helper child stays lightweight.
+	if role := os.Getenv("SOFTKILL_TEST_HELPER"); role != "" {
+		runSoftkillHelper(role)
+		return
+	}
+
+	// Child-helper mode for the #927 regression tests. Spawns a tmux -C
+	// attach-session against the requested session, prints its pid, and
+	// exits — leaving the grandchild orphaned (reparented to init/systemd/
+	// launchd). The parent must have already isolated TMUX_TMPDIR before
+	// spawning this helper; we inherit that env so we hit the same tmux
+	// server. Must run before IsolateTmuxSocket so we don't fight the
+	// parent's isolation.
+	if name := os.Getenv("ORPHAN_CONTROL_CLIENT_HELPER"); name != "" {
+		runOrphanControlClientHelper(name)
+		return
+	}
+
+	os.Exit(runTestMain(m))
+}
+
+// runTestMain holds the real TestMain body. It exists so the cleanup defers
+// below actually run: TestMain calls os.Exit, which does NOT run deferred
+// functions, so registering them here and returning the exit code is the only
+// way to guarantee the bootstrap tmux server is killed and the isolated
+// TMUX_TMPDIR is removed. Skipping this leaked a tmux server (1 pty) on every
+// run — the 2026-06-07 pty-exhaustion incident.
+func runTestMain(m *testing.M) int {
+	// Isolate HOME+XDG so agent-deck path resolution lands in a temp dir, never
+	// the real ~/.agent-deck (2026-06-04 data-loss incident, S5). Placed after
+	// the child-helper guards above (those re-exec as subprocess tools and must
+	// keep the inherited env). See internal/testutil/homeenv.go.
+	cleanupHome := testutil.IsolateHome()
+	defer cleanupHome()
+
+	// Isolate the tmux socket. Without this, `tmux new-session` / `list-sessions` /
+	// `kill-session` calls in test setup & cleanup hit the user's default
+	// /tmp/tmux-<uid>/default socket — destabilizing their live sessions.
+	// 2026-04-17 incident: go test ./... killed every session in the personal
+	// profile when a maintainer ran tests during PR review.
+	// See internal/testutil/tmuxenv.go for the full postmortem.
+	cleanupTmux := testutil.IsolateTmuxSocket()
+	defer cleanupTmux()
+
+	// Bootstrap an idle tmux server in the isolated socket so the tests that
+	// depend on `tmux list-sessions` succeeding (#618 cleanup-attach OSC,
+	// etc.) actively run rather than silent-skipping on cold-boot. Registered
+	// last so its kill-server defer runs FIRST — while TMUX_TMPDIR still points
+	// at the isolated socket, before cleanupTmux restores the env.
+	cleanupBootstrap := bootstrapTmuxServer()
+	defer cleanupBootstrap()
+
+	// Keep the process-wide orphan sweep from firing implicitly. Every
+	// PipeManager.Connect calls startOrphanReapOnce, and the sweep walks all of
+	// /proc and SIGTERMs what it judges — against the developer's real process
+	// table, since /proc has no isolated equivalent of TMUX_TMPDIR. Inline that
+	// was at least ordered; launched in the background it would also race the
+	// tests that swap its seams. Marking it already-started means no Connect
+	// launches one, and both halves are covered directly instead
+	// (orphan_reap_identity_test.go, orphan_reap_budget_test.go).
+	orphanReapStarted.Store(true)
+
+	// Force _test profile for all tests in this package
+	os.Setenv("AGENTDECK_PROFILE", "_test")
+
+	// Run tests
+	code := m.Run()
+
+	// Cleanup: Kill any orphaned test sessions after tests complete
+	// This prevents RAM waste from lingering test sessions
+	// See CLAUDE.md: "2026-01-20 Incident: 20+ Test-Skip-Regen sessions orphaned, wasting ~3GB RAM"
+	cleanupTestSessions()
+
+	return code
+}
+
+// cleanupTestSessions kills any tmux sessions created during testing.
+// IMPORTANT: Only match specific known test artifacts, NOT broad patterns.
+// Broad patterns like HasPrefix("agentdeck_test") or Contains("test_") kill
+// real user sessions with "test" in their title. Each test already has
+// defer Kill() which handles cleanup reliably (runs on panic, Fatal, etc).
+func cleanupTestSessions() {
+	out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
+	if err != nil {
+		return
+	}
+
+	sessions := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, sess := range sessions {
+		if strings.Contains(sess, "Test-Skip-Regen") {
+			_ = exec.Command("tmux", "kill-session", "-t", sess).Run()
+		}
+	}
+}
+
+// bootstrapTmuxServer starts a detached no-op tmux session in the isolated
+// socket so `tmux list-sessions` succeeds for the lifetime of this test
+// binary. If tmux is not installed this is a no-op (tests skip anyway).
+func bootstrapTmuxServer() func() {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		return func() {}
+	}
+	start := func() bool {
+		cmd := exec.Command("tmux", "new-session", "-d", "-s", bootstrapSessionName, "sh", "-c", "sleep 3600")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "bootstrapTmuxServer(tmux): new-session failed: %v (%s)\n", err, strings.TrimSpace(string(out)))
+			return false
+		}
+		return true
+	}
+	ok := start()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := exec.Command("tmux", "has-session", "-t", bootstrapSessionName).Run(); err == nil {
+			break
+		}
+		if !ok {
+			ok = start()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return func() {
+		_ = exec.Command("tmux", "kill-server").Run()
+	}
+}
+
+// TestTmuxBootstrap_ServerIsRunning pins that TestMain's bootstrap ran and
+// `tmux list-sessions` succeeds before any other test runs. Regression guard
+// against F3 silent-skip trap.
+func TestTmuxBootstrap_ServerIsRunning(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	var lastErr error
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := exec.Command("tmux", "list-sessions").Run(); err != nil {
+			lastErr = fmt.Errorf("list-sessions: %w", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
+		if err != nil {
+			lastErr = fmt.Errorf("list-sessions -F: %w", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if strings.Contains(string(out), bootstrapSessionName) {
+			return
+		}
+		lastErr = fmt.Errorf("bootstrap session %q not present; got: %s", bootstrapSessionName, string(out))
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("tmux bootstrap not ready within 10s: %v", lastErr)
+}

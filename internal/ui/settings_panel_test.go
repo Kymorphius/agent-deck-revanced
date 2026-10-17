@@ -1,0 +1,1207 @@
+package ui
+
+import (
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/asheshgoplani/agent-deck/internal/session"
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+func boolPtr(v bool) *bool { return &v }
+
+func setSettingsPanelHotkeyConfigForTest(t *testing.T, tomlBody string) {
+	t.Helper()
+
+	homeDir := setXDGTestHome(t)
+	writeXDGTestConfig(t, homeDir, tomlBody)
+}
+
+// toolValueIndex returns the index of value in panel.toolValues (for name-based tests).
+func toolValueIndex(t *testing.T, panel *SettingsPanel, value string) int {
+	t.Helper()
+	for i, v := range panel.toolValues {
+		if v == value {
+			return i
+		}
+	}
+	t.Fatalf("tool value %q not found in %#v", value, panel.toolValues)
+	return -1
+}
+
+func TestSettingsPanel_InitialState(t *testing.T) {
+	panel := NewSettingsPanel()
+
+	if panel.IsVisible() {
+		t.Error("Panel should not be visible initially")
+	}
+
+	panel.Show()
+	if !panel.IsVisible() {
+		t.Error("Panel should be visible after Show()")
+	}
+}
+
+func TestSettingsPanel_Hide(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.Show()
+
+	if !panel.IsVisible() {
+		t.Error("Panel should be visible after Show()")
+	}
+
+	panel.Hide()
+
+	if panel.IsVisible() {
+		t.Error("Panel should not be visible after Hide()")
+	}
+}
+
+func TestSettingsPanel_LoadConfig(t *testing.T) {
+	panel := NewSettingsPanel()
+
+	// Load a config with specific values
+	dangerousModeBool := true
+	config := &session.UserConfig{
+		DefaultTool: "gemini",
+		Claude: session.ClaudeSettings{
+			DangerousMode: &dangerousModeBool,
+			ConfigDir:     "~/.claude-work",
+		},
+		Updates: session.UpdateSettings{
+			CheckEnabled: boolPtr(false),
+			AutoUpdate:   true,
+			AutoInstall:  boolPtr(false),
+			AutoRestart:  boolPtr(false),
+		},
+		Logs: session.LogSettings{
+			MaxSizeMB:     20,
+			MaxLines:      5000,
+			RemoveOrphans: boolPtr(false),
+		},
+		GlobalSearch: session.GlobalSearchSettings{
+			Enabled:    boolPtr(true),
+			Tier:       "instant",
+			RecentDays: 60,
+		},
+	}
+	panel.LoadConfig(config)
+
+	if got := panel.toolValues[panel.selectedTool]; got != "gemini" {
+		t.Errorf("default tool: got %q, want %q", got, "gemini")
+	}
+	if !panel.dangerousMode {
+		t.Error("dangerousMode should be true")
+	}
+	if panel.claudeConfigDir != "~/.claude-work" {
+		t.Errorf("claudeConfigDir: got %q, want %q", panel.claudeConfigDir, "~/.claude-work")
+	}
+	if panel.checkForUpdates {
+		t.Error("checkForUpdates should be false")
+	}
+	if !panel.autoUpdate {
+		t.Error("autoUpdate should be true")
+	}
+	if panel.autoInstall || panel.autoRestart {
+		t.Errorf("autoInstall=%v autoRestart=%v, want both false from config", panel.autoInstall, panel.autoRestart)
+	}
+	if panel.logMaxSizeMB != 20 {
+		t.Errorf("logMaxSizeMB: got %d, want 20", panel.logMaxSizeMB)
+	}
+	if panel.logMaxLines != 5000 {
+		t.Errorf("logMaxLines: got %d, want 5000", panel.logMaxLines)
+	}
+	if panel.removeOrphans {
+		t.Error("removeOrphans should be false")
+	}
+	if !panel.globalSearchEnabled {
+		t.Error("globalSearchEnabled should be true")
+	}
+	// "instant" should be index 1
+	if panel.searchTier != 1 {
+		t.Errorf("searchTier: got %d, want 1 (instant)", panel.searchTier)
+	}
+	if panel.recentDays != 60 {
+		t.Errorf("recentDays: got %d, want 60", panel.recentDays)
+	}
+}
+
+func TestSettingsPanel_LoadConfig_ProfileClaudeOverride(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.SetProfile("work")
+
+	dangerousModeBool := true
+	config := &session.UserConfig{
+		Claude: session.ClaudeSettings{
+			DangerousMode: &dangerousModeBool,
+			ConfigDir:     "~/.claude-global",
+		},
+		Profiles: map[string]session.ProfileSettings{
+			"work": {
+				Claude: session.ProfileClaudeSettings{
+					ConfigDir: "~/.claude-work",
+				},
+			},
+		},
+	}
+
+	panel.LoadConfig(config)
+
+	if panel.claudeConfigDir != "~/.claude-work" {
+		t.Errorf("claudeConfigDir: got %q, want %q", panel.claudeConfigDir, "~/.claude-work")
+	}
+	if !panel.claudeConfigIsScope {
+		t.Error("claudeConfigIsScope should be true when profile override exists")
+	}
+}
+
+func TestSettingsPanel_LoadConfig_DefaultTool(t *testing.T) {
+	panel := NewSettingsPanel()
+
+	tests := []struct {
+		name      string
+		tool      string
+		wantValue string // selected slot's config value ("", "" for None / unknown)
+	}{
+		{"claude", "claude", "claude"},
+		{"gemini", "gemini", "gemini"},
+		{"opencode", "opencode", "opencode"},
+		{"codex", "codex", "codex"},
+		{"pi", "pi", "pi"},
+		{"copilot", "copilot", "copilot"},
+		{"crush", "crush", "crush"},
+		{"muse", "muse", "muse"},
+		{"cursor", "cursor", "cursor"},
+		{"hermes", "hermes", "hermes"},
+		{"empty", "", ""}, // None
+		{"unknown", "unknown-tool", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &session.UserConfig{
+				DefaultTool: tt.tool,
+			}
+			panel.LoadConfig(config)
+			if got := panel.toolValues[panel.selectedTool]; got != tt.wantValue {
+				t.Errorf("LoadConfig(%q): toolValues[selectedTool] = %q, want %q",
+					tt.tool, got, tt.wantValue)
+			}
+		})
+	}
+}
+
+func TestSettingsPanel_LoadConfig_CustomTools(t *testing.T) {
+	panel := NewSettingsPanel()
+
+	config := &session.UserConfig{
+		DefaultTool: "openclaw",
+		Tools: map[string]session.ToolDef{
+			"openclaw": {},
+			"zeta":     {},
+			"claude":   {},
+		},
+	}
+
+	panel.LoadConfig(config)
+
+	wantNames := []string{"Claude", "Gemini", "OpenCode", "Codex", "Pi", "Copilot", "Crush", "Muse", "Cursor", "Hermes", "DeepSeek", "Oh My Pi", "Openclaw", "Zeta", "None"}
+	wantValues := []string{"claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "muse", "cursor", "hermes", "deepseek", "omp", "openclaw", "zeta", ""}
+
+	if !reflect.DeepEqual(panel.toolNames, wantNames) {
+		t.Fatalf("toolNames = %#v, want %#v", panel.toolNames, wantNames)
+	}
+	if !reflect.DeepEqual(panel.toolValues, wantValues) {
+		t.Fatalf("toolValues = %#v, want %#v", panel.toolValues, wantValues)
+	}
+	wantIdx := toolValueIndex(t, panel, "openclaw")
+	if panel.selectedTool != wantIdx {
+		t.Fatalf("selectedTool = %d, want %d for openclaw", panel.selectedTool, wantIdx)
+	}
+}
+
+func TestSettingsPanel_LoadConfig_SearchTier(t *testing.T) {
+	panel := NewSettingsPanel()
+
+	tests := []struct {
+		name     string
+		tier     string
+		expected int
+	}{
+		{"auto", "auto", 0},
+		{"instant", "instant", 1},
+		{"balanced", "balanced", 2},
+		{"empty", "", 0},
+		{"unknown", "unknown", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &session.UserConfig{
+				GlobalSearch: session.GlobalSearchSettings{
+					Tier: tt.tier,
+				},
+			}
+			panel.LoadConfig(config)
+			if panel.searchTier != tt.expected {
+				t.Errorf("LoadConfig tier %q: searchTier = %d, want %d",
+					tt.tier, panel.searchTier, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSettingsPanel_GetConfig(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.selectedTool = toolValueIndex(t, panel, "opencode")
+	panel.dangerousMode = true
+	panel.claudeConfigDir = "~/.claude-custom"
+	panel.checkForUpdates = false
+	panel.autoUpdate = true
+	panel.autoInstall = false
+	panel.autoRestart = false
+	panel.logMaxSizeMB = 15
+	panel.logMaxLines = 8000
+	panel.removeOrphans = false
+	panel.globalSearchEnabled = true
+	panel.searchTier = 2 // balanced
+	panel.recentDays = 45
+
+	config := panel.GetConfig()
+
+	if config.DefaultTool != "opencode" {
+		t.Errorf("DefaultTool: got %q, want %q", config.DefaultTool, "opencode")
+	}
+	if !config.Claude.GetDangerousMode() {
+		t.Error("DangerousMode should be true")
+	}
+	if config.Claude.ConfigDir != "~/.claude-custom" {
+		t.Errorf("ConfigDir: got %q, want %q", config.Claude.ConfigDir, "~/.claude-custom")
+	}
+	if config.Updates.GetCheckEnabled() {
+		t.Error("CheckEnabled should be false")
+	}
+	if !config.Updates.AutoUpdate {
+		t.Error("AutoUpdate should be true")
+	}
+	if config.Updates.AutoInstall == nil || *config.Updates.AutoInstall {
+		t.Error("AutoInstall should be *false")
+	}
+	if config.Updates.AutoRestart == nil || *config.Updates.AutoRestart {
+		t.Error("AutoRestart should be *false")
+	}
+	if config.Logs.MaxSizeMB != 15 {
+		t.Errorf("MaxSizeMB: got %d, want 15", config.Logs.MaxSizeMB)
+	}
+	if config.Logs.MaxLines != 8000 {
+		t.Errorf("MaxLines: got %d, want 8000", config.Logs.MaxLines)
+	}
+	if config.Logs.RemoveOrphans == nil || *config.Logs.RemoveOrphans {
+		t.Error("RemoveOrphans should be *false")
+	}
+	if config.GlobalSearch.Enabled == nil || !*config.GlobalSearch.Enabled {
+		t.Error("GlobalSearch.Enabled should be *true")
+	}
+	if config.GlobalSearch.Tier != "balanced" {
+		t.Errorf("Tier: got %q, want %q", config.GlobalSearch.Tier, "balanced")
+	}
+	if config.GlobalSearch.RecentDays != 45 {
+		t.Errorf("RecentDays: got %d, want 45", config.GlobalSearch.RecentDays)
+	}
+}
+
+func TestSettingsPanel_GetConfig_PreservesProfileOverrides(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.originalConfig = &session.UserConfig{
+		Profiles: map[string]session.ProfileSettings{
+			"work": {
+				Claude: session.ProfileClaudeSettings{
+					ConfigDir: "~/.claude-work",
+				},
+			},
+		},
+	}
+
+	config := panel.GetConfig()
+	profileCfg, ok := config.Profiles["work"]
+	if !ok {
+		t.Fatal("expected profile override for work to be preserved")
+	}
+	if profileCfg.Claude.ConfigDir != "~/.claude-work" {
+		t.Errorf("profile override config dir: got %q, want %q", profileCfg.Claude.ConfigDir, "~/.claude-work")
+	}
+}
+
+func TestSettingsPanel_GetConfig_UpdatesProfileClaudeOverride(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.SetProfile("work")
+	panel.claudeConfigDir = "~/.claude-work-updated"
+	panel.claudeConfigIsScope = true
+	panel.originalConfig = &session.UserConfig{
+		Claude: session.ClaudeSettings{
+			ConfigDir: "~/.claude-global",
+		},
+		Profiles: map[string]session.ProfileSettings{
+			"work": {
+				Claude: session.ProfileClaudeSettings{
+					ConfigDir: "~/.claude-work",
+				},
+			},
+		},
+	}
+
+	config := panel.GetConfig()
+	if config.Claude.ConfigDir != "~/.claude-global" {
+		t.Errorf("global Claude.ConfigDir changed unexpectedly: got %q, want %q", config.Claude.ConfigDir, "~/.claude-global")
+	}
+	if got := config.Profiles["work"].Claude.ConfigDir; got != "~/.claude-work-updated" {
+		t.Errorf("profile override config dir: got %q, want %q", got, "~/.claude-work-updated")
+	}
+}
+
+func TestSettingsPanel_GetConfig_ToolMapping(t *testing.T) {
+	panel := NewSettingsPanel()
+
+	tests := []struct {
+		name     string
+		value    string
+		expected string
+	}{
+		{"claude", "claude", "claude"},
+		{"gemini", "gemini", "gemini"},
+		{"opencode", "opencode", "opencode"},
+		{"codex", "codex", "codex"},
+		{"pi", "pi", "pi"},
+		{"copilot", "copilot", "copilot"},
+		{"crush", "crush", "crush"},
+		{"muse", "muse", "muse"},
+		{"cursor", "cursor", "cursor"},
+		{"hermes", "hermes", "hermes"},
+		{"none", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			panel.selectedTool = toolValueIndex(t, panel, tt.value)
+			config := panel.GetConfig()
+			if config.DefaultTool != tt.expected {
+				t.Errorf("GetConfig for tool %q: DefaultTool = %q, want %q",
+					tt.value, config.DefaultTool, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSettingsPanel_GetConfig_CustomToolMapping(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.LoadConfig(&session.UserConfig{
+		Tools: map[string]session.ToolDef{
+			"openclaw": {},
+		},
+	})
+
+	panel.selectedTool = toolValueIndex(t, panel, "openclaw")
+	config := panel.GetConfig()
+	if config.DefaultTool != "openclaw" {
+		t.Fatalf("DefaultTool: got %q, want %q", config.DefaultTool, "openclaw")
+	}
+}
+
+func TestSettingsPanel_GetConfig_TierMapping(t *testing.T) {
+	panel := NewSettingsPanel()
+
+	tests := []struct {
+		name     string
+		index    int
+		expected string
+	}{
+		{"auto", 0, "auto"},
+		{"instant", 1, "instant"},
+		{"balanced", 2, "balanced"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			panel.searchTier = tt.index
+			config := panel.GetConfig()
+			if config.GlobalSearch.Tier != tt.expected {
+				t.Errorf("GetConfig for tier index %d: Tier = %q, want %q",
+					tt.index, config.GlobalSearch.Tier, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSettingsPanel_SetSize(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.SetSize(120, 60)
+
+	if panel.width != 120 {
+		t.Errorf("Width = %d, want 120", panel.width)
+	}
+	if panel.height != 60 {
+		t.Errorf("Height = %d, want 60", panel.height)
+	}
+}
+
+func TestSettingsPanel_Update_Navigation(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.Show()
+
+	// Initial cursor should be at 0
+	if panel.cursor != 0 {
+		t.Errorf("Initial cursor = %d, want 0", panel.cursor)
+	}
+
+	// Move down
+	panel.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if panel.cursor != 1 {
+		t.Errorf("After down: cursor = %d, want 1", panel.cursor)
+	}
+
+	// Move down with 'j'
+	panel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	if panel.cursor != 2 {
+		t.Errorf("After j: cursor = %d, want 2", panel.cursor)
+	}
+
+	// Move up
+	panel.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if panel.cursor != 1 {
+		t.Errorf("After up: cursor = %d, want 1", panel.cursor)
+	}
+
+	// Move up with 'k'
+	panel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	if panel.cursor != 0 {
+		t.Errorf("After k: cursor = %d, want 0", panel.cursor)
+	}
+
+	// Should not go below 0
+	panel.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if panel.cursor != 0 {
+		t.Errorf("After up at 0: cursor = %d, want 0", panel.cursor)
+	}
+}
+
+func TestSettingsPanel_Update_ToggleCheckbox(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.Show()
+
+	// Navigate to dangerous_mode (index 2, after Theme and DefaultTool)
+	panel.cursor = int(SettingDangerousMode)
+	initialValue := panel.dangerousMode
+
+	// Toggle with space
+	_, _, changed := panel.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if panel.dangerousMode == initialValue {
+		t.Error("dangerousMode should have toggled")
+	}
+	if !changed {
+		t.Error("Update should return changed=true when value changes")
+	}
+
+	// Toggle back
+	panel.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if panel.dangerousMode != initialValue {
+		t.Error("dangerousMode should have toggled back")
+	}
+}
+
+func TestSettingsPanel_Update_RadioSelection(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.Show()
+
+	// Navigate to DEFAULT TOOL (index 1, after Theme)
+	panel.cursor = int(SettingDefaultTool)
+	panel.selectedTool = 0 // claude
+
+	// Move right
+	panel.Update(tea.KeyMsg{Type: tea.KeyRight})
+	if panel.selectedTool != 1 {
+		t.Errorf("After right: selectedTool = %d, want 1", panel.selectedTool)
+	}
+
+	// Move right with 'l'
+	panel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	if panel.selectedTool != 2 {
+		t.Errorf("After l: selectedTool = %d, want 2", panel.selectedTool)
+	}
+
+	// Move left
+	panel.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	if panel.selectedTool != 1 {
+		t.Errorf("After left: selectedTool = %d, want 1", panel.selectedTool)
+	}
+
+	// Move left with 'h'
+	panel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	if panel.selectedTool != 0 {
+		t.Errorf("After h: selectedTool = %d, want 0", panel.selectedTool)
+	}
+
+	// Should not go below 0
+	panel.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	if panel.selectedTool != 0 {
+		t.Errorf("After left at 0: selectedTool = %d, want 0", panel.selectedTool)
+	}
+}
+
+func TestSettingsPanel_Update_NumberAdjustment(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.Show()
+
+	// Navigate to logMaxSizeMB (index 6, after Theme)
+	panel.cursor = int(SettingLogMaxSize)
+	panel.logMaxSizeMB = 10
+
+	// Increase with right
+	panel.Update(tea.KeyMsg{Type: tea.KeyRight})
+	if panel.logMaxSizeMB != 11 {
+		t.Errorf("After right: logMaxSizeMB = %d, want 11", panel.logMaxSizeMB)
+	}
+
+	// Decrease with left
+	panel.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	if panel.logMaxSizeMB != 10 {
+		t.Errorf("After left: logMaxSizeMB = %d, want 10", panel.logMaxSizeMB)
+	}
+
+	// Should not go below 1
+	panel.logMaxSizeMB = 1
+	panel.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	if panel.logMaxSizeMB != 1 {
+		t.Errorf("After left at 1: logMaxSizeMB = %d, want 1", panel.logMaxSizeMB)
+	}
+}
+
+func TestSettingsPanel_Update_Escape(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.Show()
+
+	if !panel.IsVisible() {
+		t.Error("Panel should be visible after Show()")
+	}
+
+	panel.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	if panel.IsVisible() {
+		t.Error("Panel should be hidden after Escape")
+	}
+}
+
+func TestSettingsPanel_Update_SKey(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.Show()
+
+	if !panel.IsVisible() {
+		t.Error("Panel should be visible after Show()")
+	}
+
+	panel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'S'}})
+
+	if panel.IsVisible() {
+		t.Error("Panel should be hidden after pressing S")
+	}
+}
+
+func TestSettingsPanel_NeedsRestart(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.Show()
+
+	// Initially should not need restart
+	if panel.NeedsRestart() {
+		t.Error("Should not need restart initially")
+	}
+
+	// Navigate to global search settings and change
+	panel.cursor = int(SettingGlobalSearchEnabled)
+	panel.Update(tea.KeyMsg{Type: tea.KeySpace})
+
+	if !panel.NeedsRestart() {
+		t.Error("Should need restart after changing global search setting")
+	}
+}
+
+func TestSettingsPanel_View_NotVisible(t *testing.T) {
+	panel := NewSettingsPanel()
+
+	view := panel.View()
+	if view != "" {
+		t.Errorf("View() should return empty string when not visible, got %q", view)
+	}
+}
+
+func TestSettingsPanel_View_Visible(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.SetSize(100, 80)
+	panel.Show()
+	panel.cursor = int(SettingMaintenanceEnabled)
+
+	view := panel.View()
+	if view == "" {
+		t.Error("View() should return non-empty string when visible")
+	}
+
+	// Check that it contains expected elements
+	expectedElements := []string{
+		"Settings",
+		"THEME",
+		"Dark",
+		"Light",
+		"DEFAULT TOOL",
+		"Claude",
+		"Gemini",
+		"CLAUDE",
+		"Dangerous mode",
+		"UPDATES",
+		"LOGS",
+		"GLOBAL SEARCH",
+	}
+
+	for _, elem := range expectedElements {
+		if !containsString(view, elem) {
+			t.Errorf("View() should contain %q", elem)
+		}
+	}
+}
+
+func TestSettingsPanel_View_HighlightsCursor(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.SetSize(80, 50) // Increased height for new settings
+	panel.Show()
+
+	// Just verify no crash with various cursor positions
+	for i := 0; i < settingsCount; i++ {
+		panel.cursor = i
+		view := panel.View()
+		if view == "" {
+			t.Errorf("View() should return non-empty for cursor position %d", i)
+		}
+	}
+}
+
+// Helper function to check if a string contains a substring
+func containsString(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsSubstring(s, substr))
+}
+
+func containsSubstring(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSettingsPanel_ThemeToggle(t *testing.T) {
+	panel := NewSettingsPanel()
+	// Set dark explicitly (avoid loading config from disk)
+	panel.selectedTheme = 0
+	panel.visible = true
+
+	// Navigate right to select light
+	panel.cursor = int(SettingTheme)
+	panel, _, shouldSave := panel.Update(tea.KeyMsg{Type: tea.KeyRight})
+
+	if panel.selectedTheme != 1 {
+		t.Errorf("Theme should be 1 (light) after right, got %d", panel.selectedTheme)
+	}
+	if !shouldSave {
+		t.Error("Should trigger save on theme change")
+	}
+
+	// Navigate right to select system
+	panel, _, shouldSave = panel.Update(tea.KeyMsg{Type: tea.KeyRight})
+	if panel.selectedTheme != 2 {
+		t.Errorf("Theme should be 2 (system) after right, got %d", panel.selectedTheme)
+	}
+	if !shouldSave {
+		t.Error("Should trigger save on theme change to system")
+	}
+
+	// Theme changes should not require restart (applied live)
+	if panel.needsRestart {
+		t.Error("Theme change should not require restart")
+	}
+}
+
+// The embedded layout is bound to the terminal protocol main negotiated at
+// startup, so saving the checkbox stores the value for the next launch and
+// says so, instead of switching a dashboard that has no PTY router into a
+// layout it cannot honor.
+func TestSavedEmbeddedTerminalSettingWaitsForRestart(t *testing.T) {
+	home := NewHome()
+	home.embeddedLayout = false
+	home.sidebarDensity = session.DefaultSidebarDensity
+
+	enabled := true
+	home.applySavedLayoutSettings(session.UISettings{EmbeddedTerminal: &enabled, SidebarDensity: session.SidebarDensityFull})
+	if home.embeddedLayout {
+		t.Fatal("embedded layout switched on live without the startup router")
+	}
+	if home.err == nil || !strings.Contains(home.err.Error(), "restart") {
+		t.Fatalf("user was not told the layout applies at the next launch: %v", home.err)
+	}
+	if home.sidebarDensity != session.SidebarDensityFull {
+		t.Fatalf("sidebar density = %q, want live update to full", home.sidebarDensity)
+	}
+
+	// Saving the value the process already runs with is not a restart event.
+	home.clearError()
+	disabled := false
+	home.applySavedLayoutSettings(session.UISettings{EmbeddedTerminal: &disabled})
+	if home.err != nil {
+		t.Fatalf("unchanged layout raised a notice: %v", home.err)
+	}
+}
+
+func TestSettingsPanelEmbeddedTerminalDefaultsOffAndCanBeEnabled(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.LoadConfig(&session.UserConfig{})
+	if panel.embeddedLayout {
+		t.Fatal("settings panel should preserve the classic layout by default")
+	}
+
+	panel.visible = true
+	panel.cursor = int(SettingEmbeddedTerminal)
+	_, _, changed := panel.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if !changed || !panel.embeddedLayout {
+		t.Fatal("embedded terminal checkbox did not toggle on")
+	}
+
+	cfg := panel.GetConfig()
+	if cfg.UI.EmbeddedTerminal == nil || !*cfg.UI.EmbeddedTerminal {
+		t.Fatal("settings panel did not persist explicit embedded_terminal=true")
+	}
+	if view := panel.View(); !containsString(view, "Embedded terminal") {
+		t.Fatal("settings panel does not render the embedded terminal checkbox")
+	}
+}
+
+func TestSettingsPanel_LoadConfig_Theme(t *testing.T) {
+	tests := []struct {
+		name     string
+		theme    string
+		expected int
+	}{
+		{"dark", "dark", 0},
+		{"light", "light", 1},
+		{"system", "system", 2},
+		{"empty defaults to dark", "", 0},
+		{"invalid defaults to dark", "invalid", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			panel := NewSettingsPanel()
+			config := &session.UserConfig{Theme: tt.theme}
+			panel.LoadConfig(config)
+
+			if panel.selectedTheme != tt.expected {
+				t.Errorf("selectedTheme: got %d, want %d", panel.selectedTheme, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSettingsPanel_GetConfig_Theme(t *testing.T) {
+	tests := []struct {
+		name          string
+		selectedTheme int
+		expected      string
+	}{
+		{"dark", 0, "dark"},
+		{"light", 1, "light"},
+		{"system", 2, "system"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			panel := NewSettingsPanel()
+			panel.selectedTheme = tt.selectedTheme
+			config := panel.GetConfig()
+
+			if config.Theme != tt.expected {
+				t.Errorf("Theme: got %q, want %q", config.Theme, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSettingsPanelPreviewSettings(t *testing.T) {
+	sp := NewSettingsPanel()
+
+	// Find Show Output setting
+	foundOutput := false
+	foundAnalytics := false
+	for i := 0; i < settingsCount; i++ {
+		sp.cursor = i
+		setting := SettingType(i)
+		switch setting {
+		case SettingShowOutput:
+			foundOutput = true
+		case SettingShowAnalytics:
+			foundAnalytics = true
+		}
+	}
+
+	if !foundOutput {
+		t.Error("Show Output setting should exist (SettingShowOutput constant)")
+	}
+	if !foundAnalytics {
+		t.Error("Show Analytics setting should exist (SettingShowAnalytics constant)")
+	}
+}
+
+func TestSettingsPanel_PreviewSettings_Toggle(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.Show()
+
+	// Test Show Output toggle
+	panel.cursor = int(SettingShowOutput)
+	initialOutput := panel.showOutput
+
+	_, _, changed := panel.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if !changed {
+		t.Error("Show Output toggle should report changed=true")
+	}
+	if panel.showOutput == initialOutput {
+		t.Error("Show Output should have toggled")
+	}
+
+	// Test Show Analytics toggle
+	panel.cursor = int(SettingShowAnalytics)
+	initialAnalytics := panel.showAnalytics
+
+	_, _, changed = panel.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if !changed {
+		t.Error("Show Analytics toggle should report changed=true")
+	}
+	if panel.showAnalytics == initialAnalytics {
+		t.Error("Show Analytics should have toggled")
+	}
+}
+
+func TestSettingsPanel_PreviewSettings_LoadConfig(t *testing.T) {
+	panel := NewSettingsPanel()
+
+	// Test loading with explicit values
+	showOutputTrue := true
+	showAnalyticsFalse := false
+	config := &session.UserConfig{
+		Preview: session.PreviewSettings{
+			ShowOutput:    &showOutputTrue,
+			ShowAnalytics: &showAnalyticsFalse,
+		},
+	}
+	panel.LoadConfig(config)
+
+	if !panel.showOutput {
+		t.Error("showOutput should be true after loading config")
+	}
+	if panel.showAnalytics {
+		t.Error("showAnalytics should be false after loading config")
+	}
+
+	// Test loading with nil ShowAnalytics (should default to false)
+	showOutputFalse := false
+	config2 := &session.UserConfig{
+		Preview: session.PreviewSettings{
+			ShowOutput:    &showOutputFalse,
+			ShowAnalytics: nil,
+		},
+	}
+	panel.LoadConfig(config2)
+
+	if panel.showOutput {
+		t.Error("showOutput should be false after loading config2")
+	}
+	if panel.showAnalytics {
+		t.Error("showAnalytics should default to false when nil")
+	}
+}
+
+func TestSettingsPanel_PreviewSettings_GetConfig(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.showOutput = true
+	panel.showAnalytics = false
+
+	config := panel.GetConfig()
+
+	if config.Preview.ShowOutput == nil || !*config.Preview.ShowOutput {
+		t.Error("Preview.ShowOutput should be true")
+	}
+	if config.Preview.ShowAnalytics == nil {
+		t.Error("Preview.ShowAnalytics should not be nil")
+	} else if *config.Preview.ShowAnalytics {
+		t.Error("Preview.ShowAnalytics should be false")
+	}
+}
+
+func TestSettingsPanel_PreviewSettings_GetConfigPreservesHiddenFields(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.showOutput = false
+	panel.showAnalytics = true
+
+	showNotes := false
+	showTools := false
+	original := &session.UserConfig{
+		Preview: session.PreviewSettings{
+			ShowNotes:        &showNotes,
+			NotesOutputSplit: 0.42,
+			Analytics: session.AnalyticsDisplaySettings{
+				ShowTools: &showTools,
+			},
+		},
+	}
+	panel.LoadConfig(original)
+	panel.originalConfig = original
+
+	config := panel.GetConfig()
+
+	// ShowNotes is now editable; LoadConfig sets it from original
+	if config.Preview.ShowNotes == nil || *config.Preview.ShowNotes {
+		t.Fatal("Preview.ShowNotes should be false after loading config with false")
+	}
+	// NotesOutputSplit is now editable; LoadConfig converts 0.42 -> 42% -> int(42)
+	// GetConfig converts back: 42 / 100.0 = 0.42
+	if config.Preview.NotesOutputSplit != 0.42 {
+		t.Fatalf("Preview.NotesOutputSplit = %v, want 0.42", config.Preview.NotesOutputSplit)
+	}
+	if config.Preview.Analytics.ShowTools == nil || *config.Preview.Analytics.ShowTools {
+		t.Fatal("Preview.Analytics should preserve original hidden settings")
+	}
+}
+
+func TestSettingsPanel_Worktree_GetConfigPreservesHiddenFields(t *testing.T) {
+	panel := NewSettingsPanel()
+
+	branchPrefix := "dev/"
+	pathTemplate := "~/worktrees/{repo-name}/{branch}"
+	autoCleanupTrue := true
+	original := &session.UserConfig{
+		Worktree: session.WorktreeSettings{
+			AutoCleanup:     &autoCleanupTrue,
+			DefaultEnabled:  true,
+			DefaultLocation: "sibling",
+			PathTemplate:    &pathTemplate,
+			BranchPrefix:    &branchPrefix,
+		},
+	}
+	panel.LoadConfig(original)
+	panel.originalConfig = original
+
+	config := panel.GetConfig()
+
+	if config.Worktree.AutoCleanup == nil || !*config.Worktree.AutoCleanup {
+		t.Fatal("Worktree.AutoCleanup should be preserved")
+	}
+	if !config.Worktree.DefaultEnabled {
+		t.Fatal("Worktree.DefaultEnabled should be preserved")
+	}
+	if config.Worktree.DefaultLocation != "sibling" {
+		t.Fatalf("Worktree.DefaultLocation = %q, want %q", config.Worktree.DefaultLocation, "sibling")
+	}
+	if config.Worktree.PathTemplate == nil || *config.Worktree.PathTemplate != pathTemplate {
+		t.Fatalf("Worktree.PathTemplate should be preserved, got %v", config.Worktree.PathTemplate)
+	}
+	if config.Worktree.BranchPrefix == nil || *config.Worktree.BranchPrefix != branchPrefix {
+		t.Fatalf("Worktree.BranchPrefix should be preserved, got %v", config.Worktree.BranchPrefix)
+	}
+}
+
+func TestSettingsPanel_Fork_GetConfigPreservesHiddenFields(t *testing.T) {
+	panel := NewSettingsPanel()
+
+	worktree := false
+	withState := false
+	withIgnored := false
+	dockerMode := "off"
+	original := &session.UserConfig{
+		Fork: session.ForkSettings{
+			InheritFromParent: true,
+			Worktree:          &worktree,
+			WithState:         &withState,
+			WithIgnored:       &withIgnored,
+			Docker:            &dockerMode,
+			BranchPrefix:      "wip/",
+		},
+	}
+	panel.LoadConfig(original)
+	panel.originalConfig = original
+
+	config := panel.GetConfig()
+
+	if !config.Fork.InheritFromParent {
+		t.Fatal("Fork.InheritFromParent should be preserved")
+	}
+	if config.Fork.Worktree == nil || *config.Fork.Worktree {
+		t.Fatalf("Fork.Worktree should preserve explicit false, got %v", config.Fork.Worktree)
+	}
+	if config.Fork.WithState == nil || *config.Fork.WithState {
+		t.Fatalf("Fork.WithState should preserve explicit false, got %v", config.Fork.WithState)
+	}
+	if config.Fork.WithIgnored == nil || *config.Fork.WithIgnored {
+		t.Fatalf("Fork.WithIgnored should preserve explicit false, got %v", config.Fork.WithIgnored)
+	}
+	if config.Fork.Docker == nil || *config.Fork.Docker != "off" {
+		t.Fatalf("Fork.Docker should preserve off, got %v", config.Fork.Docker)
+	}
+	if config.Fork.BranchPrefix != "wip/" {
+		t.Fatalf("Fork.BranchPrefix = %q, want %q", config.Fork.BranchPrefix, "wip/")
+	}
+}
+
+// TestSettingsPanel_Tmux_GetConfigPreservesHiddenFields guards #710.
+// The Settings TUI does not expose [tmux] fields, so GetConfig() must copy
+// them through from originalConfig — same as MCPs/Tools/Worktree. Before the
+// fix, saving from the TUI silently dropped the entire [tmux] table, which
+// also explained the original #687 inject_status_line report we couldn't
+// reproduce by editing config.toml directly.
+func TestSettingsPanel_Tmux_GetConfigPreservesHiddenFields(t *testing.T) {
+	panel := NewSettingsPanel()
+
+	injectFalse := false
+	launchScopeTrue := true
+	original := &session.UserConfig{
+		Tmux: session.TmuxSettings{
+			InjectStatusLine:  &injectFalse,
+			LaunchInUserScope: &launchScopeTrue,
+			DetachKey:         "C-q",
+		},
+	}
+	panel.LoadConfig(original)
+	panel.originalConfig = original
+
+	config := panel.GetConfig()
+
+	if config.Tmux.InjectStatusLine == nil || *config.Tmux.InjectStatusLine != false {
+		t.Fatalf("Tmux.InjectStatusLine should be preserved as false, got %v", config.Tmux.InjectStatusLine)
+	}
+	if config.Tmux.LaunchInUserScope == nil || *config.Tmux.LaunchInUserScope != true {
+		t.Fatalf("Tmux.LaunchInUserScope should be preserved as true, got %v", config.Tmux.LaunchInUserScope)
+	}
+	if config.Tmux.DetachKey != "C-q" {
+		t.Fatalf("Tmux.DetachKey = %q, want %q", config.Tmux.DetachKey, "C-q")
+	}
+}
+
+func TestSettingsPanel_PreviewSettings_ViewContains(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.SetSize(80, 50)
+	panel.Show()
+	// matrix/hardened: focus the preview section below the new local-search row.
+	panel.cursor = int(SettingShowOutput)
+
+	view := panel.View()
+
+	expectedElements := []string{
+		"PREVIEW",
+		"Show Output",
+		"Show Analytics",
+	}
+
+	for _, elem := range expectedElements {
+		if !containsString(view, elem) {
+			t.Errorf("View() should contain %q", elem)
+		}
+	}
+}
+
+func TestSettingsPanel_ViewUsesConfiguredMCPHotkeyHint(t *testing.T) {
+	setSettingsPanelHotkeyConfigForTest(t, "[hotkeys]\nmcp_manager = \"ctrl+m\"\n")
+
+	panel := NewSettingsPanel()
+	// Tall viewport so the MCP hint (below many settings rows) is not clipped by scroll windowing.
+	panel.SetSize(120, 200)
+	panel.Show()
+	panel.cursor = int(SettingStatsShowLoad)
+
+	view := panel.View()
+	// Hint may wrap across dialog lines; assert on stable fragments rather than one contiguous string.
+	if !containsString(view, "Press ctrl+m on any Claude, Gemini, or Cursor session") ||
+		!containsString(view, "attach MCPs") {
+		t.Fatalf("settings view should show configured MCP key hint, got %q", view)
+	}
+}
+
+func TestSettingsPanel_ViewShowsUnboundMCPHotkeyHint(t *testing.T) {
+	setSettingsPanelHotkeyConfigForTest(t, "[hotkeys]\nmcp_manager = \"\"\n")
+
+	panel := NewSettingsPanel()
+	// matrix/hardened: allow the whole panel, including the local-search section,
+	// to fit so this assertion checks the trailing MCP hint without scrolling.
+	panel.SetSize(120, 200)
+	panel.Show()
+	panel.cursor = int(SettingMaintenanceEnabled)
+
+	view := panel.View()
+	if !containsString(view, "MCP Manager hotkey is unbound.") {
+		t.Fatalf("settings view should show unbound MCP key hint, got %q", view)
+	}
+}
+
+// TestSettingsPanel_AutoInstallRestartToggles pins the two auto-update
+// rows: they default on, load from config, toggle with Space and render
+// under UPDATES.
+func TestSettingsPanel_AutoInstallRestartToggles(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	session.ClearUserConfigCache()
+	t.Cleanup(session.ClearUserConfigCache)
+
+	panel := NewSettingsPanel()
+	// matrix/hardened: auto_install defaults off; auto_restart stays on.
+	if panel.autoInstall || !panel.autoRestart {
+		t.Fatal("matrix/hardened: auto-install must default off, auto-restart on")
+	}
+	panel.cursor = int(SettingAutoInstall)
+	if !panel.toggleValue() || !panel.autoInstall {
+		t.Fatal("Space on the auto-install row must turn it on")
+	}
+	panel.cursor = int(SettingAutoRestart)
+	if !panel.toggleValue() || panel.autoRestart {
+		t.Fatal("Space on the auto-restart row must turn it off")
+	}
+	panel.SetSize(100, 80)
+	panel.Show()
+	view := panel.View()
+	for _, want := range []string{"Install updates automatically", "Restart automatically after update", "Offer to install on startup"} {
+		if !containsString(view, want) {
+			t.Errorf("settings view missing %q", want)
+		}
+	}
+}
+
+// RemoteSession: sidebar_density is a layout setting that sizes every row
+// type through sidebarItemRenderHeightDensity; remote rows are measured at
+// min(2, density) and covered by TestEmbeddedRemoteRowMinimalDensityIsOneLineWithoutTool
+// and TestSyncViewportHoldsStillWithRemoteRowsInEmbeddedLayout.
+func TestSettingsPanelSidebarDensityRoundTrips(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.LoadConfig(&session.UserConfig{})
+	if got := sidebarDensityValues[panel.sidebarDensity]; got != session.DefaultSidebarDensity {
+		t.Fatalf("settings panel default sidebar density = %q, want %q", got, session.DefaultSidebarDensity)
+	}
+
+	panel.LoadConfig(&session.UserConfig{UI: session.UISettings{SidebarDensity: "minimal"}})
+	if got := sidebarDensityValues[panel.sidebarDensity]; got != session.SidebarDensityMinimal {
+		t.Fatalf("settings panel did not load sidebar_density=minimal, got %q", got)
+	}
+
+	panel.visible = true
+	panel.cursor = int(SettingSidebarDensity)
+	_, _, changed := panel.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if !changed {
+		t.Fatal("space did not cycle the sidebar density radio group")
+	}
+	cfg := panel.GetConfig()
+	if cfg.UI.SidebarDensity != sidebarDensityValues[panel.sidebarDensity] {
+		t.Fatalf("settings panel persisted sidebar_density=%q, want %q", cfg.UI.SidebarDensity, sidebarDensityValues[panel.sidebarDensity])
+	}
+	if view := panel.View(); !containsString(view, "Sidebar density") {
+		t.Fatal("settings panel does not render the sidebar density radio group")
+	}
+}

@@ -1,0 +1,50 @@
+  xxx xxxx, xxxx xxxxxx:
+
+  - xxxxxx. xxx xxxxx xxxxx xx xxx xx xxxxx xxxx xxx xxxxxxx xxxxxx xx. xxxxxx xxx xxxxx xxxxxxxxxxx xxxx xxx xxxx. xx xxxxx xxx xxxxxxx xxxxxxxxxxx xxxx.
+  - xxxxxx. xxxx xxx xxx xxx, xxx xxxxx xxx xxxxxxxxxx, xxxx xxx xxxxxxxx xxxx. xxxxxxx xxx xxxxxxxx xxxxx xxxxx.
+
+  xx xx xxx xxxxxx xx xxx xxxx. xx xxxxxxx xx xxx xxxxxxxxxxx xxxxxx xx xxxxxxx, xx xxx xxxx xxxx xxxxx.
+
+  xxxx xx xxxxx xxxxxxx, xxxxxxxx xxxx
+
+  ┌───────────────────────────────────────────────────────┬─────────────────────────────────────────────────┬────────┐
+  │                         Xxxx                          │                       Xxx                       │  Xxxx  │
+  ├───────────────────────────────────────────────────────┼─────────────────────────────────────────────────┼────────┤
+  │ Xxx xxx xxxxx for xxx xxxxxxxxxxx                     │ Xxx, xxx xxxxxxx xx xx                          │ 0 xxx  │
+  ├───────────────────────────────────────────────────────┼─────────────────────────────────────────────────┼────────┤
+  │ Xxxxxxxx xxxxxxxxxxxx, xxxx 00                        │ Xxx xxxxxxx xxxxxxx xx xxx xxxxx, xxxxxx, xxxx  │ 0 xxx  │
+  ├───────────────────────────────────────────────────────┼─────────────────────────────────────────────────┼────────┤
+  │ Xxxxxxxx xxxxx, xxxx 00                               │ Xxx xxxxxxxx xxxxxxx xx xxx xxxxx, xxxxxx, xxxx │ 0 xxx  │
+  ├───────────────────────────────────────────────────────┼─────────────────────────────────────────────────┼────────┤
+  │ Xxxxxxxx Xxxx xx Xxxxxx 0000                          │ Xxxxxxx xxxxxx, xxxxxxxx xxxxxx                 │ 0 xxx  │
+  ├───────────────────────────────────────────────────────┼─────────────────────────────────────────────────┼────────┤
+  │ XXXXXX xxxxxxx xxxxxxxxxx                             │ Xxxx xxxxx                                      │ 0 xxx  │
+  ├───────────────────────────────────────────────────────┼─────────────────────────────────────────────────┼────────┤
+  │ Xxxxxxxxx xxxxx                                       │ xx                                              │ 00 xxx │
+  ├───────────────────────────────────────────────────────┼─────────────────────────────────────────────────┼────────┤
+  │ Xxxxx xxxxxxxx xx xxx xxxxxxxxxxxxxx xxxx xxxxxxxxxxx │ Search xx xxxx                                  │ ?      │
+  ├───────────────────────────────────────────────────────┼─────────────────────────────────────────────────┼────────┤
+  │ Xxxxx xxxxxxxxxxx xxxxxxxxxxx                         │ Xxxxx, Xxxxxxx xxxx                             │ xxxx   │
+  └───────────────────────────────────────────────────────┴─────────────────────────────────────────────────┴────────┘
+
+  xxxxxxxxxx xxxx xx xxxxxx xx xxx xxxx xx xxxxxxx xx xxxx xxxxxx. xxxxx'x xxxxx xxxxx xx xxxxxxx xxxx xxx xxxxxx xxxx xxxx, xxx xxxxxxx, xxx xxxxxxx, xxx xx xxxxxx, xx x xxxxxxx xxxxxx
+  xxxx xx xxxxx.
+
+  xxx xxx xxxxx xxx xxx xxxx xxxxx. xxx xxxxxxx xxxx xxx xxx x xxxxxx xxx xxxxxxxxxxx.
+
+✻ Baked for 1m 34s · done 0:00 XX
+
+❯ xxxxx xx xx xx x xx xxx xx xxxx xxxx xxxx xxxx  xxxxxxx xxxxxxxxx?
+
+⏺ xxxxxxx xxxxxxxx xxxxxxxx: "xxxxxx xxxxxxxxxxxxxxxx" (xxxxxxxxxx xxxx)
+  ⎿  You've hit your weekly limit · resets Xxx 00 xx 00xx (Xxxxxx/Xxxxxx)
+     /xxxxx-xxxxxxx xx xxxxxx xxxx xxx’xx xxxxxxx xx.
+
+✻ Worked for 1s · done 0:00 XX
+                                                                                                                                                  new task? /clear to save 000.0k tokens
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── Xxxxxxx Xxxxxxxxxxx ─
+❯ 
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [xxxxxxxx] x@xxxx:/Xxxxx/x | [Fable 5.1] ctx:00% in:000.0k out:000 5h:0% 7d:000%
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+  ⧉  xxx-00-xxxx

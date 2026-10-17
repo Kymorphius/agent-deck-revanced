@@ -1,0 +1,118 @@
+# file	tool	expected	note   (expected = tmux-layer verdict for one frame: active | waiting | error)
+claude-frame-003	claude	waiting	idle prompt after completed turn
+claude-frame-004	claude	waiting	idle prompt with unsent draft
+claude-frame-005	claude	waiting	fresh session, Remote Control disconnected notice, idle prompt
+claude-frame-006	claude	waiting	idle prompt
+claude-frame-007	claude	waiting	idle prompt
+claude-frame-008	claude	waiting	fresh session idle prompt
+claude-frame-009	claude	waiting	MCP server trust menu
+claude-frame-010	claude	active	spinner Undulating… (8s)
+claude-frame-011	claude	waiting	idle prompt with unsent draft
+claude-frame-012	claude	active	spinner · Calculating… (2m 5s)
+claude-frame-013	claude	active	spinner ✳ Architecting… (4m 2s)
+claude-frame-014	claude	waiting	idle prompt with unsent draft
+claude-frame-015	claude	waiting	idle prompt
+claude-frame-016	claude	waiting	AskUserQuestion menu
+claude-frame-017	claude	waiting	folder trust prompt
+claude-frame-018	claude	waiting	folder trust prompt
+claude-frame-002	claude	waiting	weekly usage limit banner then idle prompt
+claude-frame-019	claude	waiting	idle prompt with unsent draft
+claude-frame-020	claude	waiting	session feedback prompt (1: Bad 2: Fine)
+claude-frame-022	claude	waiting	idle prompt with unsent draft
+claude-frame-023	claude	waiting	AskUserQuestion menu
+claude-frame-024	claude	waiting	idle prompt with unsent draft
+claude-frame-025	claude	waiting	idle prompt with unsent draft
+claude-frame-026	claude	waiting	idle prompt
+claude-frame-027	claude	waiting	Fable limit notice then idle prompt
+claude-frame-028	claude	waiting	Remote Control disconnected notices, idle prompt
+claude-frame-029	claude	active	turn done, 1 shell still running, unsent draft (false green in deck); relabelled active by #2473: live shell/monitor counter in the footer is work in flight
+claude-frame-030	claude	waiting	idle prompt with unsent draft
+claude-frame-031	claude	waiting	idle prompt
+claude-frame-032	claude	waiting	idle prompt
+claude-frame-033	claude	waiting	idle prompt
+claude-frame-034	claude	active	spinner with 3 sub-agent rows below the footer
+claude-frame-035	claude	waiting	org-disabled notice then idle prompt
+claude-frame-036	claude	waiting	idle prompt
+claude-frame-037	claude	waiting	idle prompt
+claude-frame-038	claude	waiting	idle prompt
+claude-frame-039	claude	waiting	weekly limit notice then idle prompt
+claude-frame-040	claude	waiting	folder trust prompt
+claude-frame-041	claude	waiting	idle prompt
+claude-frame-042	claude	waiting	idle prompt with unsent draft
+claude-frame-043	claude	active	spinner ✢ Deliberating… (7m 14s)
+claude-frame-044	claude	active	spinner ✳ Pondering… (5m 11s), 1 shell in footer
+claude-frame-045	claude	waiting	fresh session idle prompt
+claude-frame-046	claude	waiting	idle prompt with unsent draft
+claude-frame-047	claude	active	turn done, 1 monitor still running, unsent draft; relabelled active by #2473: live shell/monitor counter in the footer is work in flight
+claude-frame-048	claude	waiting	idle prompt
+claude-frame-001	claude	active	spinner with 18 sub-agent rows below the footer (derived from the 3-row frame)
+claude-frame-050	claude	active	turn done, 1 shell still running, unsent draft (shown green on controller); relabelled active by #2473: live shell/monitor counter in the footer is work in flight
+claude-frame-051	claude	active	turn done, 1 shell still running (shown green on controller); relabelled active by #2473: live shell/monitor counter in the footer is work in flight
+claude-frame-052	claude	waiting	turn done, unsent draft
+claude-frame-049	claude	waiting	interactive menu
+claude-frame-053	claude	active	DONE sentinel printed, 2 shells still running (shown green on controller); relabelled active by #2473: live shell/monitor counter in the footer is work in flight
+claude-frame-054	claude	active	DONE sentinel printed, 1 shell still running (shown green on controller); relabelled active by #2473: live shell/monitor counter in the footer is work in flight
+claude-frame-055	claude	active	DONE sentinel printed, 1 shell still running (shown green on controller); relabelled active by #2473: live shell/monitor counter in the footer is work in flight
+claude-frame-056	claude	active	DONE sentinel printed, 2 shells still running, unsent draft (shown green on controller); relabelled active by #2473: live shell/monitor counter in the footer is work in flight
+claude-frame-057	claude	active	turn done, 1 shell still running (shown green on controller); relabelled active by #2473: live shell/monitor counter in the footer is work in flight
+claude-frame-058	claude	waiting	interactive menu
+codex-frame-021	codex	waiting	idle composer, weekly-limit warnings above
+codex-frame-022	codex	waiting	idle composer
+codex-frame-023	codex	waiting	idle composer after Worked for 2m 07s
+codex-frame-024	codex	waiting	idle composer
+codex-frame-025	codex	active	• Working (9m 41s • esc to interrupt) above composer and footer
+codex-frame-026	codex	waiting	idle composer, Model changed notice
+codex-frame-027	codex	active	• Working (2m 59s • esc to interrupt) above composer and footer
+codex-frame-031	codex	waiting	idle composer
+codex-frame-032	codex	error	■ usage limit banner, idle composer
+codex-frame-033	codex	waiting	idle composer
+codex-frame-034	codex	waiting	idle composer
+codex-frame-036	codex	error	■ usage limit banner, idle composer
+codex-frame-035	codex	active	• Waiting for background terminal (13m 23s • esc to interrupt) with └ command line below
+codex-frame-037	codex	active	• Working (…) · 1 background terminal running
+codex-frame-028	codex	active	CAPTURE-DERIVED Codex 0.155.1: • Compacting context (48s • esc to interrupt) · 1 background terminal running, then • Queued follow-up inputs list above the composer
+codex-frame-029	codex	active	CAPTURE-DERIVED Codex 0.155.1: • Working (32m 32s • esc to interrupt) · 1 background terminal running, then • Queued follow-up inputs list above the composer
+codex-frame-030	codex	active	CAPTURE-DERIVED Codex 0.155.1: • Working (…) after compaction, Queued follow-up inputs list above the composer
+codex-frame-038	codex	waiting	idle composer
+codex-frame-039	codex	waiting	idle composer
+pi-frame-001	pi	waiting	idle composer with unsent draft
+pi-frame-002	pi	waiting	idle composer with unsent draft
+pi-frame-005	pi	waiting	idle composer
+pi-frame-006	pi	waiting	idle composer
+pi-frame-007	pi	waiting	idle composer
+shell-frame-001	shell	waiting	bash prompt
+shell-frame-002	shell	waiting	bash prompt
+shell-frame-003	shell	waiting	bash prompt
+shell-frame-004	shell	waiting	password prompt (known blind spot: no shell prompt glyph)
+shell-frame-005	shell	waiting	bash prompt
+codex-frame-040	codex	waiting	SYNTHETIC (review r1): idle; agent message quotes the "(9m 41s • esc to interrupt)" shape, then Worked for + composer
+codex-frame-041	codex	waiting	SYNTHETIC (review r1): idle; • Ran grep whose command contains the status shape, then composer
+codex-frame-042	codex	waiting	SYNTHETIC (review r1): idle; user pasted "Working (… • esc to interrupt)" into a › line
+pi-frame-008	pi	waiting	idle composer, status line without R/CH fields (openai provider, review r1 P2-4)
+claude-frame-061	claude	active	SYNTHETIC (review r1): live spinner + 12 roster rows under the footer
+claude-frame-060	claude	waiting	SYNTHETIC (review r1): idle prompt + 12 roster rows under the footer
+claude-frame-059	claude	active	SYNTHETIC: turn handed off to 3 background agents, 16 roster rows push the Waiting line out of the 20-line window
+pi-frame-009	pi	waiting	SYNTHETIC (review r2 P1): idle composer, finished answer mentions delegate_task in prose; captured composer layout
+pi-frame-004	pi	active	CAPTURE-DERIVED pi 0.85.1 + pi-subagents 0.51.0, mid subagent_wait: async delegate run "running", step row "⠇ delegate · step 1/1", "── ⠴ Working ──" banner, "1 active agent" row; token/cost status line present while busy
+pi-frame-003	pi	waiting	CAPTURE-DERIVED pi 0.85.1, after the turn ended: finished answer names delegate_task in prose, token/cost composer (installed v1.16.16 reported this pane running)
+claude-frame-021	claude	active	CAPTURE-DERIVED Claude Code (Fable 5.1), mid tool call: "✳ Lollygagging… (6m 17s · ↓ 00.0k tokens)" over a running Bash block; the daemon published running -> error for it while a nested TUI on a foreign tmux server wrote error rows
+codex-frame-008	codex	active	SOURCE-DERIVED Codex 0.155: blink variant uses hollow bullet
+codex-frame-011	codex	active	SOURCE-DERIVED Codex 0.155: reduced motion hides bullet
+codex-frame-014	codex	active	SOURCE-DERIVED Codex 0.155: narrow pane truncates after interrupt hint
+codex-frame-012	codex	active	SOURCE-DERIVED Codex 0.155: remapped ctrl + c interrupt hint
+codex-frame-007	codex	active	SOURCE-DERIVED Codex 0.155 parallel approval snapshot: 2 detail rows
+codex-frame-005	codex	active	SOURCE-DERIVED Codex 0.155 parallel approval shape: 4 detail rows
+codex-frame-015	codex	active	SOURCE-DERIVED Codex 0.155 wrapped status detail shape
+codex-frame-001	codex	active	SOURCE-DERIVED Codex 0.155 review r3 busy frame
+codex-frame-002	codex	active	SOURCE-DERIVED Codex 0.155 review r3 busy frame
+codex-frame-003	codex	active	SOURCE-DERIVED Codex 0.155 review r3 busy frame
+codex-frame-004	codex	active	SOURCE-DERIVED Codex 0.155 review r3 busy frame
+codex-frame-006	codex	active	SOURCE-DERIVED Codex 0.155 review r3 busy frame
+codex-frame-009	codex	active	SOURCE-DERIVED Codex 0.155 review r3 busy frame
+codex-frame-010	codex	active	SOURCE-DERIVED Codex 0.155 review r3 busy frame
+codex-frame-013	codex	active	SOURCE-DERIVED Codex 0.155 review r3 busy frame
+codex-frame-020	codex	waiting	SOURCE-DERIVED quoted prose with idle composer
+codex-frame-019	codex	waiting	SOURCE-DERIVED quoted prose with idle composer
+codex-frame-018	codex	waiting	SOURCE-DERIVED quoted prose with idle composer
+codex-frame-017	codex	waiting	SOURCE-DERIVED quoted prose with idle composer
+codex-frame-016	codex	waiting	SOURCE-DERIVED quoted prose with idle composer

@@ -1,0 +1,486 @@
+package agentpaths
+
+import (
+	"os"
+	"os/user"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestLegacyDir_DefaultsToHomeAgentDeck(t *testing.T) {
+	home := setupHome(t)
+
+	legacyDir, err := LegacyDir()
+	if err != nil {
+		t.Fatalf("LegacyDir() error = %v", err)
+	}
+	if want := filepath.Join(home, ".agent-deck"); legacyDir != want {
+		t.Fatalf("LegacyDir() = %q, want %q", legacyDir, want)
+	}
+}
+
+func TestXDGDirs_DefaultToHomeFallbacks(t *testing.T) {
+	home := setupHome(t)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("XDG_CACHE_HOME", "")
+
+	configDir, err := ConfigDir()
+	if err != nil {
+		t.Fatalf("ConfigDir() error = %v", err)
+	}
+	if want := filepath.Join(home, ".config", AppDirName); configDir != want {
+		t.Fatalf("ConfigDir() = %q, want %q", configDir, want)
+	}
+
+	dataDir, err := DataDir()
+	if err != nil {
+		t.Fatalf("DataDir() error = %v", err)
+	}
+	if want := filepath.Join(home, ".local", "share", AppDirName); dataDir != want {
+		t.Fatalf("DataDir() = %q, want %q", dataDir, want)
+	}
+
+	cacheDir, err := CacheDir()
+	if err != nil {
+		t.Fatalf("CacheDir() error = %v", err)
+	}
+	if want := filepath.Join(home, ".cache", AppDirName); cacheDir != want {
+		t.Fatalf("CacheDir() = %q, want %q", cacheDir, want)
+	}
+}
+
+func TestXDGDirs_EnvOverrides(t *testing.T) {
+	setupHome(t)
+	root := t.TempDir()
+	configHome := filepath.Join(root, "config")
+	dataHome := filepath.Join(root, "data")
+	cacheHome := filepath.Join(root, "cache")
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	t.Setenv("XDG_DATA_HOME", dataHome)
+	t.Setenv("XDG_CACHE_HOME", cacheHome)
+
+	configDir, err := ConfigDir()
+	if err != nil {
+		t.Fatalf("ConfigDir() error = %v", err)
+	}
+	if want := filepath.Join(configHome, AppDirName); configDir != want {
+		t.Fatalf("ConfigDir() = %q, want %q", configDir, want)
+	}
+
+	dataDir, err := DataDir()
+	if err != nil {
+		t.Fatalf("DataDir() error = %v", err)
+	}
+	if want := filepath.Join(dataHome, AppDirName); dataDir != want {
+		t.Fatalf("DataDir() = %q, want %q", dataDir, want)
+	}
+
+	cacheDir, err := CacheDir()
+	if err != nil {
+		t.Fatalf("CacheDir() error = %v", err)
+	}
+	if want := filepath.Join(cacheHome, AppDirName); cacheDir != want {
+		t.Fatalf("CacheDir() = %q, want %q", cacheDir, want)
+	}
+}
+
+func TestXDGDirs_RelativeEnvValuesFallBackToHome(t *testing.T) {
+	home := setupHome(t)
+	t.Setenv("XDG_CONFIG_HOME", "relative-config")
+	t.Setenv("XDG_DATA_HOME", "relative-data")
+	t.Setenv("XDG_CACHE_HOME", "relative-cache")
+
+	configDir, err := ConfigDir()
+	if err != nil {
+		t.Fatalf("ConfigDir() error = %v", err)
+	}
+	if want := filepath.Join(home, ".config", AppDirName); configDir != want {
+		t.Fatalf("ConfigDir() = %q, want fallback %q", configDir, want)
+	}
+
+	dataDir, err := DataDir()
+	if err != nil {
+		t.Fatalf("DataDir() error = %v", err)
+	}
+	if want := filepath.Join(home, ".local", "share", AppDirName); dataDir != want {
+		t.Fatalf("DataDir() = %q, want fallback %q", dataDir, want)
+	}
+
+	cacheDir, err := CacheDir()
+	if err != nil {
+		t.Fatalf("CacheDir() error = %v", err)
+	}
+	if want := filepath.Join(home, ".cache", AppDirName); cacheDir != want {
+		t.Fatalf("CacheDir() = %q, want fallback %q", cacheDir, want)
+	}
+}
+
+func osRealHome(t *testing.T) string {
+	t.Helper()
+	u, err := user.Current()
+	if err != nil || u.HomeDir == "" {
+		t.Skip("cannot determine real home directory from OS user database")
+	}
+	return filepath.Clean(u.HomeDir)
+}
+
+func TestConfigDir_RefusesUnderTestOnRealHome(t *testing.T) {
+	real := osRealHome(t)
+	t.Setenv("HOME", real)
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	dir, err := ConfigDir()
+	if err == nil {
+		t.Fatalf("ConfigDir should refuse real-home path under test, got %s nil error", dir)
+	}
+	if !strings.Contains(err.Error(), "real home") {
+		t.Fatalf("error should mention real-home guard, got %v", err)
+	}
+}
+
+func TestLegacyDir_RefusesUnderTestOnRealHome(t *testing.T) {
+	real := osRealHome(t)
+	t.Setenv("HOME", real)
+
+	dir, err := LegacyDir()
+	if err == nil {
+		t.Fatalf("LegacyDir should refuse real-home path under test, got %s nil error", dir)
+	}
+	if !strings.Contains(err.Error(), "real home") {
+		t.Fatalf("error should mention real-home guard, got %v", err)
+	}
+}
+
+func TestUnsafeTestPathWarningDebounced(t *testing.T) {
+	real := osRealHome(t)
+	t.Setenv("HOME", real)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	var buf strings.Builder
+	restore := setUnsafeTestPathWarnSink(&buf)
+	defer restore()
+	resetUnsafeTestPathWarnOnce()
+
+	for i := 0; i < 5; i++ {
+		_, _ = DataDir()
+	}
+
+	got := buf.String()
+	if n := strings.Count(got, "real home"); n != 1 {
+		t.Fatalf("warning should be debounced to exactly 1 emission, got %d:\n%s", n, got)
+	}
+	if !strings.Contains(got, "testutil.IsolateHome") {
+		t.Fatalf("warning should explain the sandbox fix, got %q", got)
+	}
+}
+
+func TestEffectiveConfigPath_LegacyWinsOnlyWhenXDGFileMissing(t *testing.T) {
+	home := setupHome(t)
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	legacyPath := filepath.Join(home, ".agent-deck", "config.toml")
+	xdgPath := filepath.Join(home, ".config", AppDirName, "config.toml")
+
+	got, err := EffectiveConfigPath("config.toml")
+	if err != nil {
+		t.Fatalf("EffectiveConfigPath() error = %v", err)
+	}
+	if got != xdgPath {
+		t.Fatalf("EffectiveConfigPath() = %q, want XDG path %q", got, xdgPath)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", filepath.Dir(legacyPath), err)
+	}
+	if err := os.WriteFile(legacyPath, []byte("legacy = true\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", legacyPath, err)
+	}
+
+	got, err = EffectiveConfigPath("config.toml")
+	if err != nil {
+		t.Fatalf("EffectiveConfigPath() error = %v", err)
+	}
+	if got != legacyPath {
+		t.Fatalf("EffectiveConfigPath() = %q, want legacy path %q", got, legacyPath)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(xdgPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", filepath.Dir(xdgPath), err)
+	}
+	if err := os.WriteFile(xdgPath, []byte("xdg = true\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", xdgPath, err)
+	}
+
+	got, err = EffectiveConfigPath("config.toml")
+	if err != nil {
+		t.Fatalf("EffectiveConfigPath() error = %v", err)
+	}
+	if got != xdgPath {
+		t.Fatalf("EffectiveConfigPath() = %q, want XDG path %q", got, xdgPath)
+	}
+}
+
+func TestEffectiveConfigPath_XDGStatErrorDoesNotFallBackToLegacy(t *testing.T) {
+	home := setupHome(t)
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	legacyPath := filepath.Join(home, ".agent-deck", "config.toml")
+	xdgPath := filepath.Join(home, ".config", AppDirName, "config.toml")
+
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", filepath.Dir(legacyPath), err)
+	}
+	if err := os.WriteFile(legacyPath, []byte("legacy = true\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", legacyPath, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(xdgPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", filepath.Dir(xdgPath), err)
+	}
+	if err := os.Symlink("config.toml", xdgPath); err != nil {
+		t.Fatalf("Symlink(%q) error = %v", xdgPath, err)
+	}
+
+	if got, err := EffectiveConfigPath("config.toml"); err == nil {
+		t.Fatalf("EffectiveConfigPath() = %q, want stat error", got)
+	}
+}
+
+func TestEffectiveDataDir_LegacyWinsOnlyWhenXDGDataMissing(t *testing.T) {
+	home := setupHome(t)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	legacyDir := filepath.Join(home, ".agent-deck")
+	xdgDataDir := filepath.Join(home, ".local", "share", AppDirName)
+	legacyMarker := filepath.Join(legacyDir, "profiles", "default")
+	xdgMarker := filepath.Join(xdgDataDir, "profiles")
+
+	got, err := EffectiveDataDir("profiles")
+	if err != nil {
+		t.Fatalf("EffectiveDataDir() error = %v", err)
+	}
+	if got != xdgDataDir {
+		t.Fatalf("EffectiveDataDir() = %q, want XDG data dir %q", got, xdgDataDir)
+	}
+
+	if err := os.MkdirAll(legacyMarker, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", legacyMarker, err)
+	}
+
+	got, err = EffectiveDataDir("profiles")
+	if err != nil {
+		t.Fatalf("EffectiveDataDir() error = %v", err)
+	}
+	if got != legacyDir {
+		t.Fatalf("EffectiveDataDir() = %q, want legacy dir %q", got, legacyDir)
+	}
+
+	if err := os.MkdirAll(xdgMarker, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", xdgMarker, err)
+	}
+
+	got, err = EffectiveDataDir("profiles")
+	if err != nil {
+		t.Fatalf("EffectiveDataDir() error = %v", err)
+	}
+	if got != xdgDataDir {
+		t.Fatalf("EffectiveDataDir() = %q, want XDG data dir %q", got, xdgDataDir)
+	}
+}
+
+func TestEffectiveDataDir_LegacyMarkerWinsWhenXDGBaseExistsWithoutMarker(t *testing.T) {
+	home := setupHome(t)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	legacyDir := filepath.Join(home, ".agent-deck")
+	xdgDataDir := filepath.Join(home, ".local", "share", AppDirName)
+	legacyMarker := filepath.Join(legacyDir, "profiles", "default")
+
+	if err := os.MkdirAll(xdgDataDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", xdgDataDir, err)
+	}
+	if err := os.MkdirAll(legacyMarker, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", legacyMarker, err)
+	}
+
+	got, err := EffectiveDataDir("profiles")
+	if err != nil {
+		t.Fatalf("EffectiveDataDir() error = %v", err)
+	}
+	if got != legacyDir {
+		t.Fatalf("EffectiveDataDir() = %q, want legacy dir %q", got, legacyDir)
+	}
+}
+
+func TestEffectiveDataDir_RejectsNonLocalMarkers(t *testing.T) {
+	setupHome(t)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	if got, err := EffectiveDataDir("../profiles"); err == nil {
+		t.Fatalf("EffectiveDataDir() = %q, want error", got)
+	}
+}
+
+func TestEffectiveDataPath_RejectsNonLocalName(t *testing.T) {
+	setupHome(t)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	if got, err := EffectiveDataPath("../escape"); err == nil {
+		t.Fatalf("EffectiveDataPath() = %q, want error", got)
+	}
+}
+
+func TestCachePath_RejectsNonLocalName(t *testing.T) {
+	setupHome(t)
+	t.Setenv("XDG_CACHE_HOME", "")
+
+	if got, err := CachePath("../escape"); err == nil {
+		t.Fatalf("CachePath() = %q, want error", got)
+	}
+}
+
+func setupHome(t *testing.T) string {
+	t.Helper()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	return home
+}
+
+// ensureSafeForTest must honor the isolation marker testutil.IsolateHome sets,
+// for paths inside the isolated tree.
+//
+// The guard compares the resolved path against user.Current().HomeDir, read
+// from /etc/passwd. In some build sandboxes the isolated tempdir NESTS inside
+// that home — the Nix sandbox puts nixbld's passwd home and TMPDIR both under
+// /build — so a test that correctly isolated its HOME is still refused.
+func TestEnsureSafeForTest_HonorsHomeIsolationMarker(t *testing.T) {
+	realHome := osUserRealHome()
+	if realHome == "" {
+		t.Skip("no passwd home to test the guard against")
+	}
+	// An isolated HOME that nests inside the passwd home, reproducing the
+	// sandbox shape.
+	isolated := filepath.Join(realHome, "nested-sandbox-home")
+	resolved := filepath.Join(isolated, ".agent-deck")
+
+	t.Setenv("HOME", isolated)
+	for _, e := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"} {
+		t.Setenv(e, "")
+	}
+
+	t.Setenv("AGENT_DECK_TEST_HOME_ISOLATED", "")
+	if err := ensureSafeForTest(resolved); err == nil {
+		t.Fatal("guard allowed a path under the real home without the isolation marker")
+	}
+
+	t.Setenv("AGENT_DECK_TEST_HOME_ISOLATED", "1")
+	if err := ensureSafeForTest(resolved); err != nil {
+		t.Fatalf("guard rejected a path inside the isolated tree: %v", err)
+	}
+}
+
+// The marker must NOT disable the guard when HOME points back at the real
+// home. A test doing that is deliberately exercising the un-isolated path
+// (internal/session/config_pathguard_test.go does exactly this), and the
+// marker is still set process-wide by the package's TestMain.
+func TestEnsureSafeForTest_MarkerDoesNotBypassWhenHomeIsTheRealHome(t *testing.T) {
+	realHome := osUserRealHome()
+	if realHome == "" {
+		t.Skip("no passwd home to test the guard against")
+	}
+	t.Setenv("HOME", realHome)
+	for _, e := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"} {
+		t.Setenv(e, "")
+	}
+	t.Setenv("AGENT_DECK_TEST_HOME_ISOLATED", "1")
+
+	if err := ensureSafeForTest(filepath.Join(realHome, ".agent-deck")); err == nil {
+		t.Fatal("marker bypassed the guard while HOME was the real home")
+	}
+}
+
+// A test that isolates only a specific XDG dir — pointing it at its own
+// t.TempDir(), which lives under TMPDIR rather than under the isolated HOME —
+// must also be honored. This is the shape that actually fails in the Nix
+// sandbox, where TMPDIR sits under the passwd home.
+func TestEnsureSafeForTest_HonorsIsolatedXDGRoots(t *testing.T) {
+	realHome := osUserRealHome()
+	if realHome == "" {
+		t.Skip("no passwd home to test the guard against")
+	}
+	t.Setenv("HOME", realHome)
+	for _, e := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"} {
+		t.Setenv(e, "")
+	}
+	// A tempdir nested under the passwd home, as t.TempDir() is in the sandbox.
+	cacheRoot := filepath.Join(realHome, "sandbox-tmp", "xdg-cache")
+	t.Setenv("XDG_CACHE_HOME", cacheRoot)
+	t.Setenv("AGENT_DECK_TEST_HOME_ISOLATED", "1")
+
+	if err := ensureSafeForTest(filepath.Join(cacheRoot, "agent-deck")); err != nil {
+		t.Fatalf("guard rejected a path inside an isolated XDG root: %v", err)
+	}
+	// ...but the legacy dir under the un-isolated HOME is still refused.
+	if err := ensureSafeForTest(filepath.Join(realHome, ".agent-deck")); err == nil {
+		t.Fatal("an isolated XDG root licensed a path under the real home")
+	}
+}
+
+// The marker must not license a path OUTSIDE the isolated tree.
+func TestEnsureSafeForTest_MarkerDoesNotBypassOutsideTheIsolatedTree(t *testing.T) {
+	realHome := osUserRealHome()
+	if realHome == "" {
+		t.Skip("no passwd home to test the guard against")
+	}
+	t.Setenv("HOME", filepath.Join(realHome, "nested-sandbox-home"))
+	for _, e := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"} {
+		t.Setenv(e, "")
+	}
+	t.Setenv("AGENT_DECK_TEST_HOME_ISOLATED", "1")
+
+	if err := ensureSafeForTest(filepath.Join(realHome, ".agent-deck")); err == nil {
+		t.Fatal("marker bypassed the guard for a path outside the isolated tree")
+	}
+}
+
+// Only the exact marker value counts — a stray non-empty value must not
+// disable a data-loss guard.
+func TestEnsureSafeForTest_IgnoresOtherMarkerValues(t *testing.T) {
+	realHome := osUserRealHome()
+	if realHome == "" {
+		t.Skip("no passwd home to test the guard against")
+	}
+	isolated := filepath.Join(realHome, "nested-sandbox-home")
+	t.Setenv("HOME", isolated)
+	for _, e := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"} {
+		t.Setenv(e, "")
+	}
+	resolved := filepath.Join(isolated, ".agent-deck")
+
+	for _, v := range []string{"0", "true", "yes", " 1"} {
+		t.Setenv("AGENT_DECK_TEST_HOME_ISOLATED", v)
+		if err := ensureSafeForTest(resolved); err == nil {
+			t.Errorf("marker value %q disabled the guard; only \"1\" may", v)
+		}
+	}
+}
+
+func TestProfileRuntimeDir(t *testing.T) {
+	home := setupHome(t)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	got, err := ProfileRuntimeDir("work")
+	if err != nil {
+		t.Fatalf("ProfileRuntimeDir() error = %v", err)
+	}
+	if want := filepath.Join(home, ".local", "share", AppDirName, "runtime", "profiles", "work"); got != want {
+		t.Fatalf("ProfileRuntimeDir() = %q, want %q", got, want)
+	}
+	for _, bad := range []string{"", ".", "..", "a/b", "../x", "/abs"} {
+		if _, err := ProfileRuntimeDir(bad); err == nil {
+			t.Errorf("ProfileRuntimeDir(%q) succeeded", bad)
+		}
+	}
+}

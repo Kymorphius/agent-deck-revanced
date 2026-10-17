@@ -1,0 +1,2590 @@
+package statedb
+
+import (
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/safeio"
+	"github.com/google/uuid"
+
+	_ "modernc.org/sqlite"
+)
+
+// ErrRefusingEmptySweep is returned by SaveInstances when it is asked to
+// persist an EMPTY instance set while the instances table still holds rows.
+//
+// S1 data-loss safeguard (added after the 2026-06-04 incident, the third of
+// its class): SaveInstances' DELETE+re-insert sweep used to run an
+// unconditional `DELETE FROM instances` for an empty payload, so a stray
+// SaveInstances([]) wiped the live profile index. Refusing the destructive
+// empty sweep turns silent data loss into a loud, recoverable error. Callers
+// that genuinely intend to empty the table must use ClearAllInstances.
+var ErrRefusingEmptySweep = errors.New("statedb: refusing to wipe populated instances table with an empty SaveInstances payload (use ClearAllInstances to intentionally clear)")
+
+// backupDBFile copies the live SQLite database file to "<path>.bak" so a
+// destructive sweep is recoverable (S2 data-loss safeguard, 2026-06-04
+// incident). It is best-effort: a failed backup must NOT abort the save (the
+// save is the operation the caller actually asked for; the backup is an
+// insurance copy). To capture a consistent snapshot we checkpoint the WAL into
+// the main file first, then copy. Errors are returned so callers can log them,
+// but the only current caller intentionally ignores the error.
+//
+// No-op (nil) when path is empty (in-memory DB) — there is no file to copy.
+func (s *StateDB) backupDBFile() error {
+	if s.path == "" {
+		return nil
+	}
+	// Fold the WAL back into the main db file so the .bak is self-contained and
+	// doesn't depend on a sidecar -wal that the next write will overwrite.
+	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+
+	// safeio.Backup performs the shared read → temp-write → rename copy (no torn
+	// .bak, 0600 to keep the snapshot as private as the original). The
+	// sqlite-specific WAL checkpoint above stays here; the copy itself is the
+	// generic primitive. A missing source returns ("", nil) — a benign no-op.
+	if _, err := safeio.Backup(s.path); err != nil {
+		return err
+	}
+	return nil
+}
+
+// withBusyRetry runs op with linear backoff (10ms, 20ms, 30ms, 40ms, 50ms;
+// ~150ms total) when op fails with SQLITE_BUSY. Non-BUSY errors are returned
+// immediately; the final BUSY error is returned if every attempt fails.
+//
+// WAL + busy_timeout=5000 handles most contention internally, but the
+// modernc.org/sqlite driver still surfaces transient BUSY at the application
+// level under heavy multi-writer load (multiple processes plus goroutines).
+// This helper acts as a belt-and-suspenders retry. Pulled out of
+// SaveWatcherEvent (the original site) so every short-lived writer can use
+// the same policy.
+//
+// op MUST be idempotent or otherwise safe to retry (e.g. idempotent UPDATEs,
+// INSERT OR IGNORE/REPLACE, DELETE).
+func withBusyRetry(op func() error) error {
+	const attempts = 5
+	var err error
+	for attempt := 0; attempt < attempts; attempt++ {
+		err = op()
+		if err == nil {
+			return nil
+		}
+		if !isSQLiteBusy(err) {
+			return err
+		}
+		if attempt == 1 {
+			slog.Warn("statedb: SQLITE_BUSY retry", slog.Int("attempt", attempt+1), slog.String("err", err.Error()))
+		}
+		time.Sleep(time.Duration(10*(attempt+1)) * time.Millisecond)
+	}
+	if err != nil {
+		slog.Error("statedb: SQLITE_BUSY exhausted retries", slog.Int("attempts", attempts), slog.String("err", err.Error()))
+	}
+	return err
+}
+
+// SchemaVersion tracks the current database schema version.
+// Bump this when adding migrations.
+const SchemaVersion = 13
+
+// StateDB wraps a SQLite database for session/group persistence.
+// Thread-safe for concurrent use from multiple goroutines within one process.
+// Multiple OS processes can safely read/write via WAL mode + busy timeout.
+type StateDB struct {
+	db       *sql.DB
+	pid      int
+	readOnly bool
+	// token identifies this StateDB's owning process instance for session
+	// claim ownership (see ClaimSessions). Raw PID alone is not a safe
+	// ownership key: after this process exits, the OS can recycle its PID for
+	// an unrelated process, which would then silently inherit this process's
+	// ghost claims. Combining pid + process start time + random bytes makes
+	// the token practically unique for the life of the machine. Generated
+	// once per Open(), stable for the process's lifetime.
+	token string
+	// path is the on-disk path of the SQLite database file. Retained so
+	// destructive write paths can snapshot the file to "<path>.bak" before a
+	// large DELETE+re-insert sweep (S2 data-loss safeguard, 2026-06-04
+	// incident). Empty for in-memory databases (no file to back up).
+	path string
+}
+
+// newOwnerToken builds a claim-ownership token unique to this process
+// instance: `<pid>-<started-unix>-<uuid>`. The pid/started prefix keeps the
+// token self-describing when inspecting session_claims by hand; the UUID makes
+// it collision-proof under PID reuse.
+func newOwnerToken(pid int) string {
+	return fmt.Sprintf("%d-%d-%s", pid, time.Now().Unix(), uuid.NewString())
+}
+
+// backupRowDropThreshold is the minimum number of rows a single
+// saveInstancesOnce sweep must DELETE before it is worth snapshotting the DB
+// file to "<path>.bak". A sweep that drops one or two rows is routine session
+// churn (a session was removed/renamed); backing the file up on every such save
+// would thrash the disk. The 2026-06-04 incident wiped the entire populated
+// table at once, so a meaningful-drop gate catches the catastrophic case while
+// staying quiet during normal operation.
+const backupRowDropThreshold = 3
+
+// InstanceRow represents a session row in the database.
+type InstanceRow struct {
+	ID                 string
+	Title              string
+	ProjectPath        string
+	GroupPath          string
+	Order              int
+	Command            string
+	Wrapper            string
+	Tool               string
+	Status             string
+	TmuxSession        string
+	CreatedAt          time.Time
+	LastAccessed       time.Time
+	ParentSessionID    string
+	IsConductor        bool
+	NoTransitionNotify bool
+	// TmuxSocketName mirrors Instance.TmuxSocketName (v1.7.50+, issue #687).
+	// Empty for pre-v1.7.50 rows — those keep targeting the default server
+	// after upgrade.
+	TmuxSocketName string
+	// TitleLocked blocks Claude session-name sync into Title (v1.7.52+, issue #697).
+	TitleLocked bool
+	// AutoName marks Title as a machine-generated quick-session handle (v12).
+	// AutoNameDescription holds the last captured Claude task description so an
+	// auto-named session can show its meaningful name on reopen even when
+	// stopped/idle (no live pane title). Both default to zero for legacy rows.
+	AutoName            bool
+	AutoNameDescription string
+	WorktreePath        string
+	WorktreeRepo        string
+	WorktreeBranch      string
+	// Account is the per-session named account (v1.9.22+, issue #924). Maps to
+	// `[profiles.<account>.claude].config_dir` at spawn time and becomes the
+	// most-specific level in the CLAUDE_CONFIG_DIR resolution chain. Empty
+	// means "fall through to conductor/group/env/profile/global/default".
+	Account string
+	// Pin anchors the session to the top/bottom of its group (pin-sessions
+	// feature). "", "top", or "bottom"; empty (the column default) means not
+	// pinned, so legacy rows need no backfill.
+	Pin      string
+	ToolData json.RawMessage // JSON blob for tool-specific data
+	// ArchivedAt is non-zero when the session is archived (hidden from active lists).
+	ArchivedAt time.Time
+}
+
+type existingAutoNameFields struct {
+	found       bool
+	autoName    bool
+	description string
+}
+
+func mergeAutoNameFields(inst *InstanceRow, existing existingAutoNameFields) (bool, string) {
+	if !existing.found {
+		return inst.AutoName, inst.AutoNameDescription
+	}
+
+	autoName := inst.AutoName
+	if !existing.autoName && inst.AutoName {
+		// A stale full-row save must not resurrect AutoName after a newer writer
+		// cleared it through an explicit rename/title sync.
+		autoName = false
+	}
+
+	description := inst.AutoNameDescription
+	if description == "" && existing.description != "" {
+		// The capture path writes non-empty descriptions with a targeted UPDATE.
+		// Keep that fresher value when a stale snapshot still has the old empty
+		// column value.
+		description = existing.description
+	}
+	return autoName, description
+}
+
+// NOTE: title/title_locked are deliberately NOT merge-protected the way
+// auto_name is. auto_name's merge is safe because it only blocks one
+// direction (stale payload resurrecting true after a fresher writer cleared
+// it) — a row-level heuristic can't safely do that for title_locked, because
+// an incoming "unlocked" payload is ambiguous: it's either a stale snapshot
+// from a racing writer (must be rejected) or a deliberate `session
+// set-title-lock off` (must be honored), and both look identical as plain
+// row data. That ambiguity can only be resolved at the write site that
+// actually knows its own freshness — see UpdateTitleIfUnlocked, used by the
+// hook-triggered Claude title sync (cmd/agent-deck/hook_name_sync.go) instead
+// of a full stale-snapshot round-trip through UpsertInstances.
+
+// WatcherRow represents a watcher row in the database.
+type WatcherRow struct {
+	ID         string
+	Name       string
+	Type       string
+	ConfigPath string
+	Status     string
+	Conductor  string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
+// WatcherEventRow represents a single event row from the watcher_events table.
+type WatcherEventRow struct {
+	ID              int64
+	WatcherID       string
+	DedupKey        string
+	Sender          string
+	Subject         string
+	RoutedTo        string
+	SessionID       string
+	TriageSessionID string
+	Body            string
+	CreatedAt       time.Time
+}
+
+// CostEventRow mirrors the cost_events table for raw round-trip operations
+// (e.g., cross-profile migration). The canonical CostEvent type lives in
+// internal/costs, but we keep this minimal struct here so the statedb package
+// can read/write rows without a circular import.
+type CostEventRow struct {
+	ID                  string
+	SessionID           string
+	Timestamp           string // RFC3339; preserve verbatim — cost_events stores TEXT
+	Model               string
+	InputTokens         int64
+	OutputTokens        int64
+	CacheReadTokens     int64
+	CacheWriteTokens    int64
+	CostMicrodollars    int64
+	BudgetStopTriggered bool
+}
+
+// GroupRow represents a group row in the database.
+type GroupRow struct {
+	Path        string
+	Name        string
+	Expanded    bool
+	Order       int
+	DefaultPath string
+	// MaxConcurrent caps simultaneous running sessions in this group (v1.9.1).
+	// 0 = unlimited (legacy default for groups predating this field); 1 = serial
+	// (default for newly-created groups); N>=2 = bounded parallelism.
+	MaxConcurrent int
+}
+
+// StatusRow holds status + acknowledgment for a session.
+type StatusRow struct {
+	Status       string
+	Tool         string
+	Acknowledged bool
+	// matrix/hardened: per-row explicit acknowledgment time distinguishes a
+	// repeated completion from a new turn in the shared collector.
+	AcknowledgedAt int64
+	// HookLag is the persisted tool_data.hook_lag extra (nil when absent):
+	// the completed-turn samples a CLI pass recorded for a Claude session
+	// whose hook still says running (session/hook_lag.go).
+	HookLag json.RawMessage
+}
+
+// RecentSessionRow captures the config of a deleted session for quick re-creation.
+type RecentSessionRow struct {
+	ID             string // SHA-256 dedup key (title+path+tool+group)
+	Title          string
+	ProjectPath    string
+	GroupPath      string
+	Command        string
+	Wrapper        string
+	Tool           string
+	ToolOptions    json.RawMessage // serialized ToolOptionsWrapper
+	SandboxEnabled bool
+	GeminiYoloMode *bool
+	DeletedAt      time.Time
+}
+
+// global singleton for cross-package access (status writes from background worker)
+var (
+	globalDB   *StateDB
+	globalDBMu sync.RWMutex
+)
+
+// SetGlobal sets the global StateDB instance.
+func SetGlobal(db *StateDB) {
+	globalDBMu.Lock()
+	globalDB = db
+	globalDBMu.Unlock()
+}
+
+// GetGlobal returns the global StateDB instance (may be nil).
+func GetGlobal() *StateDB {
+	globalDBMu.RLock()
+	defer globalDBMu.RUnlock()
+	return globalDB
+}
+
+// Open creates or opens a SQLite database at dbPath with WAL mode and busy timeout.
+//
+// busy_timeout and foreign_keys are PER-CONNECTION pragmas in SQLite, so they
+// MUST be passed via the DSN's `_pragma` parameter — setting them once via
+// db.Exec only affects whichever pool connection happened to run the PRAGMA.
+// Pre-fix, fresh connections in the pool defaulted to busy_timeout=0, which
+// turned every transient lock into an immediate SQLITE_BUSY at the application
+// level. journal_mode=WAL is persistent on the database file, so it can stay
+// as a one-shot Exec.
+func Open(dbPath string) (*StateDB, error) {
+	// Ensure parent directory exists
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0700); err != nil {
+		return nil, fmt.Errorf("statedb: mkdir: %w", err)
+	}
+
+	dsn := dbPath + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(on)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("statedb: open: %w", err)
+	}
+
+	// WAL mode: persistent on the file, not per-connection.
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("statedb: wal mode: %w", err)
+	}
+
+	pid := os.Getpid()
+	return &StateDB{db: db, pid: pid, path: dbPath, token: newOwnerToken(pid)}, nil
+}
+
+// OpenReadOnly opens an existing database without creating files, changing
+// pragmas, migrating schema, or checkpointing WAL state. It is intended for
+// product surfaces whose contract forbids every filesystem mutation.
+func OpenReadOnly(dbPath string) (*StateDB, error) {
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, err
+	}
+	// immutable=1 prevents SQLite from creating/updating WAL/SHM sidecars and
+	// is required by the byte-zero-effect contract of callers using this API.
+	return openReadOnlyDatabase(dbPath, true)
+}
+
+// OpenReadOnlyLive reads the current WAL-backed database without initializing
+// schema, writing rows, changing journal mode or checkpointing. Unlike the
+// immutable evidence reader, SQLite may access WAL/SHM coordination files.
+func OpenReadOnlyLive(dbPath string) (*StateDB, error) {
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, err
+	}
+	return openReadOnlyDatabase(dbPath, false)
+}
+
+func openReadOnlyDatabase(dbPath string, immutable bool) (*StateDB, error) {
+	dsn := "file:" + dbPath + "?mode=ro&_pragma=query_only(1)&_pragma=busy_timeout(5000)"
+	if immutable {
+		dsn += "&immutable=1"
+	}
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("statedb: open read-only: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("statedb: open read-only: %w", err)
+	}
+	pid := os.Getpid()
+	return &StateDB{db: db, pid: pid, path: dbPath, token: newOwnerToken(pid), readOnly: true}, nil
+}
+
+// Close checkpoints WAL and closes the database.
+func (s *StateDB) Close() error {
+	if s.readOnly {
+		return s.db.Close()
+	}
+	// Checkpoint WAL to merge it back into the main database file
+	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	return s.db.Close()
+}
+
+// DB returns the underlying sql.DB for advanced use cases (e.g., testing).
+func (s *StateDB) DB() *sql.DB {
+	return s.db
+}
+
+// Migrate creates tables if they don't exist and runs any pending migrations.
+func (s *StateDB) Migrate() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("statedb: begin migrate: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// metadata table
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS metadata (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		)
+	`); err != nil {
+		return fmt.Errorf("statedb: create metadata: %w", err)
+	}
+
+	// instances table
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS instances (
+			id              TEXT PRIMARY KEY,
+			title           TEXT NOT NULL,
+			project_path    TEXT NOT NULL,
+			group_path      TEXT NOT NULL DEFAULT 'my-sessions',
+			sort_order      INTEGER NOT NULL DEFAULT 0,
+			command         TEXT NOT NULL DEFAULT '',
+			wrapper         TEXT NOT NULL DEFAULT '',
+			tool            TEXT NOT NULL DEFAULT 'shell',
+			status          TEXT NOT NULL DEFAULT 'error',
+			tmux_session     TEXT NOT NULL DEFAULT '',
+			tmux_socket_name TEXT NOT NULL DEFAULT '',
+			created_at      INTEGER NOT NULL,
+			last_accessed   INTEGER NOT NULL DEFAULT 0,
+			parent_session_id TEXT NOT NULL DEFAULT '',
+			is_conductor            INTEGER NOT NULL DEFAULT 0,
+			no_transition_notify    INTEGER NOT NULL DEFAULT 0,
+			title_locked            INTEGER NOT NULL DEFAULT 0,
+			worktree_path     TEXT NOT NULL DEFAULT '',
+			worktree_repo     TEXT NOT NULL DEFAULT '',
+			worktree_branch   TEXT NOT NULL DEFAULT '',
+			account           TEXT NOT NULL DEFAULT '',
+			archived_at       INTEGER NOT NULL DEFAULT 0,
+			auto_name              INTEGER NOT NULL DEFAULT 0,
+			auto_name_description  TEXT NOT NULL DEFAULT '',
+			pin             TEXT NOT NULL DEFAULT '',
+			last_sent_at    INTEGER NOT NULL DEFAULT 0,
+			tool_data       TEXT NOT NULL DEFAULT '{}',
+			acknowledged    INTEGER NOT NULL DEFAULT 0
+		)
+	`); err != nil {
+		return fmt.Errorf("statedb: create instances: %w", err)
+	}
+
+	// groups table.
+	// max_concurrent (v1.9.1): caps simultaneous running sessions in the
+	// group. DEFAULT 0 preserves backward compat (legacy unlimited) for any
+	// row inserted before this column existed; newly-created groups set 1.
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS groups (
+			path           TEXT PRIMARY KEY,
+			name           TEXT NOT NULL,
+			expanded       INTEGER NOT NULL DEFAULT 1,
+			sort_order     INTEGER NOT NULL DEFAULT 0,
+			default_path   TEXT NOT NULL DEFAULT '',
+			max_concurrent INTEGER NOT NULL DEFAULT 0
+		)
+	`); err != nil {
+		return fmt.Errorf("statedb: create groups: %w", err)
+	}
+
+	// ALTER for pre-existing databases (idempotent: ignore "duplicate column").
+	if _, err := tx.Exec(`ALTER TABLE groups ADD COLUMN max_concurrent INTEGER NOT NULL DEFAULT 0`); err != nil {
+		// SQLite returns "duplicate column name" when the column already exists.
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("statedb: add groups.max_concurrent: %w", err)
+		}
+	}
+
+	// instance heartbeats
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS instance_heartbeats (
+			pid        INTEGER PRIMARY KEY,
+			started    INTEGER NOT NULL,
+			heartbeat  INTEGER NOT NULL,
+			is_primary INTEGER NOT NULL DEFAULT 0
+		)
+	`); err != nil {
+		return fmt.Errorf("statedb: create heartbeats: %w", err)
+	}
+
+	// session claims: per-session polling ownership for multi-instance
+	// deduplication ([performance] claim_polling). One row per session that
+	// some instance actively polls; heartbeat-stale rows are taken over.
+	// owner_token, not owner_pid, is the ownership identity: it survives PID
+	// reuse (see StateDB.token doc); owner_pid is kept for display/debugging.
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS session_claims (
+			session_id  TEXT PRIMARY KEY,
+			owner_pid   INTEGER NOT NULL,
+			owner_token TEXT NOT NULL DEFAULT '',
+			claimed_at  INTEGER NOT NULL,
+			heartbeat   INTEGER NOT NULL,
+			scope       TEXT NOT NULL DEFAULT ''
+		)
+	`); err != nil {
+		return fmt.Errorf("statedb: create session_claims: %w", err)
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_session_claims_owner ON session_claims(owner_token)`); err != nil {
+		return fmt.Errorf("statedb: create idx_session_claims_owner: %w", err)
+	}
+
+	// recent_sessions table (schema v2)
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS recent_sessions (
+			id              TEXT PRIMARY KEY,
+			title           TEXT NOT NULL,
+			project_path    TEXT NOT NULL,
+			group_path      TEXT NOT NULL DEFAULT '',
+			command         TEXT NOT NULL DEFAULT '',
+			wrapper         TEXT NOT NULL DEFAULT '',
+			tool            TEXT NOT NULL DEFAULT '',
+			tool_options    TEXT NOT NULL DEFAULT '{}',
+			sandbox_enabled INTEGER NOT NULL DEFAULT 0,
+			gemini_yolo     INTEGER,
+			deleted_at      INTEGER NOT NULL
+		)
+	`); err != nil {
+		return fmt.Errorf("statedb: create recent_sessions: %w", err)
+	}
+
+	// cost_events table (cost tracking)
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS cost_events (
+			id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			model TEXT NOT NULL,
+			input_tokens INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+			cost_microdollars INTEGER NOT NULL DEFAULT 0,
+			budget_stop_triggered INTEGER NOT NULL DEFAULT 0
+		)
+	`); err != nil {
+		return fmt.Errorf("statedb: create cost_events: %w", err)
+	}
+
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_cost_events_session ON cost_events(session_id)`); err != nil {
+		return fmt.Errorf("statedb: create cost_events session index: %w", err)
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_cost_events_timestamp ON cost_events(timestamp)`); err != nil {
+		return fmt.Errorf("statedb: create cost_events timestamp index: %w", err)
+	}
+
+	// watchers table (v5)
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS watchers (
+			id          TEXT PRIMARY KEY,
+			name        TEXT UNIQUE NOT NULL,
+			type        TEXT NOT NULL,
+			config_path TEXT NOT NULL,
+			status      TEXT NOT NULL DEFAULT 'stopped',
+			conductor   TEXT NOT NULL DEFAULT '',
+			created_at  INTEGER NOT NULL,
+			updated_at  INTEGER NOT NULL
+		)
+	`); err != nil {
+		return fmt.Errorf("statedb: create watchers: %w", err)
+	}
+
+	// watcher_events table (v5 + Phase 18: triage_session_id)
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS watcher_events (
+			id                INTEGER PRIMARY KEY AUTOINCREMENT,
+			watcher_id        TEXT NOT NULL REFERENCES watchers(id),
+			dedup_key         TEXT NOT NULL,
+			sender            TEXT NOT NULL DEFAULT '',
+			subject           TEXT NOT NULL DEFAULT '',
+			routed_to         TEXT NOT NULL DEFAULT '',
+			session_id        TEXT NOT NULL DEFAULT '',
+			triage_session_id TEXT NOT NULL DEFAULT '',
+			body              TEXT NOT NULL DEFAULT '',
+			created_at        INTEGER NOT NULL,
+			UNIQUE(watcher_id, dedup_key)
+		)
+	`); err != nil {
+		return fmt.Errorf("statedb: create watcher_events: %w", err)
+	}
+
+	if _, err := tx.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_watcher_events_watcher_created
+		ON watcher_events(watcher_id, created_at DESC)
+	`); err != nil {
+		return fmt.Errorf("statedb: create watcher_events index: %w", err)
+	}
+
+	// Recall phase 1: session_hints / session_tags / session_links.
+	// Additive CREATE TABLE IF NOT EXISTS only; SchemaVersion stays at 13
+	// (see recall_hints.go for why).
+	if err := migrateRecallTables(tx); err != nil {
+		return err
+	}
+
+	// ALTER TABLE migrations for existing databases.
+	// CREATE TABLE IF NOT EXISTS won't add new columns to tables that already exist.
+	// Each migration is idempotent: errors from "duplicate column" are silently ignored.
+	// See CLAUDE.md "Schema Migration Safety": every new column MUST have a corresponding ALTER TABLE.
+	alterMigrations := []string{
+		"ALTER TABLE instances ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE watcher_events ADD COLUMN triage_session_id TEXT NOT NULL DEFAULT ''",
+		// Slack-truncation fix: full message text alongside the (first-line,
+		// 200-byte) subject label, so the conductor bridge can forward the
+		// complete message instead of a truncated subject. Default '' keeps
+		// pre-fix rows readable (bridge falls back to subject when body is '').
+		"ALTER TABLE watcher_events ADD COLUMN body TEXT NOT NULL DEFAULT ''",
+		// v7 (issue #687, v1.7.50): per-session tmux socket isolation.
+		// Default '' keeps the pre-v1.7.50 behavior for existing rows.
+		"ALTER TABLE instances ADD COLUMN tmux_socket_name TEXT NOT NULL DEFAULT ''",
+		// v8 (issue #697, v1.7.52): title lock blocks Claude session-name sync.
+		// Default 0 keeps the pre-v1.7.52 behavior (#572 sync default-on) for existing rows.
+		"ALTER TABLE instances ADD COLUMN title_locked INTEGER NOT NULL DEFAULT 0",
+		// v9 (issue #924): per-session named account. Default '' preserves
+		// the pre-v1.9.22 behavior for legacy rows (fall through to
+		// conductor/group/env/profile/global/default).
+		"ALTER TABLE instances ADD COLUMN account TEXT NOT NULL DEFAULT ''",
+		// v10 (archive-sessions): ArchivedAt timestamp. Default 0 means
+		// "not archived" for all pre-existing rows.
+		"ALTER TABLE instances ADD COLUMN archived_at INTEGER NOT NULL DEFAULT 0",
+		// v11 (pin-sessions): per-session pin to top/bottom of group. Default ''
+		// means "not pinned" for all pre-existing rows.
+		"ALTER TABLE instances ADD COLUMN pin TEXT NOT NULL DEFAULT ''",
+		// v12 (quick-session Claude-name display): AutoName flag + the last
+		// captured task description. Defaults (0, '') keep legacy rows showing
+		// their handle until they are recreated as quick sessions.
+		"ALTER TABLE instances ADD COLUMN auto_name INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE instances ADD COLUMN auto_name_description TEXT NOT NULL DEFAULT ''",
+		// v13 (self-heal Stage 1, #1457-followup): the "we talked to it" clock.
+		// Set by the keysender on every delivered injection. The self-heal stuck
+		// predicate measures the idle_at_empty_prompt dwell from this timestamp:
+		// a session is only stuck at an empty prompt if WE sent it something and
+		// nothing happened. Default 0 ("never sent") preserves legacy rows as
+		// deliberate-idle (never a self-heal candidate). Additive + targeted-write
+		// only (WriteLastSentAt); never part of a whole-row REPLACE/SaveInstances.
+		"ALTER TABLE instances ADD COLUMN last_sent_at INTEGER NOT NULL DEFAULT 0",
+	}
+	for _, stmt := range alterMigrations {
+		if _, err := tx.Exec(stmt); err != nil {
+			// Ignore "duplicate column name" errors (column already exists)
+			if !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("statedb: alter migration: %w", err)
+			}
+		}
+	}
+
+	// Set schema version only when missing or changed.
+	// Avoiding a write on every open reduces lock contention between CLI processes.
+	schemaVersion := fmt.Sprintf("%d", SchemaVersion)
+	var existingVersion string
+	err = tx.QueryRow(`SELECT value FROM metadata WHERE key = 'schema_version'`).Scan(&existingVersion)
+	switch {
+	case err == sql.ErrNoRows:
+		if _, err := tx.Exec(`
+			INSERT INTO metadata (key, value) VALUES ('schema_version', ?)
+		`, schemaVersion); err != nil {
+			return fmt.Errorf("statedb: insert schema version: %w", err)
+		}
+	case err != nil:
+		return fmt.Errorf("statedb: read schema version: %w", err)
+	case existingVersion != schemaVersion:
+		oldVer, _ := strconv.Atoi(existingVersion)
+		if oldVer < 4 {
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN is_conductor INTEGER NOT NULL DEFAULT 0`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v4 is_conductor: %w", err)
+				}
+			}
+			// Backfill: mark existing sessions whose title starts with "conductor-"
+			if _, err := tx.Exec(`UPDATE instances SET is_conductor = 1 WHERE title LIKE 'conductor-%'`); err != nil {
+				return fmt.Errorf("statedb: migrate v4 backfill is_conductor: %w", err)
+			}
+		}
+		// v5: Watcher tables are new (CREATE TABLE IF NOT EXISTS handles creation).
+		// No column backfill needed for v5.
+		if oldVer < 6 {
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN no_transition_notify INTEGER NOT NULL DEFAULT 0`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v6 no_transition_notify: %w", err)
+				}
+			}
+		}
+		if oldVer < 8 {
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN title_locked INTEGER NOT NULL DEFAULT 0`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v8 title_locked: %w", err)
+				}
+			}
+		}
+		if oldVer < 9 {
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN account TEXT NOT NULL DEFAULT ''`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v9 account: %w", err)
+				}
+			}
+		}
+		if oldVer < 10 {
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN archived_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v10 archived_at: %w", err)
+				}
+			}
+		}
+		if oldVer < 11 {
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN pin TEXT NOT NULL DEFAULT ''`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v11 pin: %w", err)
+				}
+			}
+		}
+		if oldVer < 12 {
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN auto_name INTEGER NOT NULL DEFAULT 0`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v12 auto_name: %w", err)
+				}
+			}
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN auto_name_description TEXT NOT NULL DEFAULT ''`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v12 auto_name_description: %w", err)
+				}
+			}
+		}
+		if oldVer < 13 {
+			// Self-heal Stage 1: the last_sent_at clock. Default 0 = "never sent",
+			// so every legacy row reads as deliberate-idle (never a self-heal
+			// candidate) until the keysender stamps it.
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN last_sent_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v13 last_sent_at: %w", err)
+				}
+			}
+		}
+		if _, err := tx.Exec(`
+			UPDATE metadata SET value = ? WHERE key = 'schema_version'
+		`, schemaVersion); err != nil {
+			return fmt.Errorf("statedb: update schema version: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// IsEmpty returns true if the instances table has no rows.
+func (s *StateDB) IsEmpty() (bool, error) {
+	count, err := s.InstanceCount()
+	if err != nil {
+		return false, err
+	}
+	return count == 0, nil
+}
+
+// InstanceCount returns the number of session rows (archived included). It
+// is the "is this store populated" signal the profile-root selection uses
+// to never prefer an empty store over a populated one.
+func (s *StateDB) InstanceCount() (int, error) {
+	var count int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM instances").Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// --- Instance CRUD ---
+
+func archivedAtUnix(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UTC().Unix()
+}
+
+// SaveInstance inserts or replaces a single instance.
+func (s *StateDB) SaveInstance(inst *InstanceRow) error {
+	toolData := inst.ToolData
+	if len(toolData) == 0 {
+		toolData = json.RawMessage("{}")
+	}
+
+	// Preserve any tool_data keys not modeled by the typed schema (e.g.,
+	// manually-set clear_on_compact). Without this merge, every
+	// INSERT OR REPLACE silently drops user-managed extras.
+	var existingToolData []byte
+	existingAutoName := existingAutoNameFields{}
+	if err := s.db.QueryRow("SELECT tool_data FROM instances WHERE id = ?", inst.ID).Scan(&existingToolData); err == nil {
+		toolData = MergeToolDataExtras(json.RawMessage(existingToolData), toolData)
+	}
+	var existingAutoNameInt int
+	if err := s.db.QueryRow("SELECT auto_name, auto_name_description FROM instances WHERE id = ?", inst.ID).Scan(&existingAutoNameInt, &existingAutoName.description); err == nil {
+		existingAutoName.found = true
+		existingAutoName.autoName = existingAutoNameInt != 0
+	}
+
+	isConductorInt := 0
+	if inst.IsConductor {
+		isConductorInt = 1
+	}
+	noTransitionNotifyInt := 0
+	if inst.NoTransitionNotify {
+		noTransitionNotifyInt = 1
+	}
+	titleLockedInt := 0
+	if inst.TitleLocked {
+		titleLockedInt = 1
+	}
+	autoName, autoNameDescription := mergeAutoNameFields(inst, existingAutoName)
+	autoNameInt := 0
+	if autoName {
+		autoNameInt = 1
+	}
+	_, err := s.db.Exec(`
+		INSERT OR REPLACE INTO instances (
+			id, title, project_path, group_path, sort_order,
+			command, wrapper, tool, status, tmux_session, tmux_socket_name,
+			created_at, last_accessed,
+			parent_session_id, is_conductor, no_transition_notify,
+			worktree_path, worktree_repo, worktree_branch, account,
+			archived_at, tool_data, title_locked, auto_name, auto_name_description, pin
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		inst.ID, inst.Title, inst.ProjectPath, inst.GroupPath, inst.Order,
+		inst.Command, inst.Wrapper, inst.Tool, inst.Status, inst.TmuxSession, inst.TmuxSocketName,
+		inst.CreatedAt.Unix(), inst.LastAccessed.Unix(),
+		inst.ParentSessionID, isConductorInt, noTransitionNotifyInt,
+		inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch, inst.Account,
+		archivedAtUnix(inst.ArchivedAt), string(toolData), titleLockedInt, autoNameInt, autoNameDescription, inst.Pin,
+	)
+	return err
+}
+
+// SaveInstances inserts or replaces multiple instances in a single transaction.
+// It also removes any rows from the database that are not in the provided list.
+//
+// DANGER (#1550): the DELETE-NOT-IN sweep deletes any row a concurrent
+// process inserted after the caller loaded its snapshot. Routine saves must
+// use UpsertInstances instead; SaveInstances is reserved for whole-table
+// replaces where the payload is authoritative (JSON->SQLite migration).
+//
+// Wrapped in withBusyRetry because parallel writers (CLI + TUI + heartbeat
+// daemons) contend on the WAL writer slot. The whole save is idempotent at
+// the row level (INSERT OR REPLACE + DELETE WHERE NOT IN), so retrying the
+// outer transaction on SQLITE_BUSY is safe. Part of the v1.9.1 #909 fix.
+func (s *StateDB) SaveInstances(insts []*InstanceRow) error {
+	return withBusyRetry(func() error {
+		return s.saveInstancesOnce(insts, true)
+	})
+}
+
+// UpsertInstances inserts or replaces the given instances WITHOUT the
+// DELETE-NOT-IN sweep: rows absent from the payload are left untouched, so a
+// writer holding a stale snapshot can never delete sessions another process
+// created after that snapshot was loaded (#1550). Deletions must be explicit
+// and targeted: DeleteInstance / RemoveSessionAndVerify (#909), or
+// ClearAllInstances for an intentional full wipe. An empty payload is a no-op.
+func (s *StateDB) UpsertInstances(insts []*InstanceRow) error {
+	return withBusyRetry(func() error {
+		return s.saveInstancesOnce(insts, false)
+	})
+}
+
+// saveInstancesOnce persists insts. When sweep is true, rows present in the
+// database but absent from insts are deleted (see SaveInstances); when false,
+// they are left untouched (see UpsertInstances).
+func (s *StateDB) saveInstancesOnce(insts []*InstanceRow, sweep bool) error {
+	// Upsert path with nothing to upsert: no-op without taking the write lock.
+	if !sweep && len(insts) == 0 {
+		return nil
+	}
+
+	// Pre-fetch existing mutable columns per instance ID so we can preserve state
+	// written by targeted UPDATE paths. Without this merge, every INSERT OR
+	// REPLACE can silently drop fresher data from another process.
+	//
+	// IMPORTANT: this read runs OUTSIDE the write transaction below.
+	// In SQLite WAL mode, beginning a transaction with a read and then
+	// trying to upgrade to a write fails with SQLITE_BUSY (rather than
+	// waiting on busy_timeout) when another connection is currently
+	// writing. Pre-reading on the raw DB handle avoids the upgrade path.
+	// There is a tiny race window where a concurrent writer could modify
+	// extras between this read and our commit; we accept it because
+	// extras keys are rarely-mutated user-managed flags and the worst-case
+	// outcome is one stale-overlay save, recoverable on next save.
+	existingToolData := make(map[string]json.RawMessage, len(insts))
+	existingAutoNames := make(map[string]existingAutoNameFields, len(insts))
+	if len(insts) > 0 {
+		placeholders := make([]string, len(insts))
+		args := make([]any, len(insts))
+		for i, inst := range insts {
+			placeholders[i] = "?"
+			args[i] = inst.ID
+		}
+		// #nosec G202 -- placeholders is a fixed sequence of "?" tokens generated
+		// from len(insts); all values flow through args[], never the SQL string.
+		query := "SELECT id, tool_data, auto_name, auto_name_description FROM instances WHERE id IN (" + strings.Join(placeholders, ",") + ")"
+		rows, queryErr := s.db.Query(query, args...)
+		if queryErr == nil {
+			for rows.Next() {
+				var id string
+				var td []byte
+				var autoNameInt int
+				var autoNameDescription string
+				if scanErr := rows.Scan(&id, &td, &autoNameInt, &autoNameDescription); scanErr == nil {
+					existingToolData[id] = json.RawMessage(td)
+					existingAutoNames[id] = existingAutoNameFields{
+						found:       true,
+						autoName:    autoNameInt != 0,
+						description: autoNameDescription,
+					}
+				}
+			}
+			_ = rows.Close()
+		}
+	}
+
+	// S2 data-loss safeguard (2026-06-04 incident): for a NON-empty payload,
+	// the sweep below DELETEs every on-disk row whose id is absent from the new
+	// set. Count that drop FIRST (on the raw handle, before opening the write
+	// transaction — running a wal_checkpoint backup inside an open tx on the
+	// same pool would deadlock). When the drop is meaningful
+	// (>= backupRowDropThreshold), snapshot the DB file to "<path>.bak" so a
+	// buggy-but-non-empty replace (the incident dropped most of the table at
+	// once) stays recoverable. S1 already refuses the fully-empty sweep; S2
+	// covers the large-but-not-empty replaces S1 cannot catch. The backup is
+	// best-effort: a failed copy is logged, never fatal — the caller asked to
+	// save, and the insurance copy must not become a new failure mode.
+	if sweep && len(insts) > 0 && s.path != "" {
+		placeholders := make([]string, len(insts))
+		args := make([]any, len(insts))
+		for i, inst := range insts {
+			placeholders[i] = "?"
+			args[i] = inst.ID
+		}
+		var dropCount int
+		// #nosec G202 -- placeholders is a fixed sequence of "?" tokens generated
+		// from len(insts); all values flow through args[], never the SQL string.
+		countQuery := "SELECT COUNT(*) FROM instances WHERE id NOT IN (" + strings.Join(placeholders, ",") + ")"
+		if err := s.db.QueryRow(countQuery, args...).Scan(&dropCount); err == nil && dropCount >= backupRowDropThreshold {
+			if bErr := s.backupDBFile(); bErr != nil {
+				slog.Warn("statedb: pre-sweep backup failed (continuing with save)",
+					"path", s.path, "drop_count", dropCount, "err", bErr)
+			}
+		}
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Delete rows not in the new list (sweep callers only, see SaveInstances).
+	// The upsert path (#1550) never deletes: rows it doesn't know about are
+	// left alone, and an empty payload simply inserts nothing.
+	if sweep {
+		if len(insts) == 0 {
+			// S1 guard: an empty payload would `DELETE FROM instances`, wiping the
+			// whole table. If rows already exist this is almost certainly a bug in
+			// the caller (a stray empty save), not an intentional clear — refuse it
+			// rather than silently destroying the index. Intentional clears go
+			// through ClearAllInstances. An empty payload on an already-empty table
+			// is a benign no-op.
+			var existing int
+			if err := tx.QueryRow("SELECT COUNT(*) FROM instances").Scan(&existing); err != nil {
+				return err
+			}
+			if existing > 0 {
+				return ErrRefusingEmptySweep
+			}
+			// Already empty: nothing to delete, nothing to insert.
+			return tx.Commit()
+		}
+		placeholders := make([]string, len(insts))
+		args := make([]any, len(insts))
+		for i, inst := range insts {
+			placeholders[i] = "?"
+			args[i] = inst.ID
+		}
+		// #nosec G202 -- placeholders is a fixed sequence of "?" tokens generated
+		// from len(insts); all values flow through args[], never the SQL string.
+		query := "DELETE FROM instances WHERE id NOT IN (" + strings.Join(placeholders, ",") + ")"
+		if _, err := tx.Exec(query, args...); err != nil {
+			return err
+		}
+		// The same sweep drops the instance-scoped recall rows (hints, tags,
+		// links) of the deleted instances; otherwise they accumulate forever
+		// in the one database chosen because it must not be wiped.
+		if err := pruneOrphanedRecallRows(tx); err != nil {
+			return err
+		}
+	}
+
+	stmt, err := tx.Prepare(`
+		INSERT OR REPLACE INTO instances (
+			id, title, project_path, group_path, sort_order,
+			command, wrapper, tool, status, tmux_session, tmux_socket_name,
+			created_at, last_accessed,
+			parent_session_id, is_conductor, no_transition_notify,
+			worktree_path, worktree_repo, worktree_branch, account,
+			archived_at, tool_data, title_locked, auto_name, auto_name_description, pin
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, inst := range insts {
+		toolData := inst.ToolData
+		if len(toolData) == 0 {
+			toolData = json.RawMessage("{}")
+		}
+		if existing, ok := existingToolData[inst.ID]; ok {
+			toolData = MergeToolDataExtras(existing, toolData)
+		}
+		isConductorInt := 0
+		if inst.IsConductor {
+			isConductorInt = 1
+		}
+		noTransitionNotifyInt := 0
+		if inst.NoTransitionNotify {
+			noTransitionNotifyInt = 1
+		}
+		titleLockedInt := 0
+		if inst.TitleLocked {
+			titleLockedInt = 1
+		}
+		autoName, autoNameDescription := mergeAutoNameFields(inst, existingAutoNames[inst.ID])
+		autoNameInt := 0
+		if autoName {
+			autoNameInt = 1
+		}
+		if _, err := stmt.Exec(
+			inst.ID, inst.Title, inst.ProjectPath, inst.GroupPath, inst.Order,
+			inst.Command, inst.Wrapper, inst.Tool, inst.Status, inst.TmuxSession, inst.TmuxSocketName,
+			inst.CreatedAt.Unix(), inst.LastAccessed.Unix(),
+			inst.ParentSessionID, isConductorInt, noTransitionNotifyInt,
+			inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch, inst.Account,
+			archivedAtUnix(inst.ArchivedAt), string(toolData), titleLockedInt, autoNameInt, autoNameDescription, inst.Pin,
+		); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// ClearAllInstances is the explicit escape hatch for intentionally emptying the
+// instances table. SaveInstances([]) refuses to wipe a populated table (S1
+// data-loss safeguard, ErrRefusingEmptySweep); callers that truly mean to clear
+// every row must call this method so the destructive intent is unambiguous and
+// greppable. It is a no-op on an already-empty table.
+func (s *StateDB) ClearAllInstances() error {
+	return withBusyRetry(func() error {
+		if _, err := s.db.Exec("DELETE FROM instances"); err != nil {
+			return err
+		}
+		return pruneOrphanedRecallRows(s.db)
+	})
+}
+
+// LoadInstances returns all instances ordered by sort_order.
+func (s *StateDB) LoadInstances() ([]*InstanceRow, error) {
+	return loadInstances(s.db.Query)
+}
+
+func loadInstances(query func(string, ...any) (*sql.Rows, error)) ([]*InstanceRow, error) {
+	rows, err := query(`
+		SELECT id, title, project_path, group_path, sort_order,
+			command, wrapper, tool, status, tmux_session, tmux_socket_name,
+			created_at, last_accessed,
+			parent_session_id, is_conductor, no_transition_notify,
+			worktree_path, worktree_repo, worktree_branch, account,
+			archived_at, tool_data, title_locked, auto_name, auto_name_description, pin
+		FROM instances ORDER BY sort_order
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []*InstanceRow
+	for rows.Next() {
+		r := &InstanceRow{}
+		var createdUnix, accessedUnix, archivedUnix int64
+		var toolDataStr string
+		var isConductorInt, noTransitionNotifyInt, titleLockedInt, autoNameInt int
+		if err := rows.Scan(
+			&r.ID, &r.Title, &r.ProjectPath, &r.GroupPath, &r.Order,
+			&r.Command, &r.Wrapper, &r.Tool, &r.Status, &r.TmuxSession, &r.TmuxSocketName,
+			&createdUnix, &accessedUnix,
+			&r.ParentSessionID, &isConductorInt, &noTransitionNotifyInt,
+			&r.WorktreePath, &r.WorktreeRepo, &r.WorktreeBranch, &r.Account,
+			&archivedUnix, &toolDataStr, &titleLockedInt, &autoNameInt, &r.AutoNameDescription, &r.Pin,
+		); err != nil {
+			return nil, err
+		}
+		r.CreatedAt = time.Unix(createdUnix, 0)
+		if accessedUnix > 0 {
+			r.LastAccessed = time.Unix(accessedUnix, 0)
+		}
+		if archivedUnix > 0 {
+			r.ArchivedAt = time.Unix(archivedUnix, 0).UTC()
+		}
+		r.IsConductor = isConductorInt != 0
+		r.NoTransitionNotify = noTransitionNotifyInt != 0
+		r.TitleLocked = titleLockedInt != 0
+		r.AutoName = autoNameInt != 0
+		r.ToolData = json.RawMessage(toolDataStr)
+		result = append(result, r)
+	}
+	return result, rows.Err()
+}
+
+// DeleteInstance removes an instance by ID.
+//
+// Wrapped in withBusyRetry because parallel `agent-deck rm` invocations
+// (e.g. xargs -P 14) all contend on the same WAL writer slot. Without
+// retry, transient SQLITE_BUSY silently drops the DELETE while the CLI
+// still reports success — the silent-loss half of issue #909.
+func (s *StateDB) DeleteInstance(id string) error {
+	return withBusyRetry(func() error {
+		if _, err := s.db.Exec("DELETE FROM instances WHERE id = ?", id); err != nil {
+			return err
+		}
+		return pruneOrphanedRecallRows(s.db)
+	})
+}
+
+// UpdateTitleIfUnlocked sets an instance's title (and clears auto_name, since
+// a synced title replaces the auto-generated handle) with a single
+// conditional UPDATE, atomic at the SQL level: the WHERE clause is evaluated
+// by SQLite as part of the same statement, so there is no read-then-write gap
+// a concurrent lock can land in. Returns applied=false (no error) when the
+// row is already locked or doesn't exist — the caller made no change.
+//
+// This exists for writers that only intend to touch the title based on a
+// possibly-stale decision — namely the hook-triggered Claude title sync
+// (cmd/agent-deck/hook_name_sync.go), which loads a full instance snapshot in
+// a separate process and used to save it back wholesale via UpsertInstances.
+// If a user rename (which sets title_locked) landed between that process's
+// load and its save, the stale wholesale save would silently revert the
+// rename — the "session name keeps getting overwritten" bug. A general
+// storage-layer guard against this is unsafe: an incoming "unlocked" payload
+// is ambiguous between "stale snapshot" (reject) and "deliberate `session
+// set-title-lock off`" (honor), and both look identical as row data. Only the
+// write site itself can resolve that, by asking SQLite to apply the change
+// solely if the row is STILL unlocked at the moment of the write.
+func (s *StateDB) UpdateTitleIfUnlocked(id, title string) (applied bool, err error) {
+	err = withBusyRetry(func() error {
+		res, execErr := s.db.Exec(
+			"UPDATE instances SET title = ?, auto_name = 0 WHERE id = ? AND title_locked = 0",
+			title, id,
+		)
+		if execErr != nil {
+			return execErr
+		}
+		n, raErr := res.RowsAffected()
+		if raErr != nil {
+			return raErr
+		}
+		applied = n > 0
+		return nil
+	})
+	return applied, err
+}
+
+// InstanceExists returns true iff a row with the given id is present.
+// Used by the rm path's post-commit verify (issue #909) to detect
+// resurrection by a concurrent SaveInstances rewrite.
+func (s *StateDB) InstanceExists(id string) (bool, error) {
+	row := s.db.QueryRow("SELECT 1 FROM instances WHERE id = ? LIMIT 1", id)
+	var one int
+	err := row.Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// --- Group CRUD ---
+
+const upsertGroupSQL = `
+		INSERT INTO groups (path, name, expanded, sort_order, default_path, max_concurrent)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET
+			name = excluded.name,
+			expanded = excluded.expanded,
+			sort_order = excluded.sort_order,
+			default_path = excluded.default_path,
+			max_concurrent = excluded.max_concurrent
+	`
+
+// SaveGroups upserts the given groups in a single transaction. It is ADDITIVE:
+// groups absent from the slice are left untouched, never deleted.
+//
+// This deliberately abandons the old replace-all (DELETE FROM groups + insert)
+// because a save can run with an incomplete in-memory tree — a stale tree from
+// another concurrent instance (allow_multiple), or the instances-only
+// NewGroupTree fallback. Replace-all then wiped every group the saver didn't
+// know about; populated groups self-healed from their sessions on reload, but
+// empty (session-less) groups were lost forever. With upsert, a partial save can
+// only add/update; intentional removal must go through DeleteGroupSubtree.
+func (s *StateDB) SaveGroups(groups []*GroupRow) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.Prepare(upsertGroupSQL)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, g := range groups {
+		expanded := 0
+		if g.Expanded {
+			expanded = 1
+		}
+		if _, err := stmt.Exec(g.Path, g.Name, expanded, g.Order, g.DefaultPath, g.MaxConcurrent); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// LoadGroups returns all groups ordered by sort_order.
+func (s *StateDB) LoadGroups() ([]*GroupRow, error) {
+	return loadGroups(s.db.Query)
+}
+
+func loadGroups(query func(string, ...any) (*sql.Rows, error)) ([]*GroupRow, error) {
+	rows, err := query(`
+		SELECT path, name, expanded, sort_order, default_path, max_concurrent
+		FROM groups ORDER BY sort_order
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []*GroupRow
+	for rows.Next() {
+		g := &GroupRow{}
+		var expanded int
+		if err := rows.Scan(&g.Path, &g.Name, &expanded, &g.Order, &g.DefaultPath, &g.MaxConcurrent); err != nil {
+			return nil, err
+		}
+		g.Expanded = expanded != 0
+		result = append(result, g)
+	}
+	return result, rows.Err()
+}
+
+// DeleteGroup removes a group by path.
+func (s *StateDB) DeleteGroup(path string) error {
+	_, err := s.db.Exec("DELETE FROM groups WHERE path = ?", path)
+	return err
+}
+
+// DeleteGroupSubtree removes a group and all of its descendants by path.
+// Because SaveGroups is additive (upsert, never prune), intentional group
+// removal — delete, rename, move — MUST go through this explicit delete, or the
+// old path rows would linger and resurrect on the next reload.
+//
+// The LIKE pattern matches only true descendants (path + "/"), so a prefix
+// look-alike such as "parental" survives a delete of "parent".
+func (s *StateDB) DeleteGroupSubtree(path string) error {
+	_, err := s.db.Exec(
+		"DELETE FROM groups WHERE path = ? OR path LIKE ? || '/%'",
+		path, path,
+	)
+	return err
+}
+
+// --- Status + Acknowledgment ---
+
+// WriteStatus updates the status and tool for an instance.
+//
+// Wrapped in withBusyRetry: the transition daemon (#755 family) calls this
+// under contention with other writers (heartbeat, status poller, hook
+// handler). Without retry, transient SQLITE_BUSY drops the user-visible
+// status update and the TUI shows stale state.
+func (s *StateDB) WriteStatus(id, status, tool string) error {
+	observe := loadStatusChangeObserver()
+	if observe == nil {
+		// Only read the prior value when someone listens: the write path
+		// stays one statement for every caller otherwise.
+		return withBusyRetry(func() error {
+			_, err := s.db.Exec(writeStatusSQL, status, tool, status, id)
+			return err
+		})
+	}
+	var from, tmuxName string
+	var changed bool
+	err := withBusyRetry(func() error {
+		from, tmuxName = "", ""
+		_ = s.db.QueryRow(`SELECT status, tmux_session FROM instances WHERE id = ?`, id).Scan(&from, &tmuxName)
+		if afterStatusRead != nil {
+			afterStatusRead()
+		}
+		// The edge is claimed by the write that changes the row: when the
+		// TUI and the notify daemon both write the same transition, only
+		// one UPDATE matches status IS NOT ?, so only one publishes.
+		res, err := s.db.Exec(writeStatusSQL+` AND status IS NOT ?`, status, tool, status, id, status)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		changed = n > 0 && from != status
+		if n == 0 {
+			// Same status: still refresh tool and the acknowledged reset.
+			_, err = s.db.Exec(writeStatusSQL, status, tool, status, id)
+		}
+		return err
+	})
+	if err == nil && changed {
+		observe(StatusChange{DBPath: s.path, ID: id, TmuxSession: tmuxName, From: from, To: status, Tool: tool, At: time.Now()})
+	}
+	return err
+}
+
+// WriteStatusIfCurrent applies a sampled verdict only while the stored status
+// still matches the value observed before sampling. A concurrent deliberate
+// stop must not be overwritten by an older daemon probe.
+func (s *StateDB) WriteStatusIfCurrent(id, expected, status, tool string) (bool, error) {
+	observe := loadStatusChangeObserver()
+	var tmuxName string
+	var applied bool
+	err := withBusyRetry(func() error {
+		applied = false
+		if observe != nil {
+			_ = s.db.QueryRow(`SELECT tmux_session FROM instances WHERE id = ?`, id).Scan(&tmuxName)
+		}
+		res, err := s.db.Exec(writeStatusSQL+` AND status = ?`, status, tool, status, id, expected)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		applied = n > 0
+		return err
+	})
+	if err == nil && applied && expected != status && observe != nil {
+		observe(StatusChange{DBPath: s.path, ID: id, TmuxSession: tmuxName, From: expected, To: status, Tool: tool, At: time.Now()})
+	}
+	return applied, err
+}
+
+// afterStatusRead is a test seam between WriteStatus's read of the prior
+// status and its update, where a second writer can interleave.
+var afterStatusRead func()
+
+const writeStatusSQL = `UPDATE instances
+	 SET status = ?, tool = ?,
+	     acknowledged = CASE WHEN ? = 'running' THEN 0 ELSE acknowledged END
+	 WHERE id = ?`
+
+// StatusChange is one status row transition written through WriteStatus.
+type StatusChange struct {
+	DBPath      string
+	ID          string
+	TmuxSession string
+	From        string
+	To          string
+	Tool        string
+	At          time.Time
+}
+
+var statusChangeObserver atomic.Pointer[func(StatusChange)]
+
+// SetStatusChangeObserver registers the single process-wide listener for
+// status transitions (the event bus tap). nil removes it. The observer runs
+// on the writer's goroutine after the write committed and must not block.
+func SetStatusChangeObserver(fn func(StatusChange)) {
+	if fn == nil {
+		statusChangeObserver.Store(nil)
+		return
+	}
+	statusChangeObserver.Store(&fn)
+}
+
+func loadStatusChangeObserver() func(StatusChange) {
+	if p := statusChangeObserver.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// WriteAutoNameDescription persists the latest Claude task description for an
+// auto-named session into the auto_name_description column without a whole-row
+// INSERT OR REPLACE. The background status loop captures the live pane title on
+// its own cadence; none of those ticks run a full Save, so without this targeted
+// write the description would only reach disk on the next user-triggered save —
+// and an app exit before then would lose the name on reopen (the bug this fixes).
+//
+// Wrapped in withBusyRetry for the same reason as WriteStatus: SQLite serializes
+// writers, so under contention a transient SQLITE_BUSY would otherwise silently
+// drop the update.
+func (s *StateDB) WriteAutoNameDescription(id, description string) error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(
+			`UPDATE instances SET auto_name_description = ? WHERE id = ?`,
+			description, id,
+		)
+		return err
+	})
+}
+
+// WriteLastSentAt persists the "we talked to it" clock (Unix seconds) for a
+// session into the last_sent_at column with a targeted single-column UPDATE —
+// never a whole-row INSERT OR REPLACE and never SaveInstances. The keysender
+// stamps this on every delivered injection; the self-heal predicate reads it to
+// measure the idle_at_empty_prompt dwell (#1457-followup, self-heal Stage 1).
+//
+// Like WriteAutoNameDescription this touches ONLY its own column, so a concurrent
+// writer's edits to any other field of the same row are preserved (no data-loss
+// surface), and it is wrapped in withBusyRetry for the same SQLITE_BUSY reason.
+func (s *StateDB) WriteLastSentAt(id string, unixSeconds int64) error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(
+			`UPDATE instances SET last_sent_at = ? WHERE id = ?`,
+			unixSeconds, id,
+		)
+		return err
+	})
+}
+
+// ReadLastSentAt returns the last_sent_at clock (Unix seconds, 0 if never sent)
+// for a session. Read-only; used by the self-heal detection pass.
+func (s *StateDB) ReadLastSentAt(id string) (int64, error) {
+	var ts int64
+	err := s.db.QueryRow(`SELECT last_sent_at FROM instances WHERE id = ?`, id).Scan(&ts)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return ts, err
+}
+
+// InstanceStatusUpdate is one targeted status mutation for
+// PersistInstanceStatusesTx: set instances.status = Status WHERE id = ID.
+// No other column is touched, so a concurrent writer's edits to any other
+// field of the same row are preserved.
+type InstanceStatusUpdate struct {
+	ID     string
+	Status string
+}
+
+// PersistInstanceStatusesTx applies a batch of targeted status updates inside a
+// SINGLE transaction. It is the persistence primitive for `session revive`.
+//
+// Why a dedicated primitive (two independent guarantees):
+//
+//  1. ATOMICITY / no partial write. All rows commit together or none do. A
+//     mid-loop failure on `revive --all` rolls the whole batch back instead of
+//     leaving the table half-healed (some rows StatusRunning, some still
+//     StatusError). Per-row INSERT-OR-REPLACE outside a tx could not promise
+//     this.
+//
+//  2. NO clobber of concurrent edits. Each row is written with a TARGETED
+//     `UPDATE instances SET status = ? WHERE id = ?` — only the single column
+//     revive owns (see Reviver.defaultReviveAction, which mutates nothing but
+//     Instance.Status). It deliberately does NOT use INSERT OR REPLACE of the
+//     whole row: a full-row write would overwrite every other column from
+//     revive's stale in-memory snapshot, clobbering any field (title, group,
+//     tool_data, last_accessed, …) a concurrent process edited between
+//     revive's load and its save. Mirrors WriteStatus / WriteClaudeSessionBinding,
+//     which target single columns for exactly this reason.
+//
+// There is NO DELETE sweep here — a row absent from `updates` is left entirely
+// untouched, so revive can never drop a session a concurrent `add` inserted
+// after revive loaded its snapshot (the lost-update race this fixes). Rows
+// whose id no longer exists (removed concurrently) simply match zero rows; the
+// UPDATE is a benign no-op, never a resurrection.
+//
+// The acknowledged-reset mirrors WriteStatus: flipping a row to "running"
+// clears its acknowledged flag so the TUI re-surfaces the freshly-revived
+// session. Wrapped in withBusyRetry because the whole batch is idempotent
+// (targeted UPDATEs to fixed ids), matching SaveInstances' retry rationale.
+func (s *StateDB) PersistInstanceStatusesTx(updates []InstanceStatusUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	return withBusyRetry(func() error {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		stmt, err := tx.Prepare(
+			`UPDATE instances
+			   SET status = ?,
+			       acknowledged = CASE WHEN ? = 'running' THEN 0 ELSE acknowledged END
+			 WHERE id = ?`,
+		)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+
+		for _, u := range updates {
+			if _, err := stmt.Exec(u.Status, u.Status, u.ID); err != nil {
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		_ = s.Touch()
+		return nil
+	})
+}
+
+// WriteClaudeSessionBinding atomically updates claude_session_id and
+// claude_detected_at inside the tool_data JSON column for the given
+// instance. Used by the hook-rebind path (UpdateHookStatus →
+// bindClaudeSessionFromHook) to persist the new session ID without a
+// whole-row INSERT OR REPLACE — which would clobber any concurrent
+// writes to other tool_data fields by writers holding a stale snapshot
+// of the instance.
+//
+// PERSIST-12 (see instance.go:bindClaudeSessionFromHook doc comment)
+// originally deferred this to an external "save cycle", but none of the
+// three UpdateHookStatus callers (TUI tick, web refresh, CLI status
+// refresh) actually call Save after rebind. Without this targeted
+// write, tool_data.claude_session_id stays pinned at the pre-/clear
+// UUID indefinitely for any DB-direct consumer (claudopticon, etc.) —
+// and the lifecycle log accumulates fresh "rebind" entries forever
+// because concurrent processes keep reloading the stale row from disk
+// and clobbering the in-memory mutation.
+//
+// Wrapped in withBusyRetry: SQLite serializes writers through a single
+// write lock, so under contention with WriteStatus / SaveInstance /
+// heartbeat writers a transient SQLITE_BUSY would otherwise drop this
+// update — matching the WriteStatus rationale above.
+//
+// Recall phase 1: the same call also records the mapping in session_links
+// (authoritative), because this is one of the two places that already know
+// it. The other is the hook confirmation of an id agent-deck minted itself
+// (Instance.confirmClaudeSessionLink, via UpsertSessionLink); the adoption
+// arbitration retracts a rejected candidate via RetractSessionLink.
+func (s *StateDB) WriteClaudeSessionBinding(id, sessionID string, detectedAt time.Time, expectedTouch ...int64) error {
+	return s.writeHarnessSessionBinding(id, sessionID, "claude", detectedAt, expectedTouch)
+}
+
+// writeHarnessSessionBinding is the shared body of the Claude, Codex and
+// Gemini binding writers: one json_set on tool_data plus the session_links
+// row, in one transaction so a link never exists without its binding.
+func (s *StateDB) writeHarnessSessionBinding(id, sessionID, harness string, detectedAt time.Time, expectedTouch []int64) error {
+	return withBusyRetry(func() error {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		// matrix/hardened: native bindings and Recall links share the mutation fence.
+		if err := guardRuntimeObservation(tx, id, expectedTouch); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`UPDATE instances
+			   SET tool_data = json_set(
+			         COALESCE(tool_data, '{}'),
+			         ?, ?,
+			         ?, ?)
+			 WHERE id = ?`,
+			"$."+harness+"_session_id", sessionID,
+			"$."+harness+"_detected_at", detectedAt.Unix(),
+			id,
+		); err != nil {
+			return err
+		}
+		if sessionID != "" {
+			if err := upsertSessionLink(tx, id, harness, sessionID, "", true, detectedAt); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	})
+}
+
+// WriteCodexSessionBinding is the Codex counterpart of
+// WriteClaudeSessionBinding: it atomically rewrites $.codex_session_id
+// and $.codex_detected_at inside the tool_data JSON column without
+// touching any unrelated keys. See WriteClaudeSessionBinding for the
+// full rationale (PERSIST-12, json_set vs. tool_data = ?, withBusyRetry).
+// This sibling exists because the Codex rebind path in
+// bindCodexSessionFromHook has the same in-memory-only mutation shape
+// that the Claude fix in #1140 addressed — tracked as #1139.
+func (s *StateDB) WriteCodexSessionBinding(id, sessionID string, detectedAt time.Time, expectedTouch ...int64) error {
+	return s.writeHarnessSessionBinding(id, sessionID, "codex", detectedAt, expectedTouch)
+}
+
+// WriteGeminiSessionBinding is the Gemini counterpart of
+// WriteClaudeSessionBinding. See that function's doc comment for the
+// PERSIST-12 / json_set / withBusyRetry rationale; the Gemini rebind
+// path in bindGeminiSessionFromHook had the same persistence gap
+// (#1139).
+func (s *StateDB) WriteGeminiSessionBinding(id, sessionID string, detectedAt time.Time, expectedTouch ...int64) error {
+	return s.writeHarnessSessionBinding(id, sessionID, "gemini", detectedAt, expectedTouch)
+}
+
+// WriteGenericSessionBinding persists a custom-tool conversation id
+// (tools configured via [tools.*] with resume_flag) into tool_data.
+// Mirrors WriteClaudeSessionBinding's json_set / withBusyRetry shape so a
+// live-env capture or `session set tool-session-id` survives reboot when
+// tmux is gone. Empty sessionID clears the keys.
+//
+// tool and location are the scope the id was captured under, written in the
+// SAME json_set as the id itself. They are not a separate write on purpose: an
+// id that reached disk while its scope did not would be resumed under the
+// wrong tool or on the wrong host, which is the failure the scope exists to
+// prevent (see internal/session/generic_session_scope.go).
+//
+// Recall phase 1: the same write records (id, tool, sessionID) in
+// session_links as the authoritative link, and a clear demotes the
+// instance's links, in the same transaction as the tool_data write.
+func (s *StateDB) WriteGenericSessionBinding(id, sessionID, tool, command, location string, detectedAt time.Time, expectedTouch ...int64) error {
+	return withBusyRetry(func() error {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		// matrix/hardened: a slow probe cannot bind a newly edited session.
+		if err := guardRuntimeObservation(tx, id, expectedTouch); err != nil {
+			return err
+		}
+		if sessionID == "" {
+			if _, err := tx.Exec(
+				`UPDATE instances
+				   SET tool_data = json_remove(
+				         COALESCE(tool_data, '{}'),
+				         '$.generic_session_id',
+				         '$.generic_detected_at',
+				         '$.generic_session_tool',
+				         '$.generic_session_command',
+				         '$.generic_session_location')
+				 WHERE id = ?`,
+				id,
+			); err != nil {
+				return err
+			}
+			if err := demoteSessionLinks(tx, id); err != nil {
+				return err
+			}
+			return tx.Commit()
+		}
+		if detectedAt.IsZero() {
+			detectedAt = time.Now()
+		}
+		if _, err := tx.Exec(
+			`UPDATE instances
+			   SET tool_data = json_set(
+			         COALESCE(tool_data, '{}'),
+			         '$.generic_session_id', ?,
+			         '$.generic_detected_at', ?,
+			         '$.generic_session_tool', ?,
+			         '$.generic_session_command', ?,
+			         '$.generic_session_location', ?)
+			 WHERE id = ?`,
+			sessionID, detectedAt.Unix(), tool, command, location, id,
+		); err != nil {
+			return err
+		}
+		harness := tool
+		if harness == "" {
+			harness = "generic"
+		}
+		if err := upsertSessionLink(tx, id, harness, sessionID, "", true, detectedAt); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
+}
+
+// WriteLastActivityAt atomically rewrites tool_data.last_activity_at
+// (issue #1846's durable activity record) without touching any unrelated
+// keys — same json_set/withBusyRetry shape as WriteClaudeSessionBinding,
+// and for the same reason: the observing process (TUI hook watcher,
+// attach-return) has no save cycle it can rely on to flush the in-memory
+// value before the evidence behind it is gone.
+func (s *StateDB) WriteLastActivityAt(id string, at time.Time, expectedTouch ...int64) error {
+	// matrix/hardened: activity from a superseded probe must not replace new activity.
+	return s.guardedRuntimeUpdate(id, expectedTouch,
+		`UPDATE instances SET tool_data=json_set(COALESCE(tool_data,'{}'),'$.last_activity_at',?) WHERE id=?`, at.Unix(), id)
+}
+
+// WriteLastAccessed atomically updates the last_accessed column for one
+// instance. MarkAccessed (#1846) uses this so each attach/detach is durable
+// on its own instead of waiting for a full saveInstances that may never run
+// before the TUI exits.
+func (s *StateDB) WriteLastAccessed(id string, at time.Time) error {
+	return withBusyRetry(func() error {
+		// matrix/hardened: asynchronous visits from another terminal/browser
+		// may finish out of order; an older write cannot rewind recent activity.
+		_, err := s.db.Exec(
+			`UPDATE instances SET last_accessed = MAX(COALESCE(last_accessed, 0), ?) WHERE id = ?`,
+			at.Unix(), id,
+		)
+		return err
+	})
+}
+
+// ReadAllStatuses returns status + acknowledged flag (+ the hook_lag extra)
+// for every instance. json_extract raises "malformed JSON" for a tool_data
+// value that is not JSON (an empty string, a partial write), which would
+// abort the whole query and silently blank every session's shared status;
+// the json_valid guard turns such a row into a NULL hook_lag instead.
+func (s *StateDB) ReadAllStatuses() (map[string]StatusRow, error) {
+	// matrix/hardened: keep the explicit per-row ACK time in the same read as
+	// its flag; legacy or malformed extras have an unknown zero timestamp.
+	rows, err := s.db.Query(`SELECT id, status, tool, acknowledged,
+		CASE WHEN json_valid(tool_data) THEN json_extract(tool_data, '$.hook_lag') ELSE NULL END,
+		CASE WHEN json_valid(tool_data) THEN CAST(COALESCE(json_extract(tool_data, '$.runtime_ack_at'),0) AS INTEGER) ELSE 0 END
+		FROM instances`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]StatusRow)
+	for rows.Next() {
+		var id string
+		var sr StatusRow
+		var ack int
+		var hookLag sql.NullString
+		if err := rows.Scan(&id, &sr.Status, &sr.Tool, &ack, &hookLag, &sr.AcknowledgedAt); err != nil {
+			return nil, err
+		}
+		sr.Acknowledged = ack != 0
+		if hookLag.Valid && hookLag.String != "" {
+			sr.HookLag = json.RawMessage(hookLag.String)
+		}
+		result[id] = sr
+	}
+	return result, rows.Err()
+}
+
+// WriteToolDataExtra atomically sets one tool_data extras-zone key to the
+// given JSON value (a targeted UPDATE like WriteLastActivityAt, so a read
+// path can publish a small observation without a full row save).
+func (s *StateDB) WriteToolDataExtra(id, key string, value json.RawMessage) error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(
+			`UPDATE instances
+			   SET tool_data = json_set(COALESCE(tool_data, '{}'), '$.' || ?, json(?))
+			 WHERE id = ?`,
+			key, string(value), id,
+		)
+		return err
+	})
+}
+
+// touchWithRetry stamps metadata.last_modified, retrying on SQLITE_BUSY.
+//
+// Touch() is a plain Exec, so under a concurrent writer it fails where the
+// retry-wrapped row UPDATE beside it would have succeeded — leaving the row
+// changed but the change unannounced. Every targeted writer that stamps its
+// own signal must retry the stamp as hard as it retried the write.
+func (s *StateDB) touchWithRetry() error {
+	return withBusyRetry(func() error { return s.Touch() })
+}
+
+// SetAcknowledged sets or clears the acknowledged flag for an instance.
+func (s *StateDB) SetAcknowledged(id string, ack bool) error {
+	_, err := s.SetAcknowledgedStamped(id, ack)
+	return err
+}
+
+// SetAcknowledgedStamped is SetAcknowledged for a caller that is also a reader
+// of this database: it returns the WriteStamps identifying the last_modified
+// bump this write produced.
+//
+// The TUI decides whether to save by comparing last_modified against the value
+// it captured when it last loaded. This write moves last_modified, so a TUI
+// that cannot recognise its own bump reads it as another process's change and
+// abandons the save that would have persisted the status change accompanying
+// it — then reloads, which rebuilds the session's acknowledged state from the
+// STALE stored status. Same self-inflicted false positive WriteRestartOutcome's
+// stamps exist to prevent (#1868).
+func (s *StateDB) SetAcknowledgedStamped(id string, ack bool) (WriteStamps, error) {
+	v := 0
+	if ack {
+		v = 1
+	}
+	// matrix/hardened: the flag, its time and the operator watermark commit
+	// together. An older collector cannot clear a just-acknowledged new turn.
+	var stamps WriteStamps
+	err := withBusyRetry(func() error {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		var before int64
+		if err := tx.QueryRow(`SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM metadata WHERE key='last_modified'),0)`).Scan(&before); err != nil {
+			return err
+		}
+		after := time.Now().UnixNano()
+		if after <= before {
+			after = before + 1
+		}
+		if _, err := tx.Exec(`UPDATE instances SET acknowledged=?,tool_data=json_set(CASE WHEN json_valid(tool_data) THEN tool_data ELSE '{}' END,'$.runtime_ack_at',?) WHERE id=?`, v, after, id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO metadata(key,value) VALUES('last_modified',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, fmt.Sprint(after)); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		stamps = WriteStamps{Before: before, After: after}
+		return nil
+	})
+	return stamps, err
+}
+
+// SetArchived sets or clears the archive timestamp for a single instance via a
+// targeted UPDATE. Archive/unarchive mutate one field on one row, so they must
+// NOT go through the full-table saveInstances() path: under concurrent writers
+// that path's external-change guard aborts the save and reloads, silently
+// discarding the archive (see #archive-abort). A scoped UPDATE always lands.
+// A zero `at` clears the flag (unarchive).
+//
+// The scoped UPDATE bypasses saveInstances(), which is also the only code path
+// that calls Touch(). Touch() explicitly here: it stamps metadata.last_modified,
+// the timestamp StorageWatcher polls to notice out-of-process writes. Without it
+// a running TUI never reloads, and its next forced full-table save replays a
+// stale snapshot over this row, reverting the archive.
+func (s *StateDB) SetArchived(id string, at time.Time) error {
+	if err := withBusyRetry(func() error {
+		_, err := s.db.Exec("UPDATE instances SET archived_at = ? WHERE id = ?", archivedAtUnix(at), id)
+		return err
+	}); err != nil {
+		return err
+	}
+	return s.touchWithRetry()
+}
+
+// --- Heartbeat ---
+
+// RegisterInstance records this process as an active TUI instance.
+func (s *StateDB) RegisterInstance(isPrimary bool) error {
+	now := time.Now().Unix()
+	primary := 0
+	if isPrimary {
+		primary = 1
+	}
+	_, err := s.db.Exec(`
+		INSERT OR REPLACE INTO instance_heartbeats (pid, started, heartbeat, is_primary)
+		VALUES (?, ?, ?, ?)
+	`, s.pid, now, now, primary)
+	return err
+}
+
+// Heartbeat updates the heartbeat timestamp for this process.
+func (s *StateDB) Heartbeat() error {
+	_, err := s.db.Exec(
+		"UPDATE instance_heartbeats SET heartbeat = ? WHERE pid = ?",
+		time.Now().Unix(), s.pid,
+	)
+	return err
+}
+
+// UnregisterInstance removes this process from the heartbeat table.
+func (s *StateDB) UnregisterInstance() error {
+	_, err := s.db.Exec("DELETE FROM instance_heartbeats WHERE pid = ?", s.pid)
+	return err
+}
+
+// CleanDeadInstances removes heartbeat entries that haven't been updated within timeout.
+func (s *StateDB) CleanDeadInstances(timeout time.Duration) error {
+	cutoff := time.Now().Add(-timeout).Unix()
+	_, err := s.db.Exec("DELETE FROM instance_heartbeats WHERE heartbeat < ?", cutoff)
+	return err
+}
+
+// AliveInstanceCount returns how many TUI instances have fresh heartbeats.
+func (s *StateDB) AliveInstanceCount() (int, error) {
+	var count int
+	cutoff := time.Now().Add(-30 * time.Second).Unix()
+	err := s.db.QueryRow(
+		"SELECT COUNT(*) FROM instance_heartbeats WHERE heartbeat >= ?", cutoff,
+	).Scan(&count)
+	return count, err
+}
+
+// --- Primary Election ---
+
+// ElectPrimary attempts to make this instance the primary.
+// Returns true if this instance is now (or already was) the primary.
+// Uses a transaction to atomically clear stale primaries and claim if available.
+func (s *StateDB) ElectPrimary(timeout time.Duration) (bool, error) {
+	var isPrimary bool
+	err := withBusyRetry(func() error {
+		isPrimary = false
+		tx, err := s.db.Begin()
+		if err != nil {
+			return fmt.Errorf("statedb: begin elect: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		cutoff := time.Now().Add(-timeout).Unix()
+
+		// Clear is_primary for any heartbeat older than timeout (stale primary)
+		if _, err := tx.Exec(
+			"UPDATE instance_heartbeats SET is_primary = 0 WHERE heartbeat < ? AND is_primary = 1",
+			cutoff,
+		); err != nil {
+			return fmt.Errorf("statedb: clear stale primary: %w", err)
+		}
+
+		// Find a candidate primary that is still fresh by heartbeat.
+		var existingPID int
+		err = tx.QueryRow(
+			"SELECT pid FROM instance_heartbeats WHERE is_primary = 1 AND heartbeat >= ? LIMIT 1",
+			cutoff,
+		).Scan(&existingPID)
+
+		if err == nil {
+			// A fresh-by-heartbeat primary row exists. Trust it as a live owner only
+			// if it is our own process OR the recorded PID is actually alive. A row
+			// left behind by an unclean exit (SIGKILL, OOM, terminal force-close,
+			// crash/panic) never ran ResignPrimary, so its heartbeat can stay within
+			// `timeout` for up to the full window after the process is gone. Without
+			// the liveness check, the next start sees that ghost as a live primary
+			// and exits "already running" — which is why users had to pkill (or wait
+			// out the window) before a restart would take. Verifying liveness here
+			// reclaims a dead primary immediately. The time-based clear above remains
+			// as a safety net against PID reuse.
+			if existingPID == s.pid || pidAlive(existingPID) {
+				if err := tx.Commit(); err != nil {
+					return fmt.Errorf("statedb: commit elect: %w", err)
+				}
+				isPrimary = existingPID == s.pid
+				return nil
+			}
+			// Dead primary: clear its flag and fall through to claim.
+			if _, err := tx.Exec(
+				"UPDATE instance_heartbeats SET is_primary = 0 WHERE pid = ?",
+				existingPID,
+			); err != nil {
+				return fmt.Errorf("statedb: clear dead primary: %w", err)
+			}
+		}
+
+		// No live primary exists: claim it
+		if _, err := tx.Exec(
+			"UPDATE instance_heartbeats SET is_primary = 1 WHERE pid = ?",
+			s.pid,
+		); err != nil {
+			return fmt.Errorf("statedb: claim primary: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("statedb: commit elect: %w", err)
+		}
+		isPrimary = true
+		return nil
+	})
+	return isPrimary, err
+}
+
+// ResignPrimary clears the is_primary flag for this process.
+func (s *StateDB) ResignPrimary() error {
+	_, err := s.db.Exec(
+		"UPDATE instance_heartbeats SET is_primary = 0 WHERE pid = ?",
+		s.pid,
+	)
+	return err
+}
+
+// --- Session Claims ---
+
+// ClaimRow is one row of the session_claims ownership table.
+type ClaimRow struct {
+	SessionID string
+	// OwnerPID is the owning process's OS pid, kept for display/debug only —
+	// it is not the ownership key (see OwnerToken) because PIDs are recycled
+	// by the OS.
+	OwnerPID int
+	// OwnerToken is the ownership identity: `<pid>-<started-unix>-<random
+	// hex>`, unique per StateDB.Open() and stable for that process's
+	// lifetime. Matching/ownership decisions use this field, not OwnerPID.
+	OwnerToken string
+	Scope      string
+	Heartbeat  int64
+}
+
+// ClaimSessions atomically claims each id for this process. A claim succeeds
+// when the row is absent, already ours (by owner_token), heartbeat-stale, or
+// held with a strictly shorter (less specific) scope — longer group path
+// wins, equal specificity is first-come (no stealing, no flapping). Returns
+// the ids owned by this process after the transaction.
+//
+// This upsert is also this process's sole heartbeat refresh path for claims:
+// the DO UPDATE branch fires for our own already-owned rows (owner_token
+// match) every sweep, bumping their heartbeat. Invariant: heartbeats are only
+// ever refreshed for rows re-claimed here — never blanket-refreshed by owner —
+// so a claim that stops being re-claimed (failed release, ghost row) goes
+// stale and gets taken over or pruned instead of living forever.
+func (s *StateDB) ClaimSessions(ids []string, scope string, staleAfter time.Duration) (map[string]bool, error) {
+	if len(ids) == 0 {
+		return make(map[string]bool), nil
+	}
+	var owned map[string]bool
+	err := withBusyRetry(func() error {
+		// Reset on every attempt: withBusyRetry may call this closure more than
+		// once, and a prior failed attempt (e.g. Commit() returning
+		// SQLITE_BUSY after owned was already populated) must not leak stale
+		// entries into the next attempt's result.
+		owned = make(map[string]bool, len(ids))
+
+		tx, err := s.db.Begin()
+		if err != nil {
+			return fmt.Errorf("statedb: begin claims: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		now := time.Now().Unix()
+		cutoff := time.Now().Add(-staleAfter).Unix()
+		// One prepared statement for the whole loop: this runs every 2s sweep,
+		// and modernc/sqlite recompiles a raw-string Exec on each call.
+		stmt, err := tx.Prepare(`
+			INSERT INTO session_claims (session_id, owner_pid, owner_token, claimed_at, heartbeat, scope)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(session_id) DO UPDATE SET
+				owner_pid   = excluded.owner_pid,
+				owner_token = excluded.owner_token,
+				claimed_at  = excluded.claimed_at,
+				heartbeat   = excluded.heartbeat,
+				scope       = excluded.scope
+			WHERE session_claims.owner_token = excluded.owner_token
+			   OR session_claims.heartbeat < ?
+			   OR length(excluded.scope) > length(session_claims.scope)
+		`)
+		if err != nil {
+			return fmt.Errorf("statedb: prepare claim: %w", err)
+		}
+		defer stmt.Close()
+		for _, id := range ids {
+			if _, err := stmt.Exec(id, s.pid, s.token, now, now, scope, cutoff); err != nil {
+				return fmt.Errorf("statedb: claim %s: %w", id, err)
+			}
+		}
+
+		rows, err := tx.Query("SELECT session_id FROM session_claims WHERE owner_token = ?", s.token)
+		if err != nil {
+			return fmt.Errorf("statedb: read claims: %w", err)
+		}
+		defer rows.Close()
+		requested := make(map[string]bool, len(ids))
+		for _, id := range ids {
+			requested[id] = true
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return fmt.Errorf("statedb: scan claim: %w", err)
+			}
+			if requested[id] {
+				owned[id] = true
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return owned, nil
+}
+
+// ReleaseClaims deletes the given claims when owned by this process (sessions
+// that left this instance's scope).
+func (s *StateDB) ReleaseClaims(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, s.token)
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	// #nosec G202 -- placeholders is a fixed sequence of "?" tokens generated
+	// from len(ids); all values flow through args[], never the SQL string.
+	query := "DELETE FROM session_claims WHERE owner_token = ? AND session_id IN (" + strings.Join(placeholders, ",") + ")"
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(query, args...)
+		return err
+	})
+}
+
+// ReleaseAllClaims deletes every claim owned by this process. Shutdown path,
+// same place as ResignPrimary.
+func (s *StateDB) ReleaseAllClaims() error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec("DELETE FROM session_claims WHERE owner_token = ?", s.token)
+		return err
+	})
+}
+
+// PruneStaleSessionClaims deletes claims whose session no longer exists in
+// the instances table. Cheap single statement; called periodically so claims
+// for deleted/archived-then-purged sessions cannot accumulate over a
+// long-lived owner process.
+func (s *StateDB) PruneStaleSessionClaims() error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec("DELETE FROM session_claims WHERE session_id NOT IN (SELECT id FROM instances)")
+		return err
+	})
+}
+
+// LoadClaims returns all claim rows keyed by session id.
+func (s *StateDB) LoadClaims() (map[string]ClaimRow, error) {
+	rows, err := s.db.Query("SELECT session_id, owner_pid, owner_token, scope, heartbeat FROM session_claims")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]ClaimRow)
+	for rows.Next() {
+		var r ClaimRow
+		if err := rows.Scan(&r.SessionID, &r.OwnerPID, &r.OwnerToken, &r.Scope, &r.Heartbeat); err != nil {
+			return nil, err
+		}
+		out[r.SessionID] = r
+	}
+	return out, rows.Err()
+}
+
+// --- Metadata ---
+
+// SetMeta sets a key-value pair in the metadata table.
+func (s *StateDB) SetMeta(key, value string) error {
+	_, err := s.db.Exec(
+		"INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+		key, value,
+	)
+	return err
+}
+
+// GetMeta gets a value from the metadata table. Returns "" if not found.
+func (s *StateDB) GetMeta(key string) (string, error) {
+	var value string
+	err := s.db.QueryRow("SELECT value FROM metadata WHERE key = ?", key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return value, err
+}
+
+// TakeMeta reads a metadata value and clears it (sets to "") for consume-once
+// signals (e.g. focus_request). Use it instead of GetMeta-then-SetMeta(""): the
+// clear is a compare-and-clear that only wipes the row when it still holds the
+// value just read, so a newer value written by a concurrent writer between the
+// read and the clear is preserved rather than lost. Returns "" when the key is
+// absent or already empty. (RETURNING isn't usable here — the modernc sqlite
+// driver routes UPDATE through exec and discards RETURNING rows.)
+func (s *StateDB) TakeMeta(key string) (string, error) {
+	value, err := s.GetMeta(key)
+	if err != nil || value == "" {
+		return "", err
+	}
+	if _, err := s.db.Exec(
+		"UPDATE metadata SET value = '' WHERE key = ? AND value = ?",
+		key, value,
+	); err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
+// --- Change Detection (replaces fsnotify) ---
+
+// Touch updates a metadata timestamp that other instances can poll to detect changes.
+func (s *StateDB) Touch() error {
+	return s.SetMeta("last_modified", fmt.Sprintf("%d", time.Now().UnixNano()))
+}
+
+// LastModified returns the last_modified timestamp from metadata.
+func (s *StateDB) LastModified() (int64, error) {
+	val, err := s.GetMeta("last_modified")
+	if err != nil || val == "" {
+		return 0, err
+	}
+	var ts int64
+	_, err = fmt.Sscanf(val, "%d", &ts)
+	return ts, err
+}
+
+// --- Recent Sessions ---
+
+// recentSessionDedupID returns a deterministic key for deduplication.
+// It includes all persisted recreation fields so different launch configs do
+// not overwrite each other.
+func recentSessionDedupID(row *RecentSessionRow) string {
+	toolOpts := "{}"
+	if len(row.ToolOptions) > 0 {
+		toolOpts = string(row.ToolOptions)
+	}
+
+	geminiYolo := "unset"
+	if row.GeminiYoloMode != nil {
+		geminiYolo = strconv.FormatBool(*row.GeminiYoloMode)
+	}
+
+	payload := strings.Join([]string{
+		row.Title,
+		row.ProjectPath,
+		row.GroupPath,
+		row.Command,
+		row.Wrapper,
+		row.Tool,
+		toolOpts,
+		strconv.FormatBool(row.SandboxEnabled),
+		geminiYolo,
+	}, "\x00")
+
+	h := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(h[:16]) // 32-char hex
+}
+
+// SaveRecentSession inserts or replaces a recent session entry, then prunes to 20.
+//
+// The INSERT and the prune are bundled in a single transaction so a crash
+// between them cannot leave the table over-budget (the prune always sees the
+// just-inserted row). The whole transaction runs under withBusyRetry to
+// absorb transient SQLITE_BUSY from concurrent writers — pre-fix, these
+// caused user-visible "recent session lost" reports under contention.
+func (s *StateDB) SaveRecentSession(row *RecentSessionRow) error {
+	id := recentSessionDedupID(row)
+
+	toolOpts := row.ToolOptions
+	if len(toolOpts) == 0 {
+		toolOpts = json.RawMessage("{}")
+	}
+
+	sandbox := 0
+	if row.SandboxEnabled {
+		sandbox = 1
+	}
+
+	var geminiYolo *int
+	if row.GeminiYoloMode != nil {
+		v := 0
+		if *row.GeminiYoloMode {
+			v = 1
+		}
+		geminiYolo = &v
+	}
+
+	return withBusyRetry(func() error {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		if _, err := tx.Exec(`
+			INSERT OR REPLACE INTO recent_sessions (
+				id, title, project_path, group_path,
+				command, wrapper, tool, tool_options,
+				sandbox_enabled, gemini_yolo, deleted_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`,
+			id, row.Title, row.ProjectPath, row.GroupPath,
+			row.Command, row.Wrapper, row.Tool, string(toolOpts),
+			sandbox, geminiYolo, time.Now().Unix(),
+		); err != nil {
+			return err
+		}
+
+		if _, err := tx.Exec(`
+			DELETE FROM recent_sessions WHERE id NOT IN (
+				SELECT id FROM recent_sessions ORDER BY deleted_at DESC LIMIT ?
+			)
+		`, 20); err != nil {
+			return err
+		}
+
+		return tx.Commit()
+	})
+}
+
+// LoadRecentSessions returns all recent sessions ordered by most recently deleted.
+func (s *StateDB) LoadRecentSessions() ([]*RecentSessionRow, error) {
+	rows, err := s.db.Query(`
+		SELECT id, title, project_path, group_path,
+			command, wrapper, tool, tool_options,
+			sandbox_enabled, gemini_yolo, deleted_at
+		FROM recent_sessions ORDER BY deleted_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []*RecentSessionRow
+	for rows.Next() {
+		r := &RecentSessionRow{}
+		var toolOptsStr string
+		var sandbox int
+		var geminiYolo *int
+		var deletedUnix int64
+		if err := rows.Scan(
+			&r.ID, &r.Title, &r.ProjectPath, &r.GroupPath,
+			&r.Command, &r.Wrapper, &r.Tool, &toolOptsStr,
+			&sandbox, &geminiYolo, &deletedUnix,
+		); err != nil {
+			return nil, err
+		}
+		r.ToolOptions = json.RawMessage(toolOptsStr)
+		r.SandboxEnabled = sandbox != 0
+		if geminiYolo != nil {
+			v := *geminiYolo != 0
+			r.GeminiYoloMode = &v
+		}
+		r.DeletedAt = time.Unix(deletedUnix, 0)
+		result = append(result, r)
+	}
+	return result, rows.Err()
+}
+
+// --- Watcher CRUD ---
+
+// SaveWatcher inserts or replaces a watcher row.
+func (s *StateDB) SaveWatcher(w *WatcherRow) error {
+	_, err := s.db.Exec(`
+		INSERT OR REPLACE INTO watchers (id, name, type, config_path, status, conductor, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, w.ID, w.Name, w.Type, w.ConfigPath, w.Status, w.Conductor,
+		w.CreatedAt.Unix(), w.UpdatedAt.Unix())
+	return err
+}
+
+// LoadWatchers returns all watchers ordered by name.
+func (s *StateDB) LoadWatchers() ([]*WatcherRow, error) {
+	rows, err := s.db.Query(`SELECT id, name, type, config_path, status, conductor, created_at, updated_at FROM watchers ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []*WatcherRow
+	for rows.Next() {
+		var w WatcherRow
+		var createdAt, updatedAt int64
+		if err := rows.Scan(&w.ID, &w.Name, &w.Type, &w.ConfigPath, &w.Status, &w.Conductor, &createdAt, &updatedAt); err != nil {
+			return nil, err
+		}
+		w.CreatedAt = time.Unix(createdAt, 0)
+		w.UpdatedAt = time.Unix(updatedAt, 0)
+		result = append(result, &w)
+	}
+	return result, rows.Err()
+}
+
+// SaveWatcherEvent inserts an event with dedup via INSERT OR IGNORE.
+// Returns true if the row was inserted (new event), false if it was a duplicate.
+// Prunes to maxEvents after successful insert.
+//
+// Retries on SQLITE_BUSY: concurrent INSERTs across connections can trip the
+// write lock even with WAL + busy_timeout if the driver surfaces BUSY before
+// the backoff completes. Retries are cheap because the operation is
+// idempotent (INSERT OR IGNORE).
+func (s *StateDB) SaveWatcherEvent(watcherID, dedupKey, sender, subject, routedTo, sessionID, body string, maxEvents int) (bool, error) {
+	var result sql.Result
+	if err := withBusyRetry(func() error {
+		var err error
+		result, err = s.db.Exec(`
+			INSERT OR IGNORE INTO watcher_events (watcher_id, dedup_key, sender, subject, routed_to, session_id, body, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, watcherID, dedupKey, sender, subject, routedTo, sessionID, body, time.Now().Unix())
+		return err
+	}); err != nil {
+		return false, err
+	}
+	n, _ := result.RowsAffected()
+	if n > 0 {
+		// Prune errors used to be silently dropped, which let the table grow
+		// unbounded under sustained BUSY. We log + retry so the next caller
+		// gets the intended bound.
+		if err := s.pruneWatcherEvents(watcherID, maxEvents); err != nil {
+			slog.Warn("statedb: pruneWatcherEvents failed",
+				slog.String("watcher_id", watcherID),
+				slog.Int("max_events", maxEvents),
+				slog.String("err", err.Error()))
+		}
+	}
+	return n > 0, nil
+}
+
+// isSQLiteBusy returns true when err is a SQLITE_BUSY / "database is locked"
+// transient condition that can be safely retried.
+func isSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "sqlite_busy") || strings.Contains(msg, "database is locked")
+}
+
+// LookupWatcherEventSessionByDedupKey queries the session_id for a specific event.
+// Returns ("", nil) if no matching event exists or session_id is empty.
+func (s *StateDB) LookupWatcherEventSessionByDedupKey(watcherID, dedupKey string) (string, error) {
+	var sessionID string
+	err := s.db.QueryRow(
+		`SELECT session_id FROM watcher_events WHERE watcher_id = ? AND dedup_key = ?`,
+		watcherID, dedupKey,
+	).Scan(&sessionID)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return sessionID, err
+}
+
+// UpdateWatcherEventSessionID sets the session_id on an existing watcher event.
+// Returns an error if no matching row exists (0 rows affected).
+func (s *StateDB) UpdateWatcherEventSessionID(watcherID, dedupKey, sessionID string) error {
+	result, err := s.db.Exec(
+		`UPDATE watcher_events SET session_id = ? WHERE watcher_id = ? AND dedup_key = ?`,
+		sessionID, watcherID, dedupKey,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("no watcher event found for watcher_id=%q dedup_key=%q", watcherID, dedupKey)
+	}
+	return nil
+}
+
+// UpdateWatcherEventRoutedTo updates the routed_to and triage_session_id columns
+// for the row matching (watcher_id, dedup_key). Returns a wrapped error if no row matches
+// (0 rows affected), allowing the caller to distinguish "update OK" from "event not found".
+//
+// Wrapped in withBusyRetry to match its sister SaveWatcherEvent — both are
+// short idempotent writes against watcher_events called from concurrent
+// engine + triage_reaper paths. Without retry, SQLITE_BUSY from a sister
+// INSERT silently drops the routed_to update and the watcher event sticks
+// in "unrouted" forever.
+func (s *StateDB) UpdateWatcherEventRoutedTo(watcherID, dedupKey, routedTo, triageSessionID string) error {
+	var n int64
+	if err := withBusyRetry(func() error {
+		res, err := s.db.Exec(
+			`UPDATE watcher_events SET routed_to = ?, triage_session_id = ? WHERE watcher_id = ? AND dedup_key = ?`,
+			routedTo, triageSessionID, watcherID, dedupKey,
+		)
+		if err != nil {
+			return err
+		}
+		n, _ = res.RowsAffected()
+		return nil
+	}); err != nil {
+		return fmt.Errorf("statedb: update routed_to: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("statedb: update routed_to: no watcher_events row for watcher_id=%s dedup_key=%s", watcherID, dedupKey)
+	}
+	return nil
+}
+
+// pruneWatcherEvents keeps only the newest maxCount events for a watcher.
+//
+// Wrapped in withBusyRetry: the DELETE ... NOT IN (SELECT ...) pattern takes
+// a stronger lock than a single-row UPDATE, so it is especially BUSY-prone
+// under concurrent inserts. If the prune is dropped, the watcher_events
+// table grows without bound.
+func (s *StateDB) pruneWatcherEvents(watcherID string, maxCount int) error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(`
+			DELETE FROM watcher_events WHERE watcher_id = ? AND id NOT IN (
+				SELECT id FROM watcher_events WHERE watcher_id = ?
+				ORDER BY id DESC LIMIT ?
+			)
+		`, watcherID, watcherID, maxCount)
+		return err
+	})
+}
+
+// LoadWatcherByName returns the watcher with the given name, or nil if not found.
+// A missing watcher is not an error; (nil, nil) is returned.
+func (s *StateDB) LoadWatcherByName(name string) (*WatcherRow, error) {
+	var w WatcherRow
+	var createdAt, updatedAt int64
+	err := s.db.QueryRow(`
+		SELECT id, name, type, config_path, status, conductor, created_at, updated_at
+		FROM watchers WHERE name = ?
+	`, name).Scan(&w.ID, &w.Name, &w.Type, &w.ConfigPath, &w.Status, &w.Conductor, &createdAt, &updatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	w.CreatedAt = time.Unix(createdAt, 0)
+	w.UpdatedAt = time.Unix(updatedAt, 0)
+	return &w, nil
+}
+
+// LoadWatcherEvents returns up to limit events for the given watcher, ordered most recent first.
+func (s *StateDB) LoadWatcherEvents(watcherID string, limit int) ([]WatcherEventRow, error) {
+	rows, err := s.db.Query(`
+		SELECT id, watcher_id, dedup_key, sender, subject, routed_to, session_id, body, created_at
+		FROM watcher_events WHERE watcher_id = ?
+		ORDER BY created_at DESC LIMIT ?
+	`, watcherID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []WatcherEventRow
+	for rows.Next() {
+		var e WatcherEventRow
+		var createdAt int64
+		if err := rows.Scan(&e.ID, &e.WatcherID, &e.DedupKey, &e.Sender, &e.Subject, &e.RoutedTo, &e.SessionID, &e.Body, &createdAt); err != nil {
+			return nil, err
+		}
+		e.CreatedAt = time.Unix(createdAt, 0)
+		result = append(result, e)
+	}
+	return result, rows.Err()
+}
+
+// LookupWatcherIDByDedupKey returns the watcher_id for the first watcher_events
+// row with the given dedup_key. Returns an error if no row is found.
+// Used by the triageReaper to correlate a result.json back to its originating event (D-08).
+func (s *StateDB) LookupWatcherIDByDedupKey(dedupKey string) (string, error) {
+	var id string
+	err := s.db.QueryRow(
+		`SELECT watcher_id FROM watcher_events WHERE dedup_key = ? LIMIT 1`,
+		dedupKey,
+	).Scan(&id)
+	if err != nil {
+		return "", fmt.Errorf("statedb: lookup watcher_id by dedup_key %q: %w", dedupKey, err)
+	}
+	return id, nil
+}
+
+// UpdateWatcherStatus sets the status field on a watcher row.
+// Returns an error if no watcher with the given ID exists.
+func (s *StateDB) UpdateWatcherStatus(watcherID string, status string) error {
+	result, err := s.db.Exec(`
+		UPDATE watchers SET status = ?, updated_at = ? WHERE id = ?
+	`, status, time.Now().Unix(), watcherID)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("no watcher found with id=%q", watcherID)
+	}
+	return nil
+}

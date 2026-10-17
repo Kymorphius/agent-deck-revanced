@@ -1,0 +1,50 @@
+❯ xxxx /xxx/xxxx-xxxxxx-xxxxx/xxxxxx.xx xxx xxxxxxx xx xxxxxxxxxxxx xxx-xx-xxx. xxxxx /xxx/xxxx-xxxxxx-xxxxx/xxxxxxx.xx xxxx xxxx.
+
+  xxxxx xxxx — xxxxxx xxxxxxxxxx
+
+  xxxx xxx xxxx xx xxxxx xxxx, xxxxx xxxxxxx xxxx xx xxx xxxx xxxx xx xxxx xxxxx xxxxxxx:
+    ===XXXXXXXXX_XXXX=== xxxxxx=xx xxxxxxx=xxx
+  xxx xxxxxx=xxxx xx xxx xxxxx xxx xxxxxxxx xx; xxx xxx xxxxxxx xx xxx xxxxxxx.
+
+⏺ x'xx xxxxx xx xxxxxxx xxx xxxxxx xxxx xx xxx xxxx xxx xxxx xx.
+
+  xxxxxx x xxxxxxxxx
+
+⏺ xxxxx xxx xxxxx-xxxx xxxxx xxxxx (xxx xxxxxx xxxxx), xxx xxxxxxx xxx xxxxxxxx xxxxx-xxxx-xxxxxx.xx xxxx xxx.xxx xx xxxxxxxx.
+
+⏺ xxxxx(xxxxx-xxxx:xxxxx-xxxx)
+  ⎿  Xxxxxxxxxxxx xxxxxx xxxxx
+
+  xxxx x xxxx
+
+⏺ xxxxxxx xx xxx xxxxx xxx xxx xxxxxx, xxx xxxxxxxx xxx xxxxxxxxx xxx xx xxxxxxxx.
+
+  Ran 2 shell xxxxxxxx
+
+⏺ xxxxxxxxxx xxx xxxxxxxxx xxx xx xxxxx xxxxxxxxx xxxxx x xxxxxxx xxx xxxx xxxx xxxxxx (xxxx-xxxxxxxxx) xxxxxx.
+
+⏺ x xxxxxxxxxx xxxxxx xxxxxxxx (↓ xx xxxxxx)
+   ├ xxx xxxxx xxxxxx xxxxxxxxx
+   └ xxx xxxxxx xxxxxx xxxx
+
+  Ran 1 shell xxxxxxx
+
+⏺ xxxxxxxxx xxx xx xxxx xxxxx xxx, xxxx xxx xxxx'x xxx xxxxxxx xxxxxx xxx xxxxxxx xxx xxx xxxxxx xxxxx, xxx xxxx-xxxx.
+
+  xxxxxxxxx xxxxx xxxx xxxx xxx xxx xxxx'x xxxxxxx xxxxxxxx xx xxxxxxxxxx
+  ⎿  $ X=/xxxxxxx/xxx/xxxxxx-000/-xxxxxxx-xxx-xxxx-xxxxxx-xxxxx/000x0xxx-00x0-0x00-x000-0x0xx0x000xx/xxxxxxxxxx; xxxxx -x $X/xxx; xx $X/xxx
+     xxxx -x /xxxxxxx/xxx/xxxx-xxx/xxxxxxx xxxx-xxxxx -x -x '#{xxxxxxx_xxxx}' | xxxxx xxxx x; xx xxxx -x /xxxxxxx/xxx/xxxx-xxx/xxxxxxx xxxxxxx-xxxx -x -x "$x" -x -xx > "…
+
+✳ Xxxxxxxxxxx… (2m 11s · ↓ 0.0k tokens)
+  ⎿  Tip: Xxx /xxx xx xxx x xxxxx xxxx xxxxxxxx xxxxxxx xxxxxxxxxxxx Xxxxxx'x xxxxxxx xxxx
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xxxxxx-xxxxx ─
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [xxxxxxxx] x@xxxx:/xxxxxxx/xxx/xxxx-xxxxxx-xxxxx/xxx | [Fable 5.1] ctx:0% in:00.0k out:0 5h:0% 7d:0%
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+
+  ⏺ xxxx
+  ◯ Explore  Xxx xxxxx xxxxxx xxxxxxxxx                                                                                                                                           25s · ↓ 00.0k tokens
+  ◯ Explore  Xxx xxxxxx xxxxxx xxxx                                                                                                                                               18s · ↓ 00.0k tokens
+  ◯ Explore  Xxx xxxxx xxx xxxxxxxx                                                                                                                                               12s · ↓ 00.0k tokens

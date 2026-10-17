@@ -1,0 +1,50 @@
+ ⟨ ● │ ○ │ ○ ⟩  Agent Deck [_test]  ● 1 running • ○ 29 idle                                                                                                                                    v1.16.10 
+  All    ● 1   ◐ 0   ○ 29   ✕ Abnormal 0   ctrl+e 最近 • !@#$~ filter • 0 all • % open • ^ archived • t view • p pinned • * time                                                                        
+SESSIONS                                                               │ PREVIEW                                                                                                                        
+────────────────────────────────────────────────────────────────────── │ ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ 1   ▾ remotes/lab (30) ● 1                                            │ conductor-buddi-sharjeel  ● running                                                                                            
+ 2 ▶   ├─ ● conductor-buddi-sharjeel claude                            │                                                                                                                                
+ 3     ├─ ○ Sharjeel-r4-bug36 claude                                   │ Remote:  lab                                                                                                                   
+ 4     ├─ ○ Sharjeel-r5-bug37 claude                                   │ Path:    /home/ashesh/.local/share/agent-deck/conductor/sharjeel                                                               
+ 5     ├─ ○ Sharjeel-r6-bug38 claude                                   │ Tool:    claude                                                                                                                
+ 6     ├─ ○ Sharjeel-r3-bug39 claude                                   │ Group:   buddi/sharjeel/buddii                                                                                                 
+ 7     ├─ ○ Sharjeel-r4-bug40 claude                                   │ Viewers: unknown (remote did not report viewers)                                                                               
+ 8     ├─ ○ Sharjeel-r5-bug41 claude                                   │ accounts not polled yet                                                                                                        
+ 9     ├─ ○ Sharjeel-r6-bug42 claude                                   │                                                                                                                                
+10     ├─ ○ Sharjeel-r3-bug43 claude                                   │ Last response                                                                                                                  
+11     ├─ ○ Sharjeel-r4-bug44 claude                                   │ ----------------------------------------                                                                                       
+12     ├─ ○ Sharjeel-r5-bug45 claude                                   │   - Handover 05:00Z par hai.                                                                                                   
+13     ├─ ○ Sharjeel-r6-bug46 claude                                   │   - Worker ko ye bhi likha ke Yasir ki side ko diye hue emulator ko na chhere.                                                 
+14     ├─ ○ Sharjeel-r3-bug47 claude                                   │                                                                                                                                
+15     ├─ ○ Sharjeel-r4-bug48 claude                                   │  अच्छा, यह मेरा जो account है ना, यहाँ पे Sharjeel semantic वाला login है, लेकिन यह यहाँ पे Sharjeel buddii क्यों show कर रहा है?Conductor
+16     ├─ ○ Sharjeel-r5-bug49 claude                                   │                                                                                                                                
+17     ├─ ○ Sharjeel-r6-bug50 claude                                   │  इसमें देख के मुझे बताओ ज़रा कि यह क्या चीज़ है, यह क्यों हो रहा है।                                                                       
+18     ├─ ○ Sharjeel-r3-bug51 claude                                   │                                                                                                                                
+19     ├─ ○ Sharjeel-r4-bug52 claude                                   │   Ran 5 shell commands                                                                                                         
+20     ├─ ○ Sharjeel-r5-bug53 claude                                   │                                                                                                                                
+21     ├─ ○ Sharjeel-r6-bug54 claude                                   │ ● Maine check kar liya. Aap ka conductor semantic login par hi chal raha hai, buddii par nahi.                                 
+22     ├─ ○ Sharjeel-r3-bug55 claude                                   │   Asal login kaunsa hai                                                                                                        
+23     ├─ ○ Sharjeel-r4-bug56 claude                                   │   - Ye conductor: sharjeel-semantic, yani login sharjeel semantic.                                                             
+24     ├─ ○ Sharjeel-r5-bug57 claude                                   │   - Mere workers: do chalte hue workers ke process khud dekhe. Dono isi semantic login par chal rahe hain.                     
+25     ├─ ○ Sharjeel-r6-bug58 claude                                   │ tag-A                                                                                                                          
+26     ├─ ○ Sharjeel-r3-bug59 claude                                   │                                                                                                                                
+27     ├─ ○ Sharjeel-r4-bug60 claude                                   │ Press o to attach via SSH                                                                                                      
+28     ├─ ○ Sharjeel-r5-bug61 claude                                   │                                                                                                                                
+29     ├─ ○ Sharjeel-r6-bug62 claude                                   │                                                                                                                                
+30     ├─ ○ Sharjeel-r3-bug63 claude                                   │                                                                                                                                
+31     ├─ ○ Sharjeel-r4-bug64 claude                                   │                                                                                                                                
+                                                                       │                                                                                                                                
+                                                                       │                                                                                                                                
+                                                                       │                                                                                                                                
+                                                                       │                                                                                                                                
+                                                                       │                                                                                                                                
+                                                                       │                                                                                                                                
+                                                                       │                                                                                                                                
+                                                                       │                                                                                                                                
+                                                                       │                                                                                                                                
+                                                                       │                                                                                                                                
+                                                                       │                                                                                                                                
+                                                                       │                                                                                                                                
+                                                                       │                                                                                                                                
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Session:  o  Attach  n/N  New/Quick  g  Group  R  Restart  c  Copy  V  Copy pane  x  Send │  r  Rename  M  Move  d  Delete  D  Close     ↑↓ Nav │ +/- Move │ / Search │ G Global │ S Settings │ q Quit  

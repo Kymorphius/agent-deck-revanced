@@ -1,0 +1,6 @@
+1 ▶ ▾ alpha (4) '1
+2    └─ ○ visible-parent claude
+3      └─ ○ visible-child claude
+4     ▸ hidden (1)
+5     ▾ visible (1)
+6      └─ ○ sibling-session claude

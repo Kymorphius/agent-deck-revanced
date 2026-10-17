@@ -1,0 +1,519 @@
+package tmux
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/logging"
+)
+
+var pipeLog = logging.ForComponent("pipe")
+
+const (
+	controlPipeConnectAttempts  = 3
+	controlPipeHandshakeTimeout = 4 * time.Second
+	controlPipeCommandTimeout   = 5 * time.Second
+	controlPipeRetryBackoff     = 150 * time.Millisecond
+
+	// controlPipeEOFExitGrace is how long Close() waits for the child
+	// `tmux -C` process to self-exit after stdin EOF before escalating to
+	// a signal-driven shutdown. Empirically, tmux 3.6a's `tmux -C` emits
+	// %exit and exits in 1-4ms after stdin closes, even under notification
+	// load and 50-way concurrent close. 200ms is ~50× the observed max —
+	// generous slack for scheduler jitter while still keeping shutdown
+	// snappy when a client is genuinely stuck.
+	controlPipeEOFExitGrace = 200 * time.Millisecond
+)
+
+// ControlPipe wraps a persistent `tmux -C -u attach-session -t <name>` process.
+// It provides event-driven output detection via %output events and
+// zero-subprocess command execution through the stdin/stdout pipe.
+// It is deliberately headless: it never opens /dev/tty, so detached callers
+// without a controlling terminal (the #1114 failure mode) are supported.
+type ControlPipe struct {
+	sessionName string
+	socketName  string // tmux -L value; "" means user's default server
+	cmd         *exec.Cmd
+	// pgid is the process group cmd was given at spawn, captured while it was
+	// certainly unreaped. 0 means it leads no group of its own. See
+	// ownProcessGroupID and reapWithEOFGrace.
+	pgid   int
+	stdin  io.WriteCloser
+	stdout io.ReadCloser
+
+	// Event channel: fires when the session produces output
+	outputEvents chan struct{}
+
+	// Event channel: fires when a window is added or closed
+	windowEvents chan struct{}
+
+	// Event channel: fires when a client attaches to, switches or detaches
+	// from a session on the server, this pipe's own attach included
+	// (latest_viewer.go)
+	clientEvents chan struct{}
+
+	// Command/response serialization
+	cmdMu      sync.Mutex
+	responseCh chan commandResponse
+
+	// Readiness: signaled after initial %begin/%end handshake consumed
+	ready        chan struct{}
+	readyOnce    sync.Once
+	handshakeErr error // non-nil if handshake received %error (e.g. session not found)
+
+	// State
+	mu         sync.RWMutex
+	alive      bool
+	lastOutput time.Time
+
+	// Lifecycle
+	done      chan struct{}
+	closeOnce sync.Once
+
+	// waitOnce guards cmd.Wait() so exactly one of reader() (natural EOF)
+	// and Close() (manual shutdown) reaps the child. Without this, a tmux
+	// subprocess that exited on its own became a zombie until Close() was
+	// eventually called — or forever if it never was (#677).
+	waitOnce sync.Once
+}
+
+type commandResponse struct {
+	output string
+	err    error
+}
+
+// NewControlPipe starts a tmux control mode pipe attached to the given session
+// on the given socket. socketName is the tmux `-L <name>` selector captured at
+// session-creation time (Instance.TmuxSocketName / Session.SocketName); pass ""
+// to target the user's default tmux server. Blocks until the initial handshake
+// completes (or a short timeout), so the pipe is ready for SendCommand
+// immediately after return. Retries a few times to smooth over transient
+// tmux/control-mode startup failures.
+func NewControlPipe(sessionName, socketName string) (*ControlPipe, error) {
+	var lastErr error
+	for attempt := 1; attempt <= controlPipeConnectAttempts; attempt++ {
+		cp, err := newControlPipeOnce(sessionName, socketName)
+		if err == nil {
+			return cp, nil
+		}
+		lastErr = err
+		if attempt == controlPipeConnectAttempts {
+			break
+		}
+		pipeLog.Debug(
+			"pipe_connect_retry",
+			slog.String("session", sessionName),
+			slog.String("socket", socketName),
+			slog.Int("attempt", attempt),
+			slog.String("error", err.Error()),
+		)
+		time.Sleep(time.Duration(attempt) * controlPipeRetryBackoff)
+	}
+	return nil, lastErr
+}
+
+// ownProcessGroupID returns the process-group id a just-started child leads, or
+// 0 when it leads none of its own.
+//
+// Read once, here, while the child is certainly unreaped: a child started with
+// Setpgid and no explicit Pgid becomes the leader of a group whose id is its own
+// pid, so the group id is known at spawn and never has to be looked up from a
+// pid later — which is the lookup that can answer for a stranger. A child that
+// joined an existing group (Pgid != 0) leads nothing, and killing the group it
+// merely belongs to would reach processes this pipe never started.
+func ownProcessGroupID(cmd *exec.Cmd) int {
+	if cmd.Process == nil || cmd.SysProcAttr == nil {
+		return 0
+	}
+	if !cmd.SysProcAttr.Setpgid || cmd.SysProcAttr.Pgid != 0 {
+		return 0
+	}
+	return cmd.Process.Pid
+}
+
+func newControlPipeOnce(sessionName, socketName string) (*ControlPipe, error) {
+	cmd := tmuxExec(socketName, "-u", "-C", "attach-session", "-t", sessionName)
+	// Put in own process group so we can kill the entire group on shutdown
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdin pipe: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		stdin.Close()
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+
+	if err := commandStart(cmd); err != nil {
+		stdin.Close()
+		return nil, fmt.Errorf("start tmux -C: %w", err)
+	}
+
+	cp := &ControlPipe{
+		sessionName:  sessionName,
+		socketName:   socketName,
+		cmd:          cmd,
+		pgid:         ownProcessGroupID(cmd),
+		stdin:        stdin,
+		stdout:       stdout,
+		outputEvents: make(chan struct{}, 64),
+		windowEvents: make(chan struct{}, 8),
+		clientEvents: make(chan struct{}, 1),
+		responseCh:   make(chan commandResponse, 1),
+		ready:        make(chan struct{}),
+		alive:        true,
+		done:         make(chan struct{}),
+	}
+
+	go cp.reader()
+
+	// Wait for initial handshake to complete so the pipe is ready for commands.
+	// tmux sends a %begin/%end pair on connect; we must consume it before
+	// any SendCommand call, otherwise the response gets mixed up.
+	select {
+	case <-cp.ready:
+	case <-cp.done:
+		cp.Close()
+		return nil, fmt.Errorf("pipe died during handshake for session %s", sessionName)
+	case <-time.After(controlPipeHandshakeTimeout):
+		// Timeout waiting for handshake, but pipe may still work
+		pipeLog.Debug("pipe_handshake_timeout", slog.String("session", sessionName))
+	}
+
+	// Check if handshake received an error (e.g. "can't find session")
+	if cp.handshakeErr != nil {
+		cp.Close()
+		return nil, fmt.Errorf("session %s: %w", sessionName, cp.handshakeErr)
+	}
+
+	pipeLog.Debug("pipe_connected", slog.String("session", sessionName))
+	return cp, nil
+}
+
+// reap calls cmd.Wait() exactly once, harvesting the child's exit status and
+// freeing its process-table entry. Safe to call from any goroutine; extra
+// calls are no-ops. Required to prevent zombie accumulation (#677).
+func (cp *ControlPipe) reap() {
+	cp.waitOnce.Do(func() {
+		_ = cp.cmd.Wait()
+	})
+}
+
+// reader is the goroutine that parses tmux control mode protocol events.
+// It handles %output, %begin/%end/%error for command responses, and
+// silently skips all other %-prefixed control lines.
+func (cp *ControlPipe) reader() {
+	defer func() {
+		cp.mu.Lock()
+		cp.alive = false
+		cp.mu.Unlock()
+		// Reap the child before signaling done so anyone watching Done()
+		// can rely on the process being fully torn down (#677).
+		cp.reap()
+		close(cp.done)
+		pipeLog.Debug("pipe_reader_exited", slog.String("session", cp.sessionName))
+	}()
+
+	scanner := bufio.NewScanner(cp.stdout)
+	// 2MB buffer for large capture-pane outputs
+	scanner.Buffer(make([]byte, 2*1024*1024), 2*1024*1024)
+
+	var (
+		inCapture bool
+		lines     []string
+		isReady   bool // tracks whether initial handshake has completed
+	)
+
+	for scanner.Scan() {
+		raw := scanner.Text()
+
+		// All %-prefixed lines are control mode protocol messages
+		if strings.HasPrefix(raw, "%") {
+			if strings.HasPrefix(raw, "%output") {
+				cp.mu.Lock()
+				cp.lastOutput = time.Now()
+				cp.mu.Unlock()
+
+				// Non-blocking send to output events channel
+				select {
+				case cp.outputEvents <- struct{}{}:
+				default:
+				}
+			} else if strings.HasPrefix(raw, "%window-add") || strings.HasPrefix(raw, "%window-close") {
+				// Window created or closed — notify listeners
+				select {
+				case cp.windowEvents <- struct{}{}:
+				default:
+				}
+			} else if strings.HasPrefix(raw, "%client-detached ") ||
+				strings.HasPrefix(raw, "%client-session-changed ") ||
+				strings.HasPrefix(raw, "%session-changed ") {
+				// A client came or went: the window's latest slot may now
+				// be held by a control client (latest_viewer.go)
+				select {
+				case cp.clientEvents <- struct{}{}:
+				default:
+				}
+			} else if strings.HasPrefix(raw, "%begin ") {
+				inCapture = true
+				lines = lines[:0]
+			} else if strings.HasPrefix(raw, "%end ") {
+				inCapture = false
+				if !isReady {
+					// First %end completes the initial handshake.
+					// Discard this response (it's the attach acknowledgment).
+					isReady = true
+					cp.readyOnce.Do(func() { close(cp.ready) })
+					continue
+				}
+				result := strings.Join(lines, "\n")
+				select {
+				case cp.responseCh <- commandResponse{output: result}:
+				default:
+					pipeLog.Debug("response_dropped", slog.String("session", cp.sessionName))
+				}
+			} else if strings.HasPrefix(raw, "%error ") {
+				inCapture = false
+				if !isReady {
+					// Handshake got an error (typically "can't find session").
+					// Record the error so NewControlPipe can detect non-existent sessions.
+					parts := strings.Fields(raw)
+					if len(parts) > 3 {
+						cp.handshakeErr = fmt.Errorf("%s", strings.Join(parts[3:], " "))
+					} else {
+						cp.handshakeErr = fmt.Errorf("handshake error: %s", raw)
+					}
+					isReady = true
+					cp.readyOnce.Do(func() { close(cp.ready) })
+					continue
+				}
+				errMsg := raw
+				parts := strings.Fields(raw)
+				if len(parts) > 3 {
+					errMsg = strings.Join(parts[3:], " ")
+				}
+				select {
+				case cp.responseCh <- commandResponse{err: fmt.Errorf("tmux error: %s", errMsg)}:
+				default:
+				}
+			}
+			// All other % lines (%exit, %session-changed, etc.) silently skipped.
+			// Critical: must NOT fall through to inCapture collection below,
+			// because %output events interleave with capture-pane response data.
+			continue
+		}
+
+		// Non-% lines during capture collection are response data
+		if inCapture {
+			lines = append(lines, raw)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		pipeLog.Debug("pipe_scanner_error", slog.String("session", cp.sessionName), slog.String("error", err.Error()))
+	}
+}
+
+// SendCommand sends a command through the control mode pipe and waits for the response.
+// Commands are serialized via cmdMu. Returns the response text or an error.
+// Timeout is slightly relaxed to reduce false negatives when tmux is busy.
+func (cp *ControlPipe) SendCommand(command string) (string, error) {
+	cp.mu.RLock()
+	if !cp.alive {
+		cp.mu.RUnlock()
+		return "", fmt.Errorf("pipe not alive for session %s", cp.sessionName)
+	}
+	stdin := cp.stdin
+	cp.mu.RUnlock()
+
+	// alive and stdin are set together by the constructor, so a live pipe
+	// normally has one. Report it rather than trusting the pairing: writing to
+	// a nil stdin panics inside fmt, and every caller of this reaches it from
+	// backgroundStatusUpdate, whose deferred recover swallows the panic and
+	// abandons the whole status sweep — the TUI just stops updating, with one
+	// background_update_panic line as the only evidence. An error here is
+	// handled: RefreshAllActivities records it and moves to the next pipe.
+	if stdin == nil {
+		return "", fmt.Errorf("pipe has no stdin for session %s", cp.sessionName)
+	}
+
+	cp.cmdMu.Lock()
+	defer cp.cmdMu.Unlock()
+
+	// Drain any stale response
+	select {
+	case <-cp.responseCh:
+	default:
+	}
+
+	// Send command through stdin
+	_, err := fmt.Fprintln(stdin, command)
+	if err != nil {
+		return "", fmt.Errorf("write to pipe: %w", err)
+	}
+
+	// Wait for response with timeout
+	select {
+	case resp := <-cp.responseCh:
+		if resp.err != nil {
+			return "", resp.err
+		}
+		return resp.output, nil
+	case <-time.After(controlPipeCommandTimeout):
+		return "", fmt.Errorf("command timed out after %s: %s", controlPipeCommandTimeout, command)
+	case <-cp.done:
+		return "", fmt.Errorf("pipe closed during command: %s", command)
+	}
+}
+
+// CapturePaneVia sends capture-pane through the control mode pipe.
+// Returns the pane content without spawning any subprocess.
+func (cp *ControlPipe) CapturePaneVia() (string, error) {
+	return cp.SendCommand(fmt.Sprintf("capture-pane -t %s -p -e", cp.sessionName))
+}
+
+// OutputEvents returns a channel that fires when the session produces output.
+// Multiple rapid outputs may be coalesced into fewer channel sends.
+func (cp *ControlPipe) OutputEvents() <-chan struct{} {
+	return cp.outputEvents
+}
+
+// WindowEvents returns a channel that fires when a window is added or closed.
+func (cp *ControlPipe) WindowEvents() <-chan struct{} {
+	return cp.windowEvents
+}
+
+// ClientEvents returns a channel that fires when a client attaches to,
+// switches or detaches from a session on the server. Bursts are coalesced.
+func (cp *ControlPipe) ClientEvents() <-chan struct{} {
+	return cp.clientEvents
+}
+
+// LastOutputTime returns the time of the most recent %output event.
+func (cp *ControlPipe) LastOutputTime() time.Time {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	return cp.lastOutput
+}
+
+// IsAlive returns true if the control mode process is still running.
+func (cp *ControlPipe) IsAlive() bool {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	return cp.alive
+}
+
+// Done returns a channel that closes when the pipe exits.
+func (cp *ControlPipe) Done() <-chan struct{} {
+	return cp.done
+}
+
+// Close shuts down the control mode pipe.
+//
+// Teardown is staged: (1) close stdin so the `tmux -C -u attach-session`
+// child sees EOF and orderly-detaches via the control protocol's %exit
+// path; (2) wait up to controlPipeEOFExitGrace (200ms) for that to
+// complete — the vast majority of cases settle in 1-4ms; (3) only on
+// timeout, escalate to softKillProcessGroup (SIGTERM+grace, SIGKILL
+// fallback) for stuck or wedged clients.
+//
+// The previous implementation went straight from stdin.Close() to
+// softKillProcessGroup with no wait. Even the SIGTERM-with-grace form
+// races tmux's server-side control_notify_client_detached walk
+// (tmux/tmux#4980, present in macOS Homebrew tmux 3.6a) — the bug is
+// server-side, so any signal-driven detach can trigger it. Letting the
+// child self-exit on EOF goes through the protocol's orderly-detach
+// codepath instead, which empirically does not trigger the crash.
+// See ~/.claude/scratchpad/agent-deck/tmux-issues/PLAN.md "Empirical
+// validation" for the measurements.
+func (cp *ControlPipe) Close() {
+	cp.closeOnce.Do(func() {
+		cp.mu.Lock()
+		cp.alive = false
+		cp.mu.Unlock()
+
+		// Stage 1: stdin EOF triggers tmux's orderly-detach %exit path.
+		cp.stdin.Close()
+
+		// Stage 2 (fast path) and Stage 3 (signal escalation fallback).
+		// reapWithEOFGrace runs cp.reap() in a goroutine so we get a
+		// timeout, while still routing the underlying cmd.Wait() through
+		// the waitOnce gate that protects against a concurrent Wait from
+		// reader() (#677).
+		usedFallback := reapWithEOFGrace(cp.reap, cp.cmd.Process, cp.pgid, controlPipeEOFExitGrace, controlClientKillGrace)
+		if usedFallback {
+			pipeLog.Warn("eof_fallback_fired",
+				slog.String("session", cp.sessionName),
+				slog.Duration("eof_grace", controlPipeEOFExitGrace))
+		}
+
+		pipeLog.Debug("pipe_closed", slog.String("session", cp.sessionName))
+	})
+}
+
+// reapWithEOFGrace runs reap in a goroutine and waits up to eofGrace for
+// it to complete. If reap doesn't return in time, it falls back to
+// soft-killing the process group (or single pid if pgid lookup fails).
+//
+// The expected fast path: caller closes stdin first, the child detects
+// EOF and exits, reap returns within a few milliseconds. The fallback
+// exists for genuinely stuck or wedged children that don't act on EOF.
+//
+// Returns true if the signal-driven fallback was used.
+//
+// reap is a function (rather than a *exec.Cmd) so callers can route the
+// underlying cmd.Wait through their own once-guard — the production
+// caller (ControlPipe.Close) needs this to coordinate with reader()'s
+// concurrent reap (#677); the test caller passes a plain wrapper.
+//
+// pgid is the process group the child was given AT SPAWN (0 if it leads no
+// group of its own). It is not looked up here on purpose: a lookup keyed on
+// proc.Pid answers for whoever holds that number NOW, and once the child has
+// been waited on that is not necessarily the child. That is the same recycled-
+// pid hazard the single-pid arm below is guarded against, but resolved into a
+// whole process group and then SIGTERMed and SIGKILLed — a strictly wider blast
+// radius on what used to be the unguarded arm.
+//
+// Both arms are gated on the handle. os.Process.Signal reports ErrProcessDone
+// once the process has been waited on, and only while it has NOT been waited on
+// is its pid — and therefore the pgid it leads — guaranteed still to name the
+// child. Reaching the fallback with a reaped handle is not hypothetical: reap
+// shares a once-guard with reader(), so reader() can complete the Wait while
+// this call is still waiting for its own turn to return.
+func reapWithEOFGrace(reap func(), proc *os.Process, pgid int, eofGrace, killGrace time.Duration) (usedFallback bool) {
+	reapDone := make(chan struct{})
+	go func() {
+		reap()
+		close(reapDone)
+	}()
+	select {
+	case <-reapDone:
+		return false
+	case <-time.After(eofGrace):
+	}
+	stillOurs := func() bool { return proc != nil && proc.Signal(syscall.Signal(0)) == nil }
+	if stillOurs() {
+		if pgid > 0 {
+			// stillOurs is re-asked inside, immediately before the escalation:
+			// this check is only true of the instant it runs in, and the
+			// escalation is a whole grace later.
+			_ = softKillProcessGroup(pgid, killGrace, stillOurs)
+		} else {
+			// The child leads no group of its own, so there is nothing wider to
+			// kill than the child. Through its handle, not its pid.
+			_ = softKillProcessHandle(proc, killGrace)
+		}
+	}
+	<-reapDone
+	return true
+}

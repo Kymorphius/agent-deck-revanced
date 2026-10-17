@@ -1,0 +1,1296 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
+	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/quota"
+	"github.com/asheshgoplani/agent-deck/internal/session"
+)
+
+var hookHandlerLog = logging.ForComponent(logging.CompSession)
+
+// maxHookPayloadSize limits the size of JSON payloads read from stdin
+// to prevent denial-of-service via oversized input.
+const maxHookPayloadSize = 1 << 20 // 1 MB
+
+// validInstanceID matches UUID-style instance IDs to prevent path traversal.
+var validInstanceID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+
+// hookPayload represents the JSON payload Claude Code sends to hooks via stdin.
+// Only the fields we need are decoded; unknown fields are ignored.
+type hookPayload struct {
+	HookEventName  string          `json:"hook_event_name"`
+	SessionID      string          `json:"session_id"`
+	ConversationID string          `json:"conversation_id"`
+	Source         string          `json:"source"`
+	Matcher        json.RawMessage `json:"matcher,omitempty"`
+	// Cwd is the session's working directory (PROJECT_DIR) as reported by
+	// Claude Code on each hook event. Issue #1233: when a running session's
+	// registered worktree is renamed/removed, this points at a path that no
+	// longer exists; we use it to degrade gracefully rather than erroring on
+	// every tool call. Empty when the agent doesn't send a cwd (older Claude
+	// Code) — treated as "present" so behavior is unchanged.
+	Cwd string `json:"cwd"`
+	// StopHookActive is Claude Code's flag: true when this Stop is a
+	// continuation induced by a previous Stop-hook block. Issue #1225 uses it
+	// to bound consecutive inbox-drain blocks so the conductor cannot loop
+	// forever (resets the budget on a genuine user turn boundary).
+	//
+	// Audit B8: a *bool (not bool) so we can distinguish ABSENT from explicit
+	// false. A missing field must NOT be read as "fresh user turn" (which would
+	// reset the loop guard every Stop); resolveStopHookActive fails safe to true.
+	StopHookActive *bool `json:"stop_hook_active"`
+
+	// Comms Ledger producer fields (docs/comms.md): the text each harness
+	// already puts on the wire, forwarded to the daemon's spool instead of
+	// discarded. Unknown to a harness that does not send them.
+	// Decoded leniently (raw, then read as a string) so a harness that
+	// sends an unexpected type for one of them never makes the whole
+	// payload undecodable for the status path.
+	TranscriptPath       json.RawMessage `json:"transcript_path"`
+	TurnID               json.RawMessage `json:"turn_id"`                // Codex hooks only; Claude's Stop has none
+	LastAssistantMessage json.RawMessage `json:"last_assistant_message"` // Claude Stop
+	Prompt               json.RawMessage `json:"prompt"`                 // Claude UserPromptSubmit
+}
+
+// rawString reads a leniently decoded field as a string ("" for anything
+// that is not a JSON string).
+func rawString(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	return s
+}
+
+// commsSpoolEdge maps a Claude Code hook event to the comms spool edge it
+// carries. Empty edge: nothing to spool for this event. P1 enables two
+// producers only (docs/comms.md): Claude through this handler and Codex
+// through codex-notify. A Codex Stop hook (recognisable by its turn_id,
+// which Claude's Stop does not carry) is never spooled here, so a user who
+// also points Codex hooks at hook-handler cannot duplicate a turn the
+// notify line already produced. Every other harness is status-only in P1.
+func commsSpoolEdge(p hookPayload) (harness, edge, text, prompt string) {
+	turnID := rawString(p.TurnID)
+	switch normalizeHookEventKey(p.HookEventName) {
+	case "userpromptsubmit":
+		if turnID != "" {
+			return "", "", "", "" // Codex UserPromptSubmit
+		}
+		return "claude", session.CommsEdgePromptStart, "", rawString(p.Prompt)
+	case "stop":
+		if turnID != "" || p.ConversationID != "" {
+			return "", "", "", "" // Codex Stop (notify owns the turn) or Cursor stop (status only)
+		}
+		return "claude", session.CommsEdgeTurnEnd, rawString(p.LastAssistantMessage), ""
+	}
+	return "", "", "", ""
+}
+
+// spoolCommsFromHook forwards the hook's text to the daemon's spool when
+// the ledger is on. It never writes the ledger itself (the #824 rule), never
+// blocks on anything but one small file write, and never fails the hook.
+func spoolCommsFromHook(instanceID string, p hookPayload) {
+	harness, edge, text, prompt := commsSpoolEdge(p)
+	if edge == "" || !session.CommsLedgerEnabled() {
+		return
+	}
+	sessionID := strings.TrimSpace(p.SessionID)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(p.ConversationID)
+	}
+	transcript := ""
+	if harness == "claude" {
+		if clean, ok := session.ValidateTranscriptPath(rawString(p.TranscriptPath)); ok {
+			transcript = clean
+		}
+	}
+	if err := session.WriteCommsSpool(session.CommsSpoolEntry{
+		Harness: harness, Event: p.HookEventName, Edge: edge, Instance: instanceID,
+		SessionID: sessionID, TurnID: strings.TrimSpace(rawString(p.TurnID)), Text: text, Prompt: prompt,
+		TranscriptPath: transcript, Cwd: strings.TrimSpace(p.Cwd), TSignal: time.Now().UnixMilli(),
+	}); err != nil {
+		hookHandlerLog.Warn("comms_spool_write_failed",
+			slog.String("instance", instanceID), slog.String("event", p.HookEventName), slog.String("error", err.Error()))
+	}
+}
+
+// resolveStopHookActive fails safe (audit B8): an absent stop_hook_active is
+// treated as active=true (this Stop counts against the MaxStopHookBlocks budget)
+// rather than false (which would reset the budget). Only an EXPLICIT false — a
+// genuine user turn boundary that Claude Code is asserting — resets the guard.
+// This keeps the loop bounded even if Claude Code ever omits the field.
+func resolveStopHookActive(p hookPayload) bool {
+	return p.StopHookActive == nil || *p.StopHookActive
+}
+
+// hookStatusFile is the JSON written to ~/.agent-deck/hooks/{instance_id}.json
+type hookStatusFile struct {
+	Status                   string `json:"status"`
+	SessionID                string `json:"session_id,omitempty"`
+	Event                    string `json:"event"`
+	Timestamp                int64  `json:"ts"`
+	CodexStartedGeneration   string `json:"codex_started_generation,omitempty"`
+	CodexCompletedGeneration string `json:"codex_completed_generation,omitempty"`
+	CodexStartedSessionID    string `json:"codex_started_session_id,omitempty"`
+	CodexCompletedSessionID  string `json:"codex_completed_session_id,omitempty"`
+	CodexTurnSequence        uint64 `json:"codex_turn_sequence,omitempty"`
+	CodexStartedSequence     uint64 `json:"codex_started_sequence,omitempty"`
+	CodexCompletedSequence   uint64 `json:"codex_completed_sequence,omitempty"`
+	HookGeneration           string `json:"hook_generation,omitempty"`
+	Sequence                 uint64 `json:"sequence,omitempty"`
+	InitialMessagePending    bool   `json:"initial_message_pending,omitempty"`
+	// DoneStatus/DoneSummary carry a worker-printed completion sentinel
+	// detected on the Stop edge (issue #1186). omitempty so ordinary Stops
+	// (no sentinel) leave the fields absent, which the daemon reads as
+	// "no finished event to emit."
+	DoneStatus  string `json:"done_status,omitempty"`
+	DoneSummary string `json:"done_summary,omitempty"`
+	// TranscriptPath is persisted ONLY when the Stop-edge sentinel scan was
+	// inconclusive because the turn's assistant record had not flushed yet
+	// (issue #1186 flush race). The daemon re-scans this path on its poll
+	// loop; the synchronous Stop hook (#1225) must not wait out the flush.
+	TranscriptPath string `json:"transcript_path,omitempty"`
+	// Cwd is the working directory the hook payload reported for this event.
+	// Issue #1729: the session-binding path uses it as same-session evidence —
+	// a candidate session id whose cwd is provably outside the instance's
+	// declared paths (e.g. a headless `claude -p` worker at $TMPDIR that
+	// inherited AGENTDECK_INSTANCE_ID) must never bind. omitempty keeps legacy
+	// files byte-identical when the agent sends no cwd.
+	Cwd string `json:"cwd,omitempty"`
+}
+
+type hookGenerationControl struct {
+	Generation            string `json:"generation"`
+	NextSequence          uint64 `json:"next_sequence"`
+	InitialMessagePending bool   `json:"initial_message_pending,omitempty"`
+}
+
+// normalizeHookEventKey folds hook event names from Claude (PascalCase), Cursor
+// (camelCase), Hermes (snake_case), and Codex into a single lookup key.
+func normalizeHookEventKey(event string) string {
+	s := strings.ToLower(strings.TrimSpace(event))
+	return strings.NewReplacer("_", "", "-", "", " ", "").Replace(s)
+}
+
+func isStopHookEvent(event string) bool {
+	return normalizeHookEventKey(event) == "stop"
+}
+
+// mapEventToStatus maps a hook event to an agent-deck status string.
+// Status semantics in agent-deck:
+//   - "running" = agent is actively processing (green)
+//   - "waiting" = agent is at the prompt, waiting for user input (orange)
+//   - "dead"    = Session ended
+func mapEventToStatus(event string) string {
+	switch normalizeHookEventKey(event) {
+	case "sessionstart":
+		return "waiting" // at initial prompt, waiting for user input
+	case "beforeagent":
+		return "running" // Gemini received user input and is processing
+	case "afteragent":
+		return "waiting" // Gemini completed response, back to waiting
+	case "prellmcall":
+		return "running" // Hermes: turn started (LLM/tool-calling loop), agent is working
+	case "postllmcall":
+		return "waiting" // Hermes: turn complete, final response produced, back at prompt
+	case "pretoolcall", "pretooluse":
+		return "running" // executing a tool call
+	case "posttoolcall":
+		// Hermes only (other tools' post-tool events normalize to
+		// "posttooluse"). Mid-turn a finished tool call means the LLM is
+		// generating the next step, not that the agent is back at the prompt;
+		// post_llm_call owns the turn-end waiting edge.
+		return "running"
+	case "posttooluse", "posttoolusefailure":
+		return "waiting" // finished a tool call, back at prompt
+	case "onsessionstart":
+		return "waiting" // Hermes session started, waiting for first prompt
+	case "onsessionend":
+		// Hermes fires on_session_end at the end of EVERY run_conversation
+		// call — once per user message — NOT at process exit. It is the
+		// turn-end edge, and the only one an interrupted turn gets
+		// (post_llm_call is skipped when interrupted). Mapping it to dead
+		// showed an error ✕ after every completed turn.
+		return "waiting"
+	case "onsessionfinalize":
+		return "dead" // Hermes process exit / session reset — the real session end
+	case "turnstart":
+		return "running" // pi: a turn began (one LLM response + its tool calls)
+	case "turnend":
+		return "waiting" // pi: the turn finished, back at the prompt
+	case "sessionshutdown":
+		// pi fires session_shutdown before a session runtime is torn down —
+		// process exit as well as the /new, /resume and fork replacements. It
+		// is the real session end, the pi analogue of Hermes'
+		// on_session_finalize, so it maps to dead rather than waiting; a
+		// replacement flow immediately emits session_start again, which
+		// restores waiting.
+		return "dead"
+	case "preapirequest", "postapirequest":
+		// Per-API-call heartbeat within a turn: refreshes "running" so a
+		// long multi-step turn doesn't outlive the hook freshness window
+		// and fade to idle mid-work.
+		return "running"
+	case "userpromptsubmit", "beforesubmitprompt":
+		return "running" // user sent prompt, agent is processing
+	case "stop":
+		return "waiting" // agent finished, back at prompt waiting for user
+	case "permissionrequest":
+		return "waiting" // agent needs permission approval
+	case "notification":
+		// Notification events with permission_prompt|elicitation_dialog matcher
+		// are mapped to "waiting" by the caller after checking the matcher.
+		// Default notification is informational, treat as no status change.
+		return ""
+	case "sessionend":
+		return "dead"
+	case "precompact":
+		return "" // Observability only; context-% monitoring handles /clear proactively
+	default:
+		return ""
+	}
+}
+
+// handleHookHandler processes a Claude Code hook event.
+// Reads JSON from stdin, maps the event to a status, and writes a status file.
+// matrix/hardened: legacy test callers do not terminate the process; the CLI
+// dispatcher handles the explicit prompt-protection blocking exit code.
+func handleHookHandler() {
+	_ = handleHookHandlerExitCode()
+}
+
+// matrix/hardened: only an opted-in Claude prompt rejection returns 2. All
+// existing status/context paths keep their original non-blocking behavior.
+func handleHookHandlerExitCode() (exitCode int) {
+	instanceID := os.Getenv("AGENTDECK_INSTANCE_ID")
+	instanceValid := instanceID != "" && validInstanceID.MatchString(instanceID) && !strings.Contains(instanceID, "..")
+	guardState := readHookPromptGuardState()
+	// matrix/hardened: retain the no-stdin fast path when message protection
+	// is absent, including sessions not managed by agent-deck.
+	if !instanceValid && !guardState.enabled {
+		return
+	}
+
+	var data []byte
+	var err error
+	// matrix/hardened: scan guard metadata through EOF without retaining large
+	// prompts; then keep the legacy handler's original 1 MiB payload behavior.
+	if guardState.enabled {
+		metadata, prefix, scanErr := readHookPromptMetadata(os.Stdin)
+		if scanErr != nil {
+			if isClaudePromptGuardEvent(metadata) {
+				fmt.Fprintln(os.Stderr, "Claude 本机消息保护：消息钩子数据无效，已阻止本条消息；请检查钩子配置后重试。")
+				return 2
+			}
+			return
+		}
+		if rejectHookPromptGuard(guardState, metadata) {
+			return 2
+		}
+		if len(prefix) > maxHookPayloadSize {
+			return
+		}
+		data = prefix
+	} else {
+		// Read stdin with size limit to prevent DoS via oversized payloads.
+		data, err = io.ReadAll(io.LimitReader(os.Stdin, maxHookPayloadSize))
+	}
+	if err != nil || len(data) == 0 {
+		return
+	}
+
+	var payload hookPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return
+	}
+	// matrix/hardened: guard before ID/cwd early exits or any spool, running
+	// status, or inbox consumption. Host protection also covers unmanaged CLI.
+	if !instanceValid {
+		return
+	}
+
+	// Issue #1233: gracefully degrade when the session's working directory
+	// (PROJECT_DIR / cwd) has been renamed or removed out from under a running
+	// session — e.g. a git worktree renamed while the session is live. Rather
+	// than emitting a FATAL-class error on every single tool call, log a single
+	// WARN (deduped per instance+path) that points at the moved path and
+	// suggests `agent-deck session move`, then soft-skip this invocation.
+	if projectDirMissing(payload.Cwd) {
+		warnProjectDirMissingOnce(instanceID, payload.Cwd)
+		return
+	}
+
+	// Comms Ledger: spool the text this event carries (Claude Stop and
+	// UserPromptSubmit only in P1).
+	spoolCommsFromHook(instanceID, payload)
+
+	// Map event to status
+	status := mapEventToStatus(payload.HookEventName)
+
+	// Special handling for Notification events: only map to "waiting" if
+	// the matcher indicates a permission prompt or elicitation dialog
+	if normalizeHookEventKey(payload.HookEventName) == "notification" && payload.Matcher != nil {
+		var matcher string
+		if err := json.Unmarshal(payload.Matcher, &matcher); err == nil {
+			if matcher == "permission_prompt" || matcher == "elicitation_dialog" {
+				status = "waiting"
+			}
+		}
+	}
+
+	if status == "" {
+		// Unknown or unhandled event, nothing to write
+		return
+	}
+
+	// Issue #1186: on the Stop edge — the completion edge — scan the transcript
+	// tail for a worker-printed completion sentinel. When present, persist the
+	// parsed outcome into the hook status file so the daemon can emit a
+	// distinct "finished" event to the parent instead of the conductor having
+	// to poll artifacts. When the turn's assistant record has not flushed yet
+	// (Claude Code can fire Stop before appending it), persist the transcript
+	// path instead and let the daemon finish the scan — the Stop hook runs
+	// SYNCHRONOUSLY (#1225), so waiting out the flush here would add turn-end
+	// latency to every managed session. Absent on ordinary mid-task Stops, so
+	// the existing "waiting" behavior is unchanged.
+	sessionID := strings.TrimSpace(payload.SessionID)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(payload.ConversationID)
+	}
+
+	if isStopHookEvent(payload.HookEventName) {
+		writeHookStatusWithScan(instanceID, status, sessionID, payload.HookEventName, payload.Cwd, detectDoneSentinel(data))
+	} else {
+		writeHookStatus(instanceID, status, sessionID, payload.HookEventName, payload.Cwd)
+	}
+
+	// #572: Sync agent-deck title from Claude Code's --name / /rename value.
+	// Event-driven so user-facing rename lands within one hook tick; silent
+	// no-op when no name is set (sessions started without --name keep the
+	// existing agent-deck adjective-noun title).
+	applyClaudeTitleSync(instanceID, sessionID)
+
+	// Propagate Claude Code's /cd working-directory change (v2.1.169+) so the
+	// TUI/web display and transcript lookups track the current cwd.
+	applyClaudeCwdSync(instanceID, payload.Cwd)
+
+	// Write cost event if this hook contains usage data
+	logCostDebug("hook event=%s instance=%s status=%s", payload.HookEventName, instanceID, status)
+	writeCostEvent(instanceID, data)
+
+	// Recall trigger (docs/recall.md): on the turn-end and session-end
+	// edges, queue this session's transcript and, budget permitting, index
+	// it right away. Behind recover(): recall can never fail the hook.
+	recallHookTrigger(instanceID, payload.HookEventName, data)
+
+	// PermissionRequest in DSP-launched, agent-deck-managed sessions: emit an
+	// explicit allow decision so headless / /remote-control contexts (which
+	// have no UI fallback) do not silently deny. DSP is the user-declared
+	// trust signal; the hook just makes that declaration consistent across
+	// interactive and non-interactive Claude UIs. Without this, a sync hook
+	// that exits with no decision falls through to Claude Code's default,
+	// which denies in UI-less contexts. Status-tracking behavior above is
+	// unchanged.
+	if normalizeHookEventKey(payload.HookEventName) == "permissionrequest" && parentIsDSP() {
+		fmt.Println(`{"hookSpecificOutput":{"hookEventName":"PermissionRequest","permissionDecision":"allow"}}`)
+	}
+
+	// Conductor fleet snapshot: on the Claude turn-start edges (UserPromptSubmit,
+	// SessionStart), a parent session gets a compact children-status snapshot
+	// injected as additionalContext. State, not events — complements the #1225
+	// Stop-edge drain below, which delivers queued deltas. No-op for sessions
+	// without children; AGENTDECK_NO_CHILDREN_CONTEXT=1 opts a session out.
+	//
+	// Issue #2469: the same hook first drains the parent's durable inbox and
+	// injects the records (text included) as additionalContext, so the turn
+	// a wake nudge, a heartbeat or a human started already carries every
+	// pending child record and the model acts with zero tool calls. The
+	// fleet snapshot follows, as a one-line delta emitted only when changed.
+	if ctxEvent := claudeContextEventName(payload.HookEventName); ctxEvent != "" {
+		isSessionStart := normalizeHookEventKey(payload.HookEventName) == "sessionstart"
+		var parts []string
+		// Fleet snapshot first: it is the slow part (a storage load) and the
+		// hook's output is discarded on timeout, so consuming the inbox is the
+		// LAST thing done before printing.
+		if os.Getenv("AGENTDECK_NO_CHILDREN_CONTEXT") != "1" {
+			if summary := buildChildrenContextSummary(instanceID, isSessionStart); summary != "" {
+				parts = append(parts, summary)
+			}
+		}
+		// Drain only on UserPromptSubmit, which the install makes synchronous;
+		// SessionStart is async and its additionalContext timing is the
+		// harness's, so records are never consumed there.
+		var ledger *session.LedgerDelivery
+		if !isSessionStart {
+			// Comms Ledger canary: an enrolled parent reads its records
+			// from the ledger (acknowledging what a wake line showed);
+			// every other session keeps the inbox drain.
+			// The ledger's context already ends with what the inbox holds.
+			if dl, ok := session.LedgerPromptContext(instanceID, rawString(payload.Prompt)); ok {
+				ledger = dl
+				if dl.Text != "" {
+					parts = append([]string{dl.Text}, parts...)
+				}
+			} else if drained, _, derr := session.DrainForPrompt(instanceID); derr == nil && drained != "" {
+				parts = append([]string{drained}, parts...)
+			}
+		}
+		printed := false
+		if len(parts) > 0 {
+			if out := childrenContextJSON(ctxEvent, strings.Join(parts, "\n")); out != "" {
+				_, err := fmt.Println(out)
+				printed = err == nil
+			}
+		}
+		ledger.Done(printed)
+	}
+
+	// Issue #1225: on the Stop edge (the turn boundary), a parent drains its
+	// durable per-parent outbox and injects any pending child completions via
+	// {decision:"block",reason} — so a BUSY conductor still receives every
+	// completion at its very next free turn, with zero forced interrupts and
+	// zero loss. No-op when the inbox is empty (the common case for non-parent
+	// sessions), and bounded by a max-consecutive-block guard so it can't loop.
+	//
+	// NOTE: Claude Code only reads this decision when the Stop hook runs
+	// SYNCHRONOUSLY. The install flips the conductor's Stop hook to sync — see
+	// the maintainer note in the PR. Emitting here is harmless under the legacy
+	// async install (Claude ignores stdout) and activates once sync lands.
+	if isStopHookEvent(payload.HookEventName) && stopHookDrainEnabled(getClaudeConfigDirForHooks()) {
+		// Comms Ledger canary: the turn that ended confirms what it carried;
+		// urgent ledger records pending block once more. When the ledger does
+		// not block, the inbox's Stop drain runs for what the inbox holds.
+		// The ledger's Stop decision already ran the inbox's Stop drain
+		// (leaving out turns the ledger showed) when it did not block itself.
+		if dl, ledgerOK := session.LedgerStopDecision(instanceID, resolveStopHookActive(payload)); ledgerOK {
+			printed := false
+			if dl.Blocked {
+				if out, mErr := json.Marshal(dl.Decision); mErr == nil {
+					_, err := fmt.Println(string(out))
+					printed = err == nil
+				}
+			}
+			dl.Done(printed)
+			return
+		}
+		if dec, blocked, derr := session.DrainForStopHook(instanceID, resolveStopHookActive(payload)); derr == nil && blocked {
+			if out, mErr := json.Marshal(dec); mErr == nil {
+				fmt.Println(string(out))
+				// A Stop-hook block buys the parent another turn: a machine
+				// wake for `msg stats`, like a typed nudge.
+				session.SpoolCommsWake(instanceID, "inbox", "stop", dec.Reason, "")
+			}
+		}
+	}
+	return // matrix/hardened: successful hook paths retain exit code zero.
+}
+
+// stopHookDrainEnabled reports whether this Stop hook may drain the parent's
+// inbox (messaging audit P2-1, review round 2 P1-B, review round 3 finding
+// 3). Claude Code only reads the {decision:"block"} answer from a SYNCHRONOUS
+// hook, so an async-installed entry must never drain: it would consume the
+// inbox into an answer nobody reads. The rule is enforced here, at drain
+// time, from two sources:
+//   - the installed form of the agent-deck Stop entry in this config dir's
+//     settings.json: async → no drain (the heal flips it to sync on the
+//     daemon's next start, but the handler does not wait for that);
+//   - the command-line marker session.StopHookSyncMarkerEnv: an explicit
+//     value other than "1" (an async-installed opt-out) disables the drain.
+//
+// An absent marker keeps draining: every install made before the marker
+// existed is synchronous too (Stop has been sync since issue #1225), and
+// switching the drain off on it silently disabled the delivery leg on every
+// existing machine. When the entry cannot be read the marker decides.
+func stopHookDrainEnabled(configDir string) bool {
+	if v := os.Getenv(session.StopHookSyncMarkerEnv); v != "" && v != "1" {
+		return false
+	}
+	return session.StopHookInstallForm(configDir) != session.StopHookFormAsync
+}
+
+// parentIsDSP reports whether the parent process (typically the claude binary)
+// was launched with --dangerously-skip-permissions. Returns true if the
+// AGENTDECK_DSP_MODE env var is explicitly set, or, on Linux/WSL, if the
+// parent's /proc/<ppid>/cmdline contains the DSP flag. Returns false on
+// non-Linux platforms unless AGENTDECK_DSP_MODE is set, since /proc is
+// unavailable; agent-deck launch paths can opt those platforms in via the
+// env var when needed.
+func parentIsDSP() bool {
+	if os.Getenv("AGENTDECK_DSP_MODE") == "1" {
+		return true
+	}
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", os.Getppid()))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(cmdline), "--dangerously-skip-permissions")
+}
+
+// writeHookStatus writes a hook status file atomically for one instance.
+// The optional done argument carries a completion sentinel (issue #1186);
+// when supplied its status/summary are persisted alongside the hook status.
+func writeHookStatus(instanceID, status, sessionID, event, cwd string, done ...session.DoneSignal) {
+	scan := doneScanResult{}
+	if len(done) > 0 {
+		scan.signal = &done[0]
+	}
+	writeHookStatusWithScan(instanceID, status, sessionID, event, cwd, scan)
+}
+
+// writeHookStatusWithScan is writeHookStatus plus the full Stop-edge scan
+// outcome: a parsed sentinel persists as done_status/done_summary; an
+// unflushed tail persists as transcript_path so the daemon can finish the
+// scan (issue #1186 flush race).
+func writeHookStatusWithScan(instanceID, status, sessionID, event, cwd string, scan doneScanResult) {
+	if instanceID == "" || status == "" {
+		return
+	}
+
+	hooksDir := getHooksDir()
+	if err := os.MkdirAll(hooksDir, 0700); err != nil {
+		hookHandlerLog.Warn("hook_status_mkdir_failed",
+			slog.String("dir", hooksDir),
+			slog.String("instance", instanceID),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+
+	sessionID = strings.TrimSpace(sessionID)
+
+	statusFile := hookStatusFile{
+		Status:    status,
+		SessionID: sessionID,
+		Event:     event,
+		Timestamp: time.Now().Unix(),
+		Cwd:       strings.TrimSpace(cwd),
+	}
+	if scan.signal != nil {
+		statusFile.DoneStatus = scan.signal.Status
+		statusFile.DoneSummary = scan.signal.Summary
+	}
+	statusFile.TranscriptPath = scan.pendingTranscript
+	writeHookStatusFile(instanceID, statusFile, true)
+}
+
+func writeHookStatusFile(instanceID string, statusFile hookStatusFile, mutateAnchor bool) bool {
+	hooksDir := getHooksDir()
+	generation := strings.TrimSpace(os.Getenv("AGENTDECK_HOOK_GENERATION"))
+	if generation != "" {
+		lockPath := filepath.Join(hooksDir, filepath.Base(instanceID)+".lock")
+		lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return false
+		}
+		defer closeChecked(lock)
+		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+			return false
+		}
+		defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+		controlPath := filepath.Join(hooksDir, filepath.Base(instanceID)+".generation.json")
+		var control hookGenerationControl
+		data, err := readHookFileBounded(controlPath)
+		if err != nil || json.Unmarshal(data, &control) != nil || control.Generation != generation {
+			return false
+		}
+		// StartWithMessage stays running until the agent-level completion edge.
+		if normalizeHookEventKey(statusFile.Event) == "onsessionstart" && control.InitialMessagePending {
+			return false
+		}
+		control.NextSequence++
+		statusFile.HookGeneration, statusFile.Sequence = generation, control.NextSequence
+		completionEvent := normalizeHookEventKey(statusFile.Event)
+		if completionEvent == "postllmcall" || completionEvent == "onsessionend" {
+			control.InitialMessagePending = false
+		}
+		statusFile.InitialMessagePending = control.InitialMessagePending
+		b, err := json.Marshal(control)
+		if err != nil || atomicHookWrite(controlPath, b) != nil {
+			return false
+		}
+	}
+
+	jsonData, err := json.Marshal(statusFile)
+	if err != nil {
+		hookHandlerLog.Warn("hook_status_marshal_failed",
+			slog.String("instance", instanceID),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+
+	filePath := filepath.Join(hooksDir, filepath.Base(instanceID)+".json")
+	if err := atomicHookWrite(filePath, jsonData); err != nil {
+		hookHandlerLog.Warn("hook_status_write_failed",
+			slog.String("path", filePath),
+			slog.String("instance", instanceID),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+	// Keep anchor mutation in the same generation-locked critical section as
+	// acceptance and status publication. Restart cannot rotate generations in
+	// between these operations.
+	if mutateAnchor && statusFile.SessionID != "" {
+		session.WriteHookSessionAnchor(instanceID, statusFile.SessionID)
+	}
+	if mutateAnchor && isTerminalHookEvent(statusFile.Event) {
+		session.ClearHookSessionAnchor(instanceID)
+	}
+	appendHookEvent(instanceID, statusFile)
+	return true
+}
+
+func readHookFileBounded(path string) ([]byte, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), path)
+	if f == nil {
+		_ = syscall.Close(fd)
+		return nil, errors.New("open hook file")
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, 64<<10))
+}
+
+func atomicHookWrite(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err = f.Chmod(0600); err == nil {
+		_, err = f.Write(data)
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func isTerminalHookEvent(event string) bool {
+	norm := strings.ToLower(strings.TrimSpace(event))
+	if norm == "" {
+		return false
+	}
+	norm = strings.NewReplacer(".", "", "-", "", "_", "", "/", "", " ", "").Replace(norm)
+	// Explicit terminal event allowlist. Keep this narrow to avoid clearing
+	// sidecar on ordinary non-terminal "Stop"/turn-complete style events.
+	switch norm {
+	case "sessionend", "sessionended", "sessionclose", "sessionclosed", "sessiondone", "sessionexit", "sessionexited",
+		"onsessionfinalize", // Hermes final process/session event
+		"threadend", "threadended", "threadterminate", "threadterminated", "threadclose", "threadclosed",
+		"threaddone", "threadexit", "threadexited":
+		return true
+	default:
+		return false
+	}
+}
+
+// projectDirMissing reports whether cwd is a non-empty path that no longer
+// exists on disk. An empty cwd (older Claude Code, or hook events that omit
+// one) returns false — we can't tell, so behavior stays unchanged. Stat errors
+// other than "not exist" (e.g. permission) also return false: only a confirmed
+// missing directory triggers the degrade path.
+func projectDirMissing(cwd string) bool {
+	if cwd == "" {
+		return false
+	}
+	_, err := os.Stat(cwd)
+	return errors.Is(err, os.ErrNotExist)
+}
+
+// warnProjectDirMissingOnce logs a single WARN for a missing project dir and
+// records a marker so subsequent hook invocations for the same instance+path
+// stay silent. Because each hook runs as a fresh process, the "once" guard is
+// an on-disk marker (next to the hook status files) whose contents are the
+// missing path: if the session is later repointed to a different (also-missing)
+// path, the mismatch lets it warn again instead of being silenced by a stale
+// marker.
+func warnProjectDirMissingOnce(instanceID, cwd string) {
+	hooksDir := getHooksDir()
+	markerPath := filepath.Join(hooksDir, filepath.Base(instanceID)+".projectdir-missing")
+
+	if existing, err := os.ReadFile(markerPath); err == nil && strings.TrimSpace(string(existing)) == cwd {
+		return // already warned for this exact missing path
+	}
+
+	hookHandlerLog.Warn("hook_projectdir_missing",
+		slog.String("instance", instanceID),
+		slog.String("project_dir", cwd),
+		slog.String("suggestion", "run `agent-deck session move <id|title> <new-path>` to repoint the session at its moved worktree"),
+	)
+
+	if err := os.MkdirAll(hooksDir, 0o700); err == nil {
+		_ = os.WriteFile(markerPath, []byte(cwd), 0o600)
+	}
+}
+
+// getHooksDir returns the path to the hooks status directory.
+func getHooksDir() string {
+	return session.GetHooksDir()
+}
+
+// cleanStaleHookFiles prunes orphan artifacts using all profile registries.
+func cleanStaleHookFiles() {
+	if err := session.PruneHookArtifacts(); err != nil {
+		hookHandlerLog.Warn("hook_prune_failed", slog.String("error", err.Error()))
+	}
+}
+
+// handleHooks handles the "hooks" CLI subcommand for manual hook management.
+func handleHooks(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: agent-deck hooks <install|uninstall|status>")
+		os.Exit(1)
+	}
+
+	// A help request anywhere in the argument list must print usage and exit
+	// without side effects: an install triggered by `hooks install --help`
+	// would write to another tool's settings file from a command whose
+	// documented purpose in that invocation was to describe itself (#1993).
+	if hooksHelpRequested(args) {
+		printClaudeHooksUsage(os.Stdout)
+		return
+	}
+
+	switch args[0] {
+	case "help":
+		printClaudeHooksUsage(os.Stdout)
+	case "install":
+		handleHooksInstall()
+	case "uninstall":
+		handleHooksUninstall()
+	case "status":
+		handleHooksStatus()
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown hooks subcommand: %s\n", args[0])
+		printClaudeHooksUsage(os.Stderr)
+		os.Exit(1)
+	}
+}
+
+func printClaudeHooksUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage: agent-deck hooks <help|install|uninstall|status>")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Manage agent-deck hook integration for Claude Code.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Commands:")
+	fmt.Fprintln(w, "  help         Show this help")
+	fmt.Fprintln(w, "  install      Install or upgrade agent-deck Claude Code hooks")
+	fmt.Fprintln(w, "  uninstall    Remove agent-deck Claude Code hooks")
+	fmt.Fprintln(w, "  status       Show current hook install status")
+}
+
+func handleHooksInstall() {
+	configDir := getClaudeConfigDirForHooks()
+	installed, err := session.InjectClaudeHooks(configDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error installing hooks: %v\n", err)
+		os.Exit(1)
+	}
+	if installed {
+		fmt.Println("Claude Code hooks installed successfully.")
+		fmt.Printf("Config: %s/settings.json\n", configDir)
+	} else {
+		fmt.Println("Claude Code hooks are already installed.")
+	}
+	// Messaging audit P1-1: the hook is pinned to this binary's absolute
+	// path, so say which one — a stale PATH entry can no longer hijack it.
+	// A build outside the install dirs cannot be pinned and says so.
+	report := session.ClaudeHooksStatus(configDir, Version)
+	if report.Unpinnable != "" {
+		fmt.Printf("This binary: %s\n", report.Unpinnable)
+	}
+	for _, b := range report.Binaries {
+		fmt.Printf("Hook command: %s\n", b.Command)
+	}
+	installUsageFeeds(os.Stdout)
+}
+
+// installUsageFeeds wires the "accounts" usage feed for every configured
+// Claude account slot (session.InstallUsageFeeds) and prints the resulting
+// statusLine command per slot, so the operator sees exactly what now runs.
+func installUsageFeeds(w io.Writer) {
+	config, err := session.LoadUserConfig()
+	if err != nil || config == nil {
+		fmt.Fprintf(w, "Usage feed: skipped (config: %v)\n", err)
+		return
+	}
+	results := session.InstallUsageFeeds(config)
+	if len(results) == 0 {
+		fmt.Fprintln(w, "Usage feed: no Claude account slots configured ([profiles.<name>.claude] config_dir)")
+		return
+	}
+	fmt.Fprintln(w, "Usage feed:")
+	width := usageFeedSlotWidth(results)
+	for _, r := range results {
+		switch {
+		case r.Err != nil:
+			fmt.Fprintf(w, "  %-*s  error: %v\n", width, r.Slot, r.Err)
+		case r.Feed.Blocked != "":
+			fmt.Fprintf(w, "  %-*s  skipped: %s\n", width, r.Slot, r.Feed.Blocked)
+		case r.Changed:
+			fmt.Fprintf(w, "  %-*s  wired: %s\n", width, r.Slot, r.Feed.Command)
+		default:
+			fmt.Fprintf(w, "  %-*s  already wired: %s\n", width, r.Slot, r.Feed.Command)
+		}
+	}
+}
+
+func usageFeedSlotWidth(results []session.UsageFeedResult) int {
+	width := 0
+	for _, r := range results {
+		width = max(width, len(r.Slot))
+	}
+	return width
+}
+
+// usageCacheAge is what hooks status knows about a slot's quota file.
+type usageCacheAge struct {
+	Exists bool
+	Age    time.Duration
+}
+
+// usageCacheAges stats every slot's claude quota file.
+func usageCacheAges(feeds []session.UsageFeed, now time.Time) map[string]usageCacheAge {
+	ages := make(map[string]usageCacheAge, len(feeds))
+	for _, f := range feeds {
+		store, err := quota.NewStore(f.Slot)
+		if err != nil {
+			continue
+		}
+		if fi, err := os.Stat(filepath.Join(store.Dir(), quota.ProviderClaude+".json")); err == nil {
+			ages[f.Slot] = usageCacheAge{Exists: true, Age: now.Sub(fi.ModTime())}
+		}
+	}
+	return ages
+}
+
+// printUsageFeedStatus renders the per-slot usage feed section of `hooks
+// status`: whether the slot's statusLine runs the ingester (and what it
+// wraps), and how old the slot's cached quota file is.
+func printUsageFeedStatus(w io.Writer, feeds []session.UsageFeed, ages map[string]usageCacheAge, now time.Time) {
+	if len(feeds) == 0 {
+		fmt.Fprintln(w, "Usage feed: no Claude account slots configured ([profiles.<name>.claude] config_dir)")
+		return
+	}
+	fmt.Fprintln(w, "Usage feed:")
+	width := 0
+	for _, f := range feeds {
+		width = max(width, len(f.Slot))
+	}
+	unwired := 0
+	for _, f := range feeds {
+		var wiring string
+		switch {
+		case f.Blocked != "":
+			// Not wired and hooks install would not change that.
+			wiring = "cannot wire (" + f.Blocked + ")"
+		case f.Wired && f.Inner != "":
+			wiring = "wired (wraps " + f.Inner + ")"
+		case f.Wired:
+			wiring = "wired"
+		case f.Command != "":
+			wiring = "not wired (statusLine: " + f.Command + ")"
+			unwired++
+		default:
+			wiring = "not wired (no statusLine)"
+			unwired++
+		}
+		cache := "no cache"
+		if age, ok := ages[f.Slot]; ok && age.Exists {
+			cache = "cache " + shortDuration(age.Age) + " old"
+		}
+		fmt.Fprintf(w, "  %-*s  %s · %s\n", width, f.Slot, wiring, cache)
+	}
+	if unwired > 0 {
+		fmt.Fprintln(w, "Run 'agent-deck hooks install' to wire the usage feed (the accounts field reads it).")
+	}
+}
+
+func handleHooksUninstall() {
+	configDir := getClaudeConfigDirForHooks()
+	removed, err := session.RemoveClaudeHooks(configDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error removing hooks: %v\n", err)
+		os.Exit(1)
+	}
+	if removed {
+		fmt.Println("Claude Code hooks removed successfully.")
+	} else {
+		fmt.Println("No agent-deck hooks found to remove.")
+	}
+	if config, err := session.LoadUserConfig(); err == nil && config != nil {
+		for _, r := range session.RemoveUsageFeeds(config) {
+			switch {
+			case r.Err != nil:
+				fmt.Printf("Usage feed %s: error: %v\n", r.Slot, r.Err)
+			case r.Changed:
+				fmt.Printf("Usage feed %s: statusLine restored.\n", r.Slot)
+			}
+		}
+	}
+}
+
+func handleHooksStatus() {
+	// Clean up stale hook files while checking status
+	cleanStaleHookFiles()
+
+	configDir := getClaudeConfigDirForHooks()
+	// Review round 3 (finding 2): status is read-only. It never touches
+	// settings.json; the self-heal runs at daemon start and on an explicit
+	// `hooks install`, and only from a binary in a known install directory.
+	printClaudeHooksStatus(os.Stdout, session.ClaudeHooksStatus(configDir, Version))
+	if config, err := session.LoadUserConfig(); err == nil && config != nil {
+		feeds := session.UsageFeedStatuses(config)
+		now := time.Now()
+		printUsageFeedStatus(os.Stdout, feeds, usageCacheAges(feeds, now), now)
+	}
+
+	// Show hook status files
+	hooksDir := getHooksDir()
+	entries, err := os.ReadDir(hooksDir)
+	if err != nil {
+		return
+	}
+
+	activeCount := 0
+	cutoff := time.Now().Add(-5 * time.Second)
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			activeCount++
+		}
+	}
+
+	fmt.Printf("Active hook files: %d (in %s)\n", activeCount, hooksDir)
+	fmt.Printf("Total hook files: %d\n", len(entries))
+}
+
+// printClaudeHooksStatus renders the install state plus, per messaging audit
+// P1-1, what each installed hook command actually resolves to. A bare command
+// that PATH resolves to a different file than this binary is a shadow; a hook
+// binary reporting a different version is a mismatch. Either means the hook
+// half of the delivery spine (Stop-hook drain, sentinel scan, events history)
+// runs code the daemon does not, and the fix is one `hooks install`.
+func printClaudeHooksStatus(w io.Writer, report session.ClaudeHooksStatusReport) {
+	problems := report.Problems()
+	switch {
+	case report.Installed && len(problems) == 0:
+		fmt.Fprintln(w, "Status: INSTALLED")
+	case report.Present:
+		fmt.Fprintln(w, "Status: INSTALLED (needs reinstall)")
+	default:
+		fmt.Fprintln(w, "Status: NOT INSTALLED")
+	}
+	fmt.Fprintf(w, "Config: %s/settings.json\n", report.ConfigDir)
+	if report.Executable != "" {
+		fmt.Fprintf(w, "This binary: %s (v%s)\n", report.Executable, report.Version)
+	}
+	if report.Unpinnable != "" {
+		fmt.Fprintf(w, "This binary: %s (v%s)\n", report.Unpinnable, report.Version)
+	}
+	for _, b := range report.Binaries {
+		resolved := b.ResolvedPath
+		if b.Version != "" {
+			resolved += ", v" + b.Version
+		}
+		line := "Hook command: " + b.Command
+		switch {
+		case b.ResolveError != "":
+			line += " (unresolvable)"
+		case b.Bare:
+			line += " (bare; PATH resolves to " + resolved + ")"
+		default:
+			line += " (" + resolved + ")"
+		}
+		fmt.Fprintln(w, line)
+	}
+	for _, p := range problems {
+		fmt.Fprintln(w, "WARNING: "+p)
+	}
+	needsRepair := !report.Installed || len(problems) > 0
+	if !needsRepair {
+		return
+	}
+	if report.Unpinnable != "" {
+		fmt.Fprintln(w, "Run 'agent-deck hooks install' from an installed agent-deck (or start its notify daemon) to repair the hooks.")
+	} else {
+		fmt.Fprintln(w, "Run 'agent-deck hooks install' to pin the hooks to this binary (the notify daemon heals this on its next start).")
+	}
+}
+
+// costEventFile is the JSON written to ~/.agent-deck/cost-events/{instance}_{ts}.json
+type costEventFile struct {
+	InstanceID       string `json:"instance_id"`
+	Model            string `json:"model"`
+	InputTokens      int64  `json:"input_tokens"`
+	OutputTokens     int64  `json:"output_tokens"`
+	CacheReadTokens  int64  `json:"cache_read_tokens"`
+	CacheWriteTokens int64  `json:"cache_write_tokens"`
+	Timestamp        int64  `json:"ts"`
+}
+
+// stopHookPayload extracts transcript_path from the Stop hook payload.
+type stopHookPayload struct {
+	HookEventName  string `json:"hook_event_name"`
+	TranscriptPath string `json:"transcript_path"`
+}
+
+// transcriptMessage is one transcript record as the cost path reads it.
+type transcriptMessage struct {
+	Type        string `json:"type"`
+	IsSidechain bool   `json:"isSidechain"`
+	Message     struct {
+		Model string `json:"model"`
+		Usage struct {
+			InputTokens              int64 `json:"input_tokens"`
+			OutputTokens             int64 `json:"output_tokens"`
+			CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+			CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+		} `json:"usage"`
+	} `json:"message"`
+}
+
+// writeCostEvent reads usage from the Claude transcript file on Stop events.
+func writeCostEvent(instanceID string, rawPayload []byte) {
+	// matrix/hardened: a disabled collector must not read usage or spool events.
+	cfg, err := session.LoadUserConfig()
+	if err != nil || cfg == nil || !cfg.Costs.GetAutoCollect() {
+		return
+	}
+	logCostDebug("writeCostEvent called for instance=%s", instanceID)
+
+	var stop stopHookPayload
+	if err := json.Unmarshal(rawPayload, &stop); err != nil {
+		logCostDebug("payload parse error: %v", err)
+		return
+	}
+	if !isStopHookEvent(stop.HookEventName) {
+		logCostDebug("not a Stop event, skipping")
+		return
+	}
+	if stop.TranscriptPath == "" {
+		logCostDebug("no transcript_path in Stop payload")
+		return
+	}
+
+	// Validate transcript path through the shared fail-closed, boundary-aware
+	// containment guard (same check the done-sentinel reader uses) so a crafted
+	// payload can't coax this reader into opening an arbitrary file. Claude
+	// stores transcripts under ~/.claude/projects/{hash}/{session}.jsonl.
+	cleanPath, ok := session.ValidateTranscriptPath(stop.TranscriptPath)
+	if !ok {
+		logCostDebug("rejected transcript_path outside ~/.claude or traversal: %s", stop.TranscriptPath)
+		return
+	}
+	logCostDebug("transcript_path: %s", cleanPath)
+
+	msg, ok := lastAssistantUsage(cleanPath)
+	if !ok {
+		logCostDebug("no main-chain assistant record in the transcript tail")
+		return
+	}
+
+	usage := msg.Message.Usage
+	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
+		logCostDebug("no token usage in transcript")
+		return
+	}
+
+	logCostDebug("found usage: model=%s in=%d out=%d cache_read=%d cache_write=%d",
+		msg.Message.Model, usage.InputTokens, usage.OutputTokens,
+		usage.CacheReadInputTokens, usage.CacheCreationInputTokens)
+
+	costDir := getCostEventsDir()
+	if err := os.MkdirAll(costDir, 0700); err != nil {
+		hookHandlerLog.Warn("cost_event_mkdir_failed",
+			slog.String("dir", costDir),
+			slog.String("instance", instanceID),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+
+	ts := time.Now().UnixNano()
+	cf := costEventFile{
+		InstanceID:       instanceID,
+		Model:            msg.Message.Model,
+		InputTokens:      usage.InputTokens,
+		OutputTokens:     usage.OutputTokens,
+		CacheReadTokens:  usage.CacheReadInputTokens,
+		CacheWriteTokens: usage.CacheCreationInputTokens,
+		Timestamp:        ts,
+	}
+
+	jsonData, err := json.Marshal(cf)
+	if err != nil {
+		hookHandlerLog.Warn("cost_event_marshal_failed",
+			slog.String("instance", instanceID),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+
+	filename := fmt.Sprintf("%s_%d.json", instanceID, ts)
+	tmpPath := filepath.Join(costDir, filename+".tmp")
+	finalPath := filepath.Join(costDir, filename)
+
+	if err := os.WriteFile(tmpPath, jsonData, 0600); err != nil {
+		hookHandlerLog.Warn("cost_event_write_failed",
+			slog.String("path", tmpPath),
+			slog.String("instance", instanceID),
+			slog.String("error", err.Error()),
+		)
+		logCostDebug("write failed: %v", err)
+		return
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		hookHandlerLog.Warn("cost_event_rename_failed",
+			slog.String("from", tmpPath),
+			slog.String("to", finalPath),
+			slog.String("instance", instanceID),
+			slog.String("error", err.Error()),
+		)
+		logCostDebug("rename failed: %v", err)
+		_ = os.Remove(tmpPath)
+		return
+	}
+	logCostDebug("wrote cost event: %s model=%s in=%d out=%d", finalPath, cf.Model, cf.InputTokens, cf.OutputTokens)
+}
+
+// doneScanResult carries the Stop-edge sentinel-scan outcome into the hook
+// status file. At most one field is set: signal when a sentinel was parsed
+// from the flushed assistant turn; pendingTranscript (the validated
+// transcript path) when the tail was unflushed at hook time — issue #1186
+// flush race — so the daemon can finish the scan on its poll loop. The zero
+// value is an ordinary Stop with nothing extra to persist.
+type doneScanResult struct {
+	signal            *session.DoneSignal
+	pendingTranscript string
+}
+
+// detectDoneSentinel parses transcript_path out of a Stop hook payload and
+// scans the transcript tail for a worker-printed completion sentinel
+// (issue #1186). Path-traversal / ~/.claude containment guards mirror the
+// cost path so a crafted payload can't read arbitrary files. The scan itself
+// lives in internal/session, shared with the transition daemon's flush-race
+// rescan.
+func detectDoneSentinel(rawPayload []byte) doneScanResult {
+	var stop stopHookPayload
+	if err := json.Unmarshal(rawPayload, &stop); err != nil {
+		return doneScanResult{}
+	}
+	cleanPath, ok := session.ValidateTranscriptPath(stop.TranscriptPath)
+	if !ok {
+		return doneScanResult{}
+	}
+	sig, found, pending := session.ScanTranscriptTailForDone(cleanPath)
+	switch {
+	case pending:
+		return doneScanResult{pendingTranscript: cleanPath}
+	case found:
+		return doneScanResult{signal: &sig}
+	default:
+		return doneScanResult{}
+	}
+}
+
+// lastAssistantUsage returns the just-finished turn's main-chain assistant
+// record from the transcript tail. Claude Code appends system, attachment
+// and sidechain records after the assistant turn, so the literal last line
+// is often not the one carrying usage; reading only it silently dropped
+// the cost event for every such turn. The walk mirrors
+// session.ScanTranscriptTailForDone: back over a bounded tail, skipping
+// sidechain traffic, stopping at the first assistant or user record.
+func lastAssistantUsage(path string) (transcriptMessage, bool) {
+	lines, err := session.TranscriptTailLines(path, costScanTailLines)
+	if err != nil {
+		logCostDebug("read transcript failed: %v", err)
+		return transcriptMessage{}, false
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		var msg transcriptMessage
+		if json.Unmarshal([]byte(lines[i]), &msg) != nil || msg.IsSidechain {
+			continue
+		}
+		switch msg.Type {
+		case "assistant":
+			return msg, true
+		case "user":
+			return transcriptMessage{}, false // the reply has not flushed yet
+		}
+	}
+	return transcriptMessage{}, false
+}
+
+// costScanTailLines bounds the backward walk for the usage record; the
+// same margin the done-sentinel scan uses.
+const costScanTailLines = 25
+
+// logCostDebug writes debug messages to the XDG cache cost-debug.log.
+// Only active when AGENTDECK_DEBUG is set.
+func logCostDebug(format string, args ...any) {
+	if os.Getenv("AGENTDECK_DEBUG") == "" {
+		return
+	}
+	logPath, err := effectiveCachePath("cost-debug.log")
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		return
+	}
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			hookHandlerLog.Debug("cost_debug_log_close_failed", slog.String("error", err.Error()))
+		}
+	}()
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(f, "%s %s\n", time.Now().Format("15:04:05.000"), msg)
+}
+
+// getCostEventsDir returns the path to the cost events directory.
+func getCostEventsDir() string {
+	path, err := agentpaths.EffectiveDataPath("cost-events", "cost-events")
+	if err != nil {
+		return filepath.Join(os.TempDir(), "agent-deck", "cost-events")
+	}
+	return path
+}
+
+// getClaudeConfigDirForHooks returns the Claude config directory for hook operations.
+// Respects CLAUDE_CONFIG_DIR env var and agent-deck config resolution.
+func getClaudeConfigDirForHooks() string {
+	return session.GetClaudeConfigDir()
+}

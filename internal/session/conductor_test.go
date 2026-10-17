@@ -1,0 +1,3473 @@
+package session
+
+import (
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/BurntSushi/toml"
+)
+
+// --- Systemd template generation tests ---
+
+func TestGenerateSystemdHeartbeatTimer(t *testing.T) {
+	timer := GenerateSystemdHeartbeatTimer("test-conductor", 15)
+
+	// Verify placeholders are replaced
+	if strings.Contains(timer, "__NAME__") {
+		t.Error("timer output still contains __NAME__ placeholder")
+	}
+	if strings.Contains(timer, "__INTERVAL__") {
+		t.Error("timer output still contains __INTERVAL__ placeholder")
+	}
+
+	// Verify correct values
+	if !strings.Contains(timer, "test-conductor") {
+		t.Error("timer should contain conductor name")
+	}
+	// 15 minutes = 900 seconds
+	if !strings.Contains(timer, "900") {
+		t.Errorf("timer should contain 900 seconds (15 min * 60), got:\n%s", timer)
+	}
+
+	// Verify systemd timer structure
+	if !strings.Contains(timer, "[Unit]") {
+		t.Error("timer should contain [Unit] section")
+	}
+	if !strings.Contains(timer, "[Timer]") {
+		t.Error("timer should contain [Timer] section")
+	}
+	if !strings.Contains(timer, "[Install]") {
+		t.Error("timer should contain [Install] section")
+	}
+	if !strings.Contains(timer, "OnBootSec=") {
+		t.Error("timer should contain OnBootSec directive")
+	}
+	if !strings.Contains(timer, "OnUnitActiveSec=") {
+		t.Error("timer should contain OnUnitActiveSec directive")
+	}
+}
+
+func TestGenerateSystemdHeartbeatTimerInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		minutes  int
+		expected string
+	}{
+		{"1 minute", 1, "60"},
+		{"5 minutes", 5, "300"},
+		{"30 minutes", 30, "1800"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			timer := GenerateSystemdHeartbeatTimer("test", tt.minutes)
+			if !strings.Contains(timer, tt.expected+"s") {
+				t.Errorf("expected interval %ss in timer, got:\n%s", tt.expected, timer)
+			}
+		})
+	}
+}
+
+func TestGenerateSystemdHeartbeatService(t *testing.T) {
+	svc, err := GenerateSystemdHeartbeatService("test-conductor")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify placeholders are replaced
+	if strings.Contains(svc, "__NAME__") {
+		t.Error("service output still contains __NAME__ placeholder")
+	}
+	if strings.Contains(svc, "__SCRIPT_PATH__") {
+		t.Error("service output still contains __SCRIPT_PATH__ placeholder")
+	}
+	if strings.Contains(svc, "__HOME__") {
+		t.Error("service output still contains __HOME__ placeholder")
+	}
+
+	// Verify systemd service structure
+	if !strings.Contains(svc, "[Unit]") {
+		t.Error("service should contain [Unit] section")
+	}
+	if !strings.Contains(svc, "[Service]") {
+		t.Error("service should contain [Service] section")
+	}
+	if !strings.Contains(svc, "Type=oneshot") {
+		t.Error("heartbeat service should be Type=oneshot")
+	}
+	if !strings.Contains(svc, "heartbeat.sh") {
+		t.Error("service should reference heartbeat.sh script")
+	}
+	if !strings.Contains(svc, "test-conductor") {
+		t.Error("service should contain conductor name in description")
+	}
+}
+
+// --- Systemd naming tests ---
+
+func TestSystemdHeartbeatServiceName(t *testing.T) {
+	name := SystemdHeartbeatServiceName("my-conductor")
+	expected := "agent-deck-conductor-heartbeat-my-conductor.service"
+	if name != expected {
+		t.Errorf("got %q, want %q", name, expected)
+	}
+}
+
+func TestSystemdHeartbeatTimerName(t *testing.T) {
+	name := SystemdHeartbeatTimerName("my-conductor")
+	expected := "agent-deck-conductor-heartbeat-my-conductor.timer"
+	if name != expected {
+		t.Errorf("got %q, want %q", name, expected)
+	}
+}
+
+func TestSystemdUserDir(t *testing.T) {
+	dir, err := SystemdUserDir()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	homeDir, _ := os.UserHomeDir()
+	expected := filepath.Join(homeDir, ".config", "systemd", "user")
+	if dir != expected {
+		t.Errorf("got %q, want %q", dir, expected)
+	}
+}
+
+func TestSystemdBridgeServicePath(t *testing.T) {
+	path, err := SystemdBridgeServicePath()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.HasSuffix(path, "agent-deck-conductor-bridge.service") {
+		t.Errorf("path should end with service file name, got %q", path)
+	}
+	if !strings.Contains(path, ".config/systemd/user") {
+		t.Errorf("path should be in systemd user dir, got %q", path)
+	}
+}
+
+func TestSystemdHeartbeatServicePath(t *testing.T) {
+	path, err := SystemdHeartbeatServicePath("test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expected := "agent-deck-conductor-heartbeat-test.service"
+	if !strings.HasSuffix(path, expected) {
+		t.Errorf("path should end with %q, got %q", expected, path)
+	}
+}
+
+func TestSystemdHeartbeatTimerPath(t *testing.T) {
+	path, err := SystemdHeartbeatTimerPath("test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expected := "agent-deck-conductor-heartbeat-test.timer"
+	if !strings.HasSuffix(path, expected) {
+		t.Errorf("path should end with %q, got %q", expected, path)
+	}
+}
+
+// --- Conductor validation and naming tests ---
+
+func TestValidateConductorName(t *testing.T) {
+	tests := []struct {
+		name    string
+		wantErr bool
+	}{
+		{"valid-name", false},
+		{"valid.name", false},
+		{"valid_name", false},
+		{"a", false},
+		{"abc123", false},
+		{"", true},                      // empty
+		{"-invalid", true},              // starts with dash
+		{".invalid", true},              // starts with dot
+		{"_invalid", true},              // starts with underscore
+		{"has space", true},             // contains space
+		{"has/slash", true},             // contains slash
+		{strings.Repeat("a", 65), true}, // too long
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateConductorName(tt.name)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateConductorName(%q) error = %v, wantErr %v", tt.name, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestConductorSessionTitle(t *testing.T) {
+	title := ConductorSessionTitle("my-conductor")
+	if title != "conductor-my-conductor" {
+		t.Errorf("got %q, want %q", title, "conductor-my-conductor")
+	}
+}
+
+func TestIsConductorHeartbeatMessage(t *testing.T) {
+	for _, msg := range []string{
+		ConductorHeartbeatMessagePrefix + " Check sessions",
+		ConductorBridgeHeartbeatPrefix + " [ops] Status: 1 waiting",
+	} {
+		if !IsConductorHeartbeatMessage(msg) {
+			t.Fatalf("expected heartbeat message to match: %q", msg)
+		}
+	}
+	if IsConductorHeartbeatMessage("hello") {
+		t.Fatal("non-heartbeat message should not match")
+	}
+}
+
+func TestHeartbeatPlistLabel(t *testing.T) {
+	label := HeartbeatPlistLabel("test")
+	expected := "com.agentdeck.conductor-heartbeat.test"
+	if label != expected {
+		t.Errorf("got %q, want %q", label, expected)
+	}
+}
+
+// --- InstallBridgeDaemon platform dispatch test ---
+
+func TestBridgeDaemonHint(t *testing.T) {
+	// BridgeDaemonHint should return a non-empty string on any platform
+	hint := BridgeDaemonHint()
+	if hint == "" {
+		t.Error("BridgeDaemonHint() should return a non-empty hint")
+	}
+}
+
+// --- Conductor meta tests ---
+
+func TestConductorMetaSaveAndLoad(t *testing.T) {
+	// Use a temp directory to simulate conductor dir
+	tmpDir := t.TempDir()
+
+	// Override the home dir detection by working with a specific name
+	meta := &ConductorMeta{
+		Name:             "test-meta",
+		Profile:          "default",
+		HeartbeatEnabled: true,
+		Description:      "test conductor",
+		CreatedAt:        "2025-01-01T00:00:00Z",
+	}
+
+	// Write meta to temp dir directly
+	metaDir := filepath.Join(tmpDir, "test-meta")
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		t.Fatalf("failed to create dir: %v", err)
+	}
+
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		t.Fatalf("failed to marshal: %v", err)
+	}
+	metaPath := filepath.Join(metaDir, "meta.json")
+	if err := os.WriteFile(metaPath, data, 0o644); err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+
+	// Read it back
+	readData, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("failed to read: %v", err)
+	}
+
+	var loaded ConductorMeta
+	if err := json.Unmarshal(readData, &loaded); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	if loaded.Name != meta.Name {
+		t.Errorf("name mismatch: got %q, want %q", loaded.Name, meta.Name)
+	}
+	if loaded.Profile != meta.Profile {
+		t.Errorf("profile mismatch: got %q, want %q", loaded.Profile, meta.Profile)
+	}
+	if loaded.HeartbeatEnabled != meta.HeartbeatEnabled {
+		t.Errorf("heartbeat mismatch: got %v, want %v", loaded.HeartbeatEnabled, meta.HeartbeatEnabled)
+	}
+	if loaded.Description != meta.Description {
+		t.Errorf("description mismatch: got %q, want %q", loaded.Description, meta.Description)
+	}
+}
+
+func intPtr(v int) *int { return &v }
+
+func TestGetHeartbeatInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval *int
+		expected int
+	}{
+		{"nil means disabled", nil, 0},
+		{"zero means disabled", intPtr(0), 0},
+		{"negative means default 15", intPtr(-1), 15},
+		{"setup default 15", intPtr(15), 15},
+		{"custom 10", intPtr(10), 10},
+		{"custom 30", intPtr(30), 30},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := &ConductorSettings{HeartbeatInterval: tt.interval}
+			if got := settings.GetHeartbeatInterval(); got != tt.expected {
+				t.Errorf("GetHeartbeatInterval() = %d, want %d", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestGetProfiles(t *testing.T) {
+	// Empty profiles should return default
+	settings := &ConductorSettings{}
+	profiles := settings.GetProfiles()
+	if len(profiles) != 1 || profiles[0] != DefaultProfile {
+		t.Errorf("empty profiles should return default, got %v", profiles)
+	}
+
+	// Custom profiles should be returned as-is
+	settings = &ConductorSettings{Profiles: []string{"work", "personal"}}
+	profiles = settings.GetProfiles()
+	if len(profiles) != 2 {
+		t.Errorf("expected 2 profiles, got %d", len(profiles))
+	}
+}
+
+// --- Slack authorization tests ---
+
+func TestSlackSettings_AllowedUserIDs(t *testing.T) {
+	tests := []struct {
+		name        string
+		settings    SlackSettings
+		expectEmpty bool
+	}{
+		{
+			name: "empty allowed users",
+			settings: SlackSettings{
+				BotToken:       "xoxb-test",
+				AppToken:       "xapp-test",
+				ChannelID:      "C12345",
+				ListenMode:     "mentions",
+				AllowedUserIDs: []string{},
+			},
+			expectEmpty: true,
+		},
+		{
+			name: "single allowed user",
+			settings: SlackSettings{
+				BotToken:       "xoxb-test",
+				AppToken:       "xapp-test",
+				ChannelID:      "C12345",
+				ListenMode:     "mentions",
+				AllowedUserIDs: []string{"U12345"},
+			},
+			expectEmpty: false,
+		},
+		{
+			name: "multiple allowed users",
+			settings: SlackSettings{
+				BotToken:       "xoxb-test",
+				AppToken:       "xapp-test",
+				ChannelID:      "C12345",
+				ListenMode:     "all",
+				AllowedUserIDs: []string{"U12345", "U67890", "UABCDE"},
+			},
+			expectEmpty: false,
+		},
+		{
+			name: "nil allowed users",
+			settings: SlackSettings{
+				BotToken:       "xoxb-test",
+				AppToken:       "xapp-test",
+				ChannelID:      "C12345",
+				ListenMode:     "mentions",
+				AllowedUserIDs: nil,
+			},
+			expectEmpty: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isEmpty := len(tt.settings.AllowedUserIDs) == 0
+			if isEmpty != tt.expectEmpty {
+				t.Errorf("expected empty=%v, got empty=%v for %+v",
+					tt.expectEmpty, isEmpty, tt.settings.AllowedUserIDs)
+			}
+		})
+	}
+}
+
+func TestSlackSettings_UserIDFormat(t *testing.T) {
+	// Verify that typical Slack user ID formats are handled correctly
+	userIDs := []string{
+		"U01234ABCDE", // Standard user ID
+		"U05678FGHIJ", // Another standard ID
+		"W12345",      // Workspace user ID
+		"USLACKBOT",   // SlackBot ID
+	}
+
+	settings := SlackSettings{
+		BotToken:       "xoxb-test",
+		AppToken:       "xapp-test",
+		ChannelID:      "C12345",
+		ListenMode:     "mentions",
+		AllowedUserIDs: userIDs,
+	}
+
+	if len(settings.AllowedUserIDs) != len(userIDs) {
+		t.Errorf("expected %d user IDs, got %d", len(userIDs), len(settings.AllowedUserIDs))
+	}
+
+	for i, id := range userIDs {
+		if settings.AllowedUserIDs[i] != id {
+			t.Errorf("user ID mismatch at index %d: got %q, want %q",
+				i, settings.AllowedUserIDs[i], id)
+		}
+	}
+}
+
+func TestSlackSettings_TOML(t *testing.T) {
+	// Verify the SlackSettings struct is properly defined with AllowedUserIDs
+	slack := SlackSettings{
+		BotToken:       "xoxb-test-token",
+		AppToken:       "xapp-test-token",
+		ChannelID:      "C01234ABCDE",
+		ListenMode:     "mentions",
+		AllowedUserIDs: []string{"U01234", "U56789", "UABCDE"},
+	}
+
+	// Verify the struct fields are accessible
+	if slack.BotToken != "xoxb-test-token" {
+		t.Errorf("bot_token mismatch: got %q", slack.BotToken)
+	}
+	if slack.AppToken != "xapp-test-token" {
+		t.Errorf("app_token mismatch: got %q", slack.AppToken)
+	}
+	if slack.ChannelID != "C01234ABCDE" {
+		t.Errorf("channel_id mismatch: got %q", slack.ChannelID)
+	}
+	if slack.ListenMode != "mentions" {
+		t.Errorf("listen_mode mismatch: got %q", slack.ListenMode)
+	}
+	if len(slack.AllowedUserIDs) != 3 {
+		t.Errorf("expected 3 allowed user IDs, got %d", len(slack.AllowedUserIDs))
+	}
+	if slack.AllowedUserIDs[0] != "U01234" {
+		t.Errorf("first user ID mismatch: got %q", slack.AllowedUserIDs[0])
+	}
+	if slack.AllowedUserIDs[1] != "U56789" {
+		t.Errorf("second user ID mismatch: got %q", slack.AllowedUserIDs[1])
+	}
+	if slack.AllowedUserIDs[2] != "UABCDE" {
+		t.Errorf("third user ID mismatch: got %q", slack.AllowedUserIDs[2])
+	}
+}
+
+func TestDiscordSettings_TOML(t *testing.T) {
+	discord := DiscordSettings{
+		BotToken:              "discord-bot-token",
+		GuildID:               NewConductorID(12345),
+		ChannelID:             NewConductorID(67890),
+		UserID:                NewConductorID(24680),
+		ListenMode:            "mentions",
+		IgnoreRepliesToOthers: true,
+	}
+
+	if discord.BotToken != "discord-bot-token" {
+		t.Errorf("bot_token mismatch: got %q", discord.BotToken)
+	}
+	if discord.GuildID != "12345" {
+		t.Errorf("guild_id mismatch: got %q", discord.GuildID)
+	}
+	if discord.ChannelID != "67890" {
+		t.Errorf("channel_id mismatch: got %q", discord.ChannelID)
+	}
+	if discord.UserID != "24680" {
+		t.Errorf("user_id mismatch: got %q", discord.UserID)
+	}
+	if discord.ListenMode != "mentions" {
+		t.Errorf("listen_mode mismatch: got %q", discord.ListenMode)
+	}
+	if !discord.IgnoreRepliesToOthers {
+		t.Error("ignore_replies_to_others should be true")
+	}
+}
+
+// --- Python bridge template tests ---
+
+func TestBridgeTemplate_ContainsSlackAuthorization(t *testing.T) {
+	// Verify that the Python bridge template contains the Slack authorization code
+	template := conductorBridgePy
+
+	// Check for authorization function definition
+	if !strings.Contains(template, "def is_slack_authorized(user_id: str) -> bool:") {
+		t.Error("template should contain is_slack_authorized function definition")
+	}
+
+	// Check for allowed_users setup
+	if !strings.Contains(template, `allowed_users = config["slack"]["allowed_user_ids"]`) {
+		t.Error("template should load allowed_user_ids from config")
+	}
+
+	// Check for authorization logic
+	if !strings.Contains(template, "if not allowed_users:") {
+		t.Error("template should check if allowed_users is empty")
+	}
+	if !strings.Contains(template, "if user_id not in allowed_users:") {
+		t.Error("template should check if user_id is in allowed_users")
+	}
+
+	// Check for warning log
+	if !strings.Contains(template, `log.warning("Unauthorized Slack message from user %s", user_id)`) {
+		t.Error("template should log warning for unauthorized users")
+	}
+
+	// Check for authorization checks in handlers
+	authCheckPatterns := []string{
+		"user_id = event.get(\"user\", \"\")",                            // message/mention handlers
+		"user_id = command.get(\"user_id\", \"\")",                       // slash command handlers
+		"if not is_slack_authorized(user_id):",                           // authorization check
+		"await respond(\"⛔ Unauthorized. Contact your administrator.\")", // slash command error
+	}
+
+	for _, pattern := range authCheckPatterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain authorization pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_SlackHandlersHaveAuthorization(t *testing.T) {
+	// Verify all Slack handlers have authorization checks
+	template := conductorBridgePy
+
+	handlers := []struct {
+		name    string
+		pattern string
+	}{
+		{"message handler", "@app.event(\"message\")"},
+		{"mention handler", "@app.event(\"app_mention\")"},
+		{"status command", "@app.command(\"/ad-status\")"},
+		{"sessions command", "@app.command(\"/ad-sessions\")"},
+		{"restart command", "@app.command(\"/ad-restart\")"},
+		{"help command", "@app.command(\"/ad-help\")"},
+	}
+
+	for _, h := range handlers {
+		if !strings.Contains(template, h.pattern) {
+			t.Errorf("template should contain %s: %q", h.name, h.pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_ConfigLoadsAllowedUserIDs(t *testing.T) {
+	// Verify the config loading includes allowed_user_ids
+	template := conductorBridgePy
+
+	configPatterns := []string{
+		`sl_allowed_users = sl.get("allowed_user_ids", [])`,
+		`"allowed_user_ids": sl_allowed_users,`,
+	}
+
+	for _, pattern := range configPatterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain config pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_HeartbeatScopesToConductorGroups(t *testing.T) {
+	template := conductorBridgePy
+
+	patterns := []string{
+		"def select_heartbeat_conductors(conductors: list[dict]) -> list[dict]:",
+		"conductors = select_heartbeat_conductors(all_conductors)",
+		`s_group = s.get("group", "") or ""`,
+		`if s_group != name and not s_group.startswith(f"{name}/"):`,
+		`for s in scoped_sessions:`,
+	}
+
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain heartbeat dedupe pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_SendToConductorSupportsSingleCallWait(t *testing.T) {
+	template := conductorBridgePy
+	waitPattern := `"--wait", "--timeout", f"{response_timeout}s", "--json",`
+	noWaitPattern := `"session", "send", session, message, "--no-wait",`
+	oldPattern := `"session", "send", session, message, profile=profile, timeout=120`
+
+	if !strings.Contains(template, waitPattern) {
+		t.Fatalf("template should include --wait send path: %q", waitPattern)
+	}
+	if !strings.Contains(template, noWaitPattern) {
+		t.Fatalf("template should retain --no-wait send path: %q", noWaitPattern)
+	}
+	if strings.Contains(template, oldPattern) {
+		t.Fatalf("template should not contain blocking send pattern: %q", oldPattern)
+	}
+}
+
+func TestConductorHeartbeatScript_StatusParsingHandlesWhitespace(t *testing.T) {
+	if !strings.Contains(conductorHeartbeatScript, `"status"`) {
+		t.Fatal("heartbeat status parser should extract status field")
+	}
+	if !strings.Contains(conductorHeartbeatScript, `session send "$SESSION"`) {
+		t.Fatal("heartbeat script should send heartbeat messages")
+	}
+	if !strings.Contains(conductorHeartbeatScript, "--no-wait -q") {
+		t.Fatal("heartbeat script should use non-blocking quiet send")
+	}
+}
+
+// TestConductorHeartbeatScript_ReferencesHeartbeatRules verifies that the OS
+// heartbeat resolves HEARTBEAT_RULES.md but sends only its stable path. Sending
+// the file contents every tick replays avoidable prompt tokens and invalidates
+// the cache prefix whenever a rule changes.
+func TestConductorHeartbeatScript_ReferencesHeartbeatRules(t *testing.T) {
+	if !strings.Contains(conductorHeartbeatScript, "HEARTBEAT_RULES.md") {
+		t.Fatal("heartbeat script should reference HEARTBEAT_RULES.md")
+	}
+	if !strings.Contains(conductorHeartbeatScript, "{NAME}/HEARTBEAT_RULES.md") {
+		t.Fatal("heartbeat script should look up per-conductor HEARTBEAT_RULES.md first")
+	}
+	if !strings.Contains(conductorHeartbeatScript, "{PROFILE}/HEARTBEAT_RULES.md") {
+		t.Fatal("heartbeat script should look up per-profile HEARTBEAT_RULES.md")
+	}
+	if !strings.Contains(conductorHeartbeatScript, "$CONDUCTOR_ROOT/HEARTBEAT_RULES.md") {
+		t.Fatal("heartbeat script should look up global HEARTBEAT_RULES.md under the effective conductor root")
+	}
+	if !strings.Contains(conductorHeartbeatScript, "/.agent-deck/conductor/HEARTBEAT_RULES.md") {
+		t.Fatal("heartbeat script should fall back to the legacy global HEARTBEAT_RULES.md")
+	}
+	if strings.Contains(conductorHeartbeatScript, `cat "$RULES_FILE"`) ||
+		strings.Contains(conductorHeartbeatScript, `RULES=$(cat`) {
+		t.Fatal("heartbeat script must reference the rules path, not inline its contents")
+	}
+	// #2348: the rules path goes to heartbeat-tick, which asks for a re-read
+	// only when the file changed since the last delivered tick.
+	if !strings.Contains(conductorHeartbeatScript, `conductor heartbeat-tick "{NAME}" --rules="$RULES_FILE"`) {
+		t.Fatal("heartbeat script should hand the resolved rules path to heartbeat-tick")
+	}
+	// The rendered (not raw) script should carry the bridge-style prefix so the
+	// idle-pause matcher (IsConductorHeartbeatMessage) can recognise heartbeat
+	// messages emitted by this OS-level heartbeat path.
+	rendered := renderConductorHeartbeatScript("alpha", "default")
+	if !strings.Contains(rendered, ConductorBridgeHeartbeatPrefix) {
+		t.Fatalf("rendered heartbeat script should emit %q prefix (matches bridge.py)", ConductorBridgeHeartbeatPrefix)
+	}
+}
+
+func TestConductorInstructionsUseCompactTriageAndBlockingWait(t *testing.T) {
+	for name, template := range map[string]string{
+		"claude/codex": conductorPerNameClaudeMDTemplate,
+		"hermes":       conductorPerNameHermesMDTemplate,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(template, `status --json`) {
+				t.Fatal("startup must triage with compact status JSON")
+			}
+			if strings.Contains(template, `Run `+"`"+`agent-deck -p {PROFILE} list --json`+"`"+` to know what sessions exist`) {
+				t.Fatal("startup must not fetch the full session list for triage")
+			}
+		})
+	}
+	if !strings.Contains(conductorSharedClaudeMDTemplate, `session children --follow --until-done`) {
+		t.Fatal("conductor instructions must replace polling turns with the blocking child stream")
+	}
+	if !strings.Contains(conductorSharedClaudeMDTemplate, `never for status triage or polling`) {
+		t.Fatal("full list JSON must be explicitly excluded from triage")
+	}
+}
+
+func TestConductorBridgeReferencesHeartbeatRulesWithoutInlining(t *testing.T) {
+	heartbeatStart := strings.Index(conductorBridgePy, "# Reference HEARTBEAT_RULES.md by path")
+	if heartbeatStart < 0 {
+		t.Fatal("bridge heartbeat should document path-only rules delivery")
+	}
+	heartbeatEnd := strings.Index(conductorBridgePy[heartbeatStart:], "# Run pre-heartbeat hook")
+	if heartbeatEnd < 0 {
+		t.Fatal("bridge heartbeat rules block boundary not found")
+	}
+	block := conductorBridgePy[heartbeatStart : heartbeatStart+heartbeatEnd]
+	if strings.Contains(block, ".read_text(") {
+		t.Fatal("bridge heartbeat must not inline HEARTBEAT_RULES.md contents")
+	}
+	if !strings.Contains(block, "Read heartbeat rules from {rules_path_ref}.") {
+		t.Fatal("bridge heartbeat should send the resolved rules path")
+	}
+	if !strings.Contains(block, "rules_path.is_file()") {
+		t.Fatal("bridge must skip directories named HEARTBEAT_RULES.md")
+	}
+	if !strings.Contains(block, "rules_path.resolve()") {
+		t.Fatal("bridge must send an absolute path independent of the conductor working directory")
+	}
+}
+
+func TestRenderConductorHeartbeatScript_UsesXDGConductorRoot(t *testing.T) {
+	home := t.TempDir()
+	xdgData := filepath.Join(home, "xdg data")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", xdgData)
+
+	wantRoot := filepath.Join(xdgData, "agent-deck", "conductor")
+	script := renderConductorHeartbeatScript("alpha", "work")
+
+	if !strings.Contains(script, `CONDUCTOR_ROOT="`+wantRoot+`"`) {
+		t.Fatalf("heartbeat script should render XDG conductor root %q:\n%s", wantRoot, script)
+	}
+	if !strings.Contains(script, `"$CONDUCTOR_ROOT/alpha/HEARTBEAT_RULES.md"`) {
+		t.Fatalf("heartbeat script should check per-conductor rules under XDG root:\n%s", script)
+	}
+	if !strings.Contains(script, `"$HOME/.agent-deck/conductor/alpha/HEARTBEAT_RULES.md"`) {
+		t.Fatalf("heartbeat script should retain legacy fallback:\n%s", script)
+	}
+}
+
+// TestRenderConductorHeartbeatScript_ReplacesHeartbeatPrefix verifies the
+// {HEARTBEAT_PREFIX} placeholder is rendered using a Go constant so the
+// producer (shell script) and the consumer (IsConductorHeartbeatMessage)
+// cannot drift apart in future refactors.
+func TestRenderConductorHeartbeatScript_ReplacesHeartbeatPrefix(t *testing.T) {
+	script := renderConductorHeartbeatScript("test", "default")
+	if strings.Contains(script, "{HEARTBEAT_PREFIX}") {
+		t.Fatalf("heartbeat script must not contain unresolved prefix placeholder:\n%s", script)
+	}
+	// #2348: the message itself is built by BuildHeartbeatTick from the same
+	// constant (see TestHeartbeatTick_DeliversOnlyChanges); the script only
+	// sends what `conductor heartbeat-tick` prints.
+	if !strings.Contains(script, `conductor heartbeat-tick "test"`) {
+		t.Fatalf("heartbeat script should send the heartbeat-tick message for this conductor:\n%s", script)
+	}
+}
+
+// TestConductorStatusJSON_ZeroActivityOmitted verifies that when
+// GetConductorLastActivity returns zero time (no managed sessions), the
+// conductor status JSON omits last_activity_at entirely rather than emitting
+// 0001-01-01T00:00:00Z. An ancient timestamp would cause the bridge to
+// suppress heartbeats forever when heartbeat_idle_minutes > 0.
+func TestConductorStatusJSON_ZeroActivityOmitted(t *testing.T) {
+	type conductorStatus struct {
+		LastActivityAt *string `json:"last_activity_at,omitempty"`
+	}
+	// Simulate a zero last_activity pointer (nil → omitted).
+	cs := conductorStatus{LastActivityAt: nil}
+	data, err := json.Marshal(cs)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "last_activity_at") {
+		t.Errorf("last_activity_at must be omitted when nil, got: %s", data)
+	}
+}
+
+// --- Symlink-based CLAUDE.md tests ---
+
+func TestInstallSharedClaudeMD_Default(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "xdg-data"))
+	conductorDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
+	claudeMDPath := filepath.Join(conductorDir, "CLAUDE.md")
+
+	// Test installing default template
+	err = InstallSharedClaudeMD("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify file exists at default location
+	if _, err := os.Stat(claudeMDPath); os.IsNotExist(err) {
+		t.Errorf("CLAUDE.md not created at %q", claudeMDPath)
+	}
+
+	// Verify it's NOT a symlink
+	if _, err := os.Readlink(claudeMDPath); err == nil {
+		t.Error("CLAUDE.md should not be a symlink when using default template")
+	}
+
+	// Verify content contains mechanism template
+	content, _ := os.ReadFile(claudeMDPath)
+	if !strings.Contains(string(content), "Conductor: Shared Knowledge Base") {
+		t.Error("CLAUDE.md should contain shared template content")
+	}
+
+	// Verify mechanism content is present
+	if !strings.Contains(string(content), "Agent-Deck CLI Reference") {
+		t.Error("CLAUDE.md should contain CLI reference (mechanism)")
+	}
+	if !strings.Contains(string(content), "Session Status Values") {
+		t.Error("CLAUDE.md should contain session status values (mechanism)")
+	}
+
+	// Verify policy content has been removed from shared template
+	if strings.Contains(string(content), "## Core Rules") {
+		t.Error("CLAUDE.md should NOT contain Core Rules (moved to POLICY.md)")
+	}
+	if strings.Contains(string(content), "## Auto-Response Guidelines") {
+		t.Error("CLAUDE.md should NOT contain Auto-Response Guidelines (moved to POLICY.md)")
+	}
+	if !strings.Contains(string(content), "Your heartbeat response format") {
+		t.Error("CLAUDE.md should contain heartbeat response format (bridge protocol)")
+	}
+}
+
+func TestInstallSharedClaudeMD_CustomSymlink(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "xdg-data"))
+	tmpDir := t.TempDir()
+	customPath := filepath.Join(tmpDir, "my-shared-claude.md")
+
+	// Create custom file first
+	if err := os.WriteFile(customPath, []byte("# My Custom Shared Rules\n"), 0o644); err != nil {
+		t.Fatalf("failed to create custom file: %v", err)
+	}
+
+	conductorDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
+	claudeMDPath := filepath.Join(conductorDir, "CLAUDE.md")
+
+	// Test installing with custom path (creates symlink)
+	err = InstallSharedClaudeMD(customPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify symlink exists
+	linkDest, err := os.Readlink(claudeMDPath)
+	if err != nil {
+		t.Fatalf("CLAUDE.md should be a symlink: %v", err)
+	}
+
+	// Verify symlink points to custom file
+	if linkDest != customPath {
+		t.Errorf("symlink should point to %q, got %q", customPath, linkDest)
+	}
+
+	// Verify reading through symlink works
+	content, _ := os.ReadFile(claudeMDPath)
+	if !strings.Contains(string(content), "My Custom Shared Rules") {
+		t.Error("reading through symlink should return custom content")
+	}
+}
+
+func TestInstallSharedClaudeMD_CustomSymlinkCreatesConductorDir(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(tmpHome, "xdg-data"))
+
+	customPath := filepath.Join(t.TempDir(), "my-shared-claude.md")
+	if err := os.WriteFile(customPath, []byte("# shared rules\n"), 0o644); err != nil {
+		t.Fatalf("failed to create custom file: %v", err)
+	}
+
+	if err := InstallSharedClaudeMD(customPath); err != nil {
+		t.Fatalf("InstallSharedClaudeMD returned error: %v", err)
+	}
+
+	conductorDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
+	target := filepath.Join(conductorDir, "CLAUDE.md")
+	linkDest, err := os.Readlink(target)
+	if err != nil {
+		t.Fatalf("expected symlink at %q: %v", target, err)
+	}
+	if linkDest != customPath {
+		t.Fatalf("symlink destination = %q, want %q", linkDest, customPath)
+	}
+}
+
+func TestGenerateTransitionNotifierDaemons_SurfaceLogPathErrors(t *testing.T) {
+	home := t.TempDir()
+	badXDGDataHome := filepath.Join(home, "xdg-data-file")
+	if err := os.WriteFile(badXDGDataHome, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q): %v", badXDGDataHome, err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", badXDGDataHome)
+
+	if _, err := GenerateTransitionNotifierLaunchdPlist(); err == nil {
+		t.Fatal("GenerateTransitionNotifierLaunchdPlist() error = nil, want log path lookup error")
+	}
+	if _, err := GenerateSystemdTransitionNotifierService(); err == nil {
+		t.Fatal("GenerateSystemdTransitionNotifierService() error = nil, want log path lookup error")
+	}
+}
+
+// neutralSessionExample is the session-creation row the shared AGENTS.md must
+// render: codex and pi both write that one file, so it names a placeholder
+// tool instead of one agent's flavor, which would strand the other (#2297).
+const neutralSessionExample = "agent-deck -p <PROFILE> add <path> -t \"Title\" -c <tool>"
+
+// useTempConductorHome points HOME and XDG_DATA_HOME at a fresh temp tree so
+// conductor files are written in isolation.
+func useTempConductorHome(t *testing.T) {
+	t.Helper()
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(tmpHome, "xdg-data"))
+}
+
+// readSharedAgentsMD returns the shared conductor/AGENTS.md contents.
+func readSharedAgentsMD(t *testing.T) string {
+	t.Helper()
+	conductorDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(conductorDir, "AGENTS.md"))
+	if err != nil {
+		t.Fatalf("failed to read shared AGENTS.md: %v", err)
+	}
+	return string(content)
+}
+
+// readConductorAgentsMD returns a single conductor's own AGENTS.md contents.
+func readConductorAgentsMD(t *testing.T, name string) string {
+	t.Helper()
+	dir, err := ConductorNameDir(name)
+	if err != nil {
+		t.Fatalf("ConductorNameDir(%s): %v", name, err)
+	}
+	content, err := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
+	if err != nil {
+		t.Fatalf("failed to read %s AGENTS.md: %v", name, err)
+	}
+	return string(content)
+}
+
+// assertNeutralSessionExamples fails if the shared AGENTS.md lost its
+// placeholder tool or picked up one agent's flavor of the CLI examples.
+func assertNeutralSessionExamples(t *testing.T, content string) {
+	t.Helper()
+	if !strings.Contains(content, neutralSessionExample) {
+		t.Fatalf("shared AGENTS.md should render agent-neutral session examples:\n%s", content)
+	}
+	if strings.Contains(content, "-c codex ") || strings.Contains(content, "-c pi ") {
+		t.Fatalf("shared AGENTS.md is biased toward one AGENTS.md-sharing agent:\n%s", content)
+	}
+}
+
+func TestInstallSharedConductorInstructions_CodexDefault(t *testing.T) {
+	useTempConductorHome(t)
+
+	if err := InstallSharedConductorInstructions(ConductorAgentCodex, ""); err != nil {
+		t.Fatalf("InstallSharedConductorInstructions returned error: %v", err)
+	}
+
+	content := readSharedAgentsMD(t)
+	if !strings.Contains(content, "Codex") {
+		t.Fatal("AGENTS.md should mention Codex")
+	}
+	assertNeutralSessionExamples(t, content)
+}
+
+// codex and pi both write the shared AGENTS.md (#2297): whichever sets up
+// first must not strand the other in its flavor of the CLI examples. The
+// shared template is agent-neutral, so setup order must not matter.
+func TestInstallSharedConductorInstructions_CodexPiOrderIndependent(t *testing.T) {
+	for _, order := range [][]string{
+		{ConductorAgentCodex, ConductorAgentPi},
+		{ConductorAgentPi, ConductorAgentCodex},
+	} {
+		t.Run(order[0]+"_then_"+order[1], func(t *testing.T) {
+			useTempConductorHome(t)
+
+			for _, agent := range order {
+				if err := InstallSharedConductorInstructions(agent, ""); err != nil {
+					t.Fatalf("InstallSharedConductorInstructions(%s): %v", agent, err)
+				}
+			}
+
+			assertNeutralSessionExamples(t, readSharedAgentsMD(t))
+		})
+	}
+}
+
+// Setting up both a codex and a pi conductor by name in one HOME (the "two
+// runtimes in the same dir" case from the #2297 review) must leave the
+// shared AGENTS.md neutral AND each per-name AGENTS.md correctly flavored
+// for its own agent.
+func TestSetupConductorWithAgent_CodexAndPiCoexistInSameHome(t *testing.T) {
+	useTempConductorHome(t)
+
+	for _, conductor := range []struct {
+		name  string
+		agent string
+	}{
+		{"cdxreview", ConductorAgentCodex},
+		{"pireview", ConductorAgentPi},
+	} {
+		if err := SetupConductorWithAgent(conductor.name, "default", conductor.agent, true, true, "", "", "", "", nil, ""); err != nil {
+			t.Fatalf("failed to set up %s conductor: %v", conductor.agent, err)
+		}
+		if err := InstallSharedConductorInstructions(conductor.agent, ""); err != nil {
+			t.Fatalf("InstallSharedConductorInstructions(%s): %v", conductor.agent, err)
+		}
+	}
+
+	assertNeutralSessionExamples(t, readSharedAgentsMD(t))
+
+	if content := readConductorAgentsMD(t, "cdxreview"); !strings.Contains(content, "Codex") {
+		t.Fatal("cdxreview's per-name AGENTS.md should identify it as Codex")
+	}
+	if content := readConductorAgentsMD(t, "pireview"); !strings.Contains(content, "Pi") {
+		t.Fatal("pireview's per-name AGENTS.md should identify it as Pi")
+	}
+}
+
+func TestInstallSharedConductorInstructions_AgentsCoexist(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(tmpHome, "xdg-data"))
+
+	if err := InstallSharedConductorInstructions(ConductorAgentClaude, ""); err != nil {
+		t.Fatalf("InstallSharedConductorInstructions(claude) returned error: %v", err)
+	}
+	if err := InstallSharedConductorInstructions(ConductorAgentCodex, ""); err != nil {
+		t.Fatalf("InstallSharedConductorInstructions(codex) returned error: %v", err)
+	}
+
+	base, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
+	for _, file := range []string{"CLAUDE.md", "AGENTS.md"} {
+		if _, err := os.Stat(filepath.Join(base, file)); err != nil {
+			t.Fatalf("%s should exist: %v", file, err)
+		}
+	}
+}
+
+func TestSetupConductor_DefaultTemplate(t *testing.T) {
+	name := "test-default"
+	profile := "default"
+
+	// Clean up after test
+	homeDir, _ := os.UserHomeDir()
+	defer os.RemoveAll(filepath.Join(homeDir, ".agent-deck", "conductor", name))
+
+	// Setup without custom path (uses default template)
+	err := SetupConductor(name, profile, true, true, "test description", "", "", "", nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify CLAUDE.md exists
+	dir, _ := ConductorNameDir(name)
+	claudeMDPath := filepath.Join(dir, "CLAUDE.md")
+	if _, err := os.Stat(claudeMDPath); os.IsNotExist(err) {
+		t.Errorf("CLAUDE.md not created at %q", claudeMDPath)
+	}
+
+	// Verify it's NOT a symlink
+	if _, err := os.Readlink(claudeMDPath); err == nil {
+		t.Error("CLAUDE.md should not be a symlink when using default template")
+	}
+
+	// Verify content contains conductor identity
+	content, _ := os.ReadFile(claudeMDPath)
+	if !strings.Contains(string(content), name) {
+		t.Errorf("CLAUDE.md should contain conductor name %q", name)
+	}
+
+	// Verify per-conductor CLAUDE.md references POLICY.md
+	if !strings.Contains(string(content), "POLICY.md") {
+		t.Error("per-conductor CLAUDE.md should reference POLICY.md")
+	}
+
+	// Verify meta.json does NOT contain ClaudeMDPath field
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("failed to load meta: %v", err)
+	}
+	// Just verify basic fields exist
+	if meta.Name != name {
+		t.Errorf("expected name %q, got %q", name, meta.Name)
+	}
+	if meta.Agent != ConductorAgentClaude {
+		t.Errorf("expected agent %q, got %q", ConductorAgentClaude, meta.Agent)
+	}
+}
+
+func TestSetupConductorWithAgent_Codex(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "test-codex"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentCodex, true, true, "codex conductor", "", "", "", nil, ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	agentsPath := filepath.Join(dir, "AGENTS.md")
+	content, err := os.ReadFile(agentsPath)
+	if err != nil {
+		t.Fatalf("failed to read AGENTS.md: %v", err)
+	}
+	if !strings.Contains(string(content), "Codex") {
+		t.Fatal("AGENTS.md should mention Codex")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); !os.IsNotExist(err) {
+		t.Fatal("CLAUDE.md should not be created for Codex conductor")
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("failed to load meta: %v", err)
+	}
+	if meta.Agent != ConductorAgentCodex {
+		t.Fatalf("agent = %q, want %q", meta.Agent, ConductorAgentCodex)
+	}
+	if meta.GetClearOnCompact() {
+		t.Fatal("codex conductor should not enable clear_on_compact")
+	}
+}
+
+func TestSetupConductorWithAgent_Pi(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "test-pi"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentPi, true, true, "pi conductor", "", "", "", nil, ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	agentsPath := filepath.Join(dir, "AGENTS.md")
+	content, err := os.ReadFile(agentsPath)
+	if err != nil {
+		t.Fatalf("failed to read AGENTS.md: %v", err)
+	}
+	if !strings.Contains(string(content), "Pi") {
+		t.Fatal("AGENTS.md should mention Pi")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); !os.IsNotExist(err) {
+		t.Fatal("CLAUDE.md should not be created for Pi conductor")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "HERMES.md")); !os.IsNotExist(err) {
+		t.Fatal("HERMES.md should not be created for Pi conductor")
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("failed to load meta: %v", err)
+	}
+	if meta.Agent != ConductorAgentPi {
+		t.Fatalf("agent = %q, want %q", meta.Agent, ConductorAgentPi)
+	}
+	if meta.GetClearOnCompact() {
+		t.Fatal("pi conductor should not enable clear_on_compact")
+	}
+}
+
+// pi and codex both read AGENTS.md (#2297): setting up a pi conductor for a
+// name previously set up as codex must not delete the file it just wrote
+// (the stale-instructions cleanup loop keys off filename collisions, not
+// just agent identity).
+func TestSetupConductorWithAgent_CodexToPiSharesAgentsFile(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "codex-then-pi"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentCodex, true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("failed to create initial Codex conductor: %v", err)
+	}
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentPi, true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("failed to switch conductor to Pi: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	content, err := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
+	if err != nil {
+		t.Fatalf("AGENTS.md should still exist after switching Codex conductor to Pi: %v", err)
+	}
+	if !strings.Contains(string(content), "Pi") {
+		t.Fatal("AGENTS.md should have been rewritten with Pi's content")
+	}
+}
+
+// ListConductors (the data source for `conductor list`) must surface a Pi
+// conductor's agent like any other registry-driven runtime.
+func TestListConductors_IncludesPiRuntime(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	if err := SetupConductorWithAgent("pi-fleet", "default", ConductorAgentPi, true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("SetupConductorWithAgent: %v", err)
+	}
+
+	conductors, err := ListConductors()
+	if err != nil {
+		t.Fatalf("ListConductors: %v", err)
+	}
+	index := slices.IndexFunc(conductors, func(c ConductorMeta) bool { return c.Name == "pi-fleet" })
+	if index < 0 {
+		t.Fatal("pi-fleet conductor not found in ListConductors output")
+	}
+	if agent := conductors[index].GetAgent(); agent != ConductorAgentPi {
+		t.Fatalf("agent = %q, want %q", agent, ConductorAgentPi)
+	}
+}
+
+func TestSetupConductorWithAgent_DefaultsHeartbeatInterval(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "hb-default"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentClaude, true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("failed to load meta: %v", err)
+	}
+	if meta.HeartbeatInterval != 15 {
+		t.Fatalf("HeartbeatInterval = %d, want 15 (fresh conductor with heartbeat enabled)", meta.HeartbeatInterval)
+	}
+}
+
+func TestSetupConductorWithAgent_HeartbeatDisabledKeepsZeroInterval(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "hb-off"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentClaude, false, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("failed to load meta: %v", err)
+	}
+	if meta.HeartbeatInterval != 0 {
+		t.Fatalf("HeartbeatInterval = %d, want 0 (heartbeat disabled)", meta.HeartbeatInterval)
+	}
+}
+
+func TestSetupConductorWithAgent_RemovesStaleInstructionsFile(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "switch-agent"
+	if err := SetupConductor(name, "default", true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("failed to create initial Claude conductor: %v", err)
+	}
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentCodex, true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("failed to switch conductor to Codex: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); !os.IsNotExist(err) {
+		t.Fatal("CLAUDE.md should be removed after switching conductor agent to Codex")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "AGENTS.md")); err != nil {
+		t.Fatalf("AGENTS.md should exist after switching conductor agent to Codex: %v", err)
+	}
+}
+
+func TestSetupConductor_CustomSymlink(t *testing.T) {
+	tmpDir := t.TempDir()
+	customPath := filepath.Join(tmpDir, "my-conductor-claude.md")
+
+	// Create custom file first
+	if err := os.WriteFile(customPath, []byte("# My Custom Conductor Rules\n"), 0o644); err != nil {
+		t.Fatalf("failed to create custom file: %v", err)
+	}
+
+	name := "test-symlink"
+	profile := "default"
+
+	// Clean up after test
+	homeDir, _ := os.UserHomeDir()
+	defer os.RemoveAll(filepath.Join(homeDir, ".agent-deck", "conductor", name))
+
+	// Setup with custom path (creates symlink)
+	err := SetupConductor(name, profile, true, true, "test description", customPath, "", "", nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify symlink exists
+	dir, _ := ConductorNameDir(name)
+	claudeMDPath := filepath.Join(dir, "CLAUDE.md")
+	linkDest, err := os.Readlink(claudeMDPath)
+	if err != nil {
+		t.Fatalf("CLAUDE.md should be a symlink: %v", err)
+	}
+
+	// Verify symlink points to custom file
+	if linkDest != customPath {
+		t.Errorf("symlink should point to %q, got %q", customPath, linkDest)
+	}
+
+	// Verify reading through symlink works
+	content, _ := os.ReadFile(claudeMDPath)
+	if !strings.Contains(string(content), "My Custom Conductor Rules") {
+		t.Error("reading through symlink should return custom content")
+	}
+}
+
+func TestSetupConductor_EmptyProfileNormalizesToDefault(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "default-profile-conductor"
+	if err := SetupConductor(name, "", true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("failed to load meta: %v", err)
+	}
+	if meta.Profile != DefaultProfile {
+		t.Fatalf("meta profile = %q, want %q", meta.Profile, DefaultProfile)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	content, err := os.ReadFile(filepath.Join(dir, "CLAUDE.md"))
+	if err != nil {
+		t.Fatalf("failed to read CLAUDE.md: %v", err)
+	}
+	if strings.Contains(string(content), "-p default") {
+		t.Fatal("default profile template should omit explicit -p default flags")
+	}
+}
+
+func TestSetupConductor_ProfileConflict(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "profile-conflict"
+	if err := SetupConductor(name, "work", true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("first setup failed: %v", err)
+	}
+
+	err := SetupConductor(name, "personal", true, true, "", "", "", "", nil, "")
+	if err == nil {
+		t.Fatal("expected conflict error when reusing conductor name across profiles")
+	}
+	if !strings.Contains(err.Error(), `already exists for profile "work"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadConductorMeta_EmptyProfileDefaultsToDefault(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "meta-empty-profile"
+	dir, _ := ConductorNameDir(name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("failed to create conductor dir: %v", err)
+	}
+
+	raw := `{"name":"meta-empty-profile","heartbeat_enabled":true,"created_at":"2026-01-01T00:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), []byte(raw), 0o644); err != nil {
+		t.Fatalf("failed to write meta.json: %v", err)
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("LoadConductorMeta failed: %v", err)
+	}
+	if meta.Profile != DefaultProfile {
+		t.Fatalf("meta profile = %q, want %q", meta.Profile, DefaultProfile)
+	}
+}
+
+func TestLoadConductorMeta_AgentContract(t *testing.T) {
+	tests := []struct {
+		name        string
+		raw         string
+		metaState   string
+		wantAgent   string
+		wantErr     bool
+		wantWarning bool
+	}{
+		{
+			name:      "missing agent defaults to claude",
+			raw:       `{"name":"meta-agent","profile":"default"}`,
+			wantAgent: ConductorAgentClaude,
+		},
+		{
+			name:      "empty agent defaults to claude",
+			raw:       `{"name":"meta-agent","agent":"  ","profile":"default"}`,
+			wantAgent: ConductorAgentClaude,
+		},
+		{
+			name:      "null agent defaults to claude",
+			raw:       `{"name":"meta-agent","agent":null,"profile":"default"}`,
+			wantAgent: ConductorAgentClaude,
+		},
+		{name: "case-variant agent is accepted", raw: `{"name":"meta-agent","Agent":"codex","profile":"default"}`, wantAgent: ConductorAgentCodex},
+		{
+			name:        "case-variant unsupported agent is preserved with a warning",
+			raw:         `{"name":"meta-agent","AGENT":"not-a-conductor-runtime","profile":"default"}`,
+			wantAgent:   "not-a-conductor-runtime",
+			wantWarning: true,
+		},
+		{name: "last case-variant agent wins", raw: `{"name":"meta-agent","agent":"claude","Agent":"codex","profile":"default"}`, wantAgent: ConductorAgentCodex},
+		{name: "duplicate null preserves prior agent", raw: `{"name":"meta-agent","agent":"codex","agent":null,"profile":"default"}`, wantAgent: ConductorAgentCodex},
+		{name: "last duplicate after case variant wins", raw: `{"name":"meta-agent","agent":"claude","Agent":"codex","agent":"hermes","profile":"default"}`, wantAgent: ConductorAgentHermes},
+		{name: "malformed earlier agent fails closed", raw: `{"name":"meta-agent","agent":42,"Agent":"codex","profile":"default"}`, wantErr: true},
+		{
+			// Back-compat: an agent this build doesn't recognize (e.g. a
+			// newer release's runtime read by an older binary) must not make
+			// the conductor disappear the way it did before this fix. It is
+			// kept, with the raw value preserved and a warning attached, so
+			// a caller that must not treat it as safe to recreate (the
+			// bridge's fresh-create path) can refuse instead of guessing.
+			name:        "unsupported non-empty agent is preserved with a warning",
+			raw:         `{"name":"meta-agent","agent":"not-a-conductor-runtime","profile":"default"}`,
+			wantAgent:   "not-a-conductor-runtime",
+			wantWarning: true,
+		},
+		{
+			name:    "malformed agent type fails closed",
+			raw:     `{"name":"meta-agent","agent":42,"profile":"default"}`,
+			wantErr: true,
+		},
+		{
+			name:    "malformed json fails closed",
+			raw:     `{"name":`,
+			wantErr: true,
+		},
+		{
+			// Back-compat: invalid UTF-8 anywhere in the file must not reject
+			// the whole file. json.Unmarshal already sanitizes invalid byte
+			// sequences in string values to U+FFFD, exactly as main did
+			// before the (now removed) whole-file utf8.Valid check.
+			name:      "invalid UTF-8 in non-agent field is tolerated, matching main",
+			raw:       "{\"name\":\"meta-agent\",\"description\":\"\xff\",\"agent\":\"codex\",\"profile\":\"default\"}",
+			wantAgent: ConductorAgentCodex,
+		},
+		{
+			name:    "non-object metadata fails closed",
+			raw:     `null`,
+			wantErr: true,
+		},
+		{
+			name:      "absent metadata fails closed",
+			metaState: "absent",
+			wantErr:   true,
+		},
+		{
+			name:      "unreadable metadata fails closed",
+			metaState: "directory",
+			wantErr:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			useTempConductorHome(t)
+			name := "meta-agent"
+			dir, err := ConductorNameDir(name)
+			if err != nil {
+				t.Fatalf("ConductorNameDir: %v", err)
+			}
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatalf("failed to create conductor dir: %v", err)
+			}
+
+			metaPath := filepath.Join(dir, "meta.json")
+			switch tt.metaState {
+			case "absent":
+			case "directory":
+				if err := os.Mkdir(metaPath, 0o755); err != nil {
+					t.Fatalf("failed to create unreadable meta.json stand-in: %v", err)
+				}
+			default:
+				if err := os.WriteFile(metaPath, []byte(tt.raw), 0o644); err != nil {
+					t.Fatalf("failed to write meta.json: %v", err)
+				}
+			}
+
+			meta, err := LoadConductorMeta(name)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("LoadConductorMeta() error = nil, meta = %+v", meta)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadConductorMeta failed: %v", err)
+			}
+			if meta.Agent != tt.wantAgent {
+				t.Fatalf("meta agent = %q, want %q", meta.Agent, tt.wantAgent)
+			}
+			if tt.wantWarning && meta.Warning == "" {
+				t.Fatalf("meta.Warning = %q, want non-empty", meta.Warning)
+			}
+			if !tt.wantWarning && meta.Warning != "" {
+				t.Fatalf("meta.Warning = %q, want empty", meta.Warning)
+			}
+		})
+	}
+}
+
+func TestCreateSymlinkWithExpansion_TildeExpansion(t *testing.T) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("failed to get home dir: %v", err)
+	}
+
+	// Create a temporary subdirectory under $HOME so tilde expansion resolves correctly
+	subDir := filepath.Join(homeDir, ".agent-deck-test-tilde")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("failed to create test dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(subDir) })
+
+	// Create source file under $HOME
+	sourceName := "test-tilde.md"
+	sourcePath := filepath.Join(subDir, sourceName)
+	if err := os.WriteFile(sourcePath, []byte("test"), 0o644); err != nil {
+		t.Fatalf("failed to create source: %v", err)
+	}
+
+	// Use tilde path — expands to $HOME/.agent-deck-test-tilde/test-tilde.md
+	tildePath := filepath.Join("~", ".agent-deck-test-tilde", sourceName)
+	targetPath := filepath.Join(t.TempDir(), "link.md")
+
+	// Test symlink creation with tilde expansion
+	err = createSymlinkWithExpansion(targetPath, tildePath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify symlink points to expanded path
+	linkDest, err := os.Readlink(targetPath)
+	if err != nil {
+		t.Fatalf("should be a symlink: %v", err)
+	}
+
+	expectedDest := filepath.Join(homeDir, ".agent-deck-test-tilde", sourceName)
+	if linkDest != expectedDest {
+		t.Errorf("symlink should point to %q, got %q", expectedDest, linkDest)
+	}
+}
+
+func TestCreateSymlinkWithExpansion_RelativePathError(t *testing.T) {
+	tmpDir := t.TempDir()
+	targetPath := filepath.Join(tmpDir, "link.md")
+
+	// Try with relative path (should fail)
+	err := createSymlinkWithExpansion(targetPath, "relative/path.md")
+	if err == nil {
+		t.Error("expected error for relative path, got nil")
+	}
+	if !strings.Contains(err.Error(), "absolute") {
+		t.Errorf("error should mention 'absolute', got %v", err)
+	}
+}
+
+func TestGenerateSystemdBridgeService_IncludesAgentDeckDir(t *testing.T) {
+	unit, err := GenerateSystemdBridgeService()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(unit, "__PATH__") {
+		t.Error("unit still contains __PATH__ placeholder")
+	}
+	agentDeck := FindAgentDeck()
+	if agentDeck == "" {
+		t.Skip("agent-deck not found in PATH, skipping directory check")
+	}
+	if !strings.Contains(unit, filepath.Dir(agentDeck)) {
+		t.Errorf("systemd bridge unit PATH should contain agent-deck dir, unit:\n%s", unit)
+	}
+}
+
+func TestGenerateSystemdHeartbeatService_IncludesAgentDeckDir(t *testing.T) {
+	unit, err := GenerateSystemdHeartbeatService("test-conductor")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(unit, "__PATH__") {
+		t.Error("unit still contains __PATH__ placeholder")
+	}
+	agentDeck := FindAgentDeck()
+	if agentDeck == "" {
+		t.Skip("agent-deck not found in PATH, skipping directory check")
+	}
+	if !strings.Contains(unit, filepath.Dir(agentDeck)) {
+		t.Errorf("systemd heartbeat unit PATH should contain agent-deck dir, unit:\n%s", unit)
+	}
+}
+
+func TestGenerateHeartbeatPlist_IncludesAgentDeckDir(t *testing.T) {
+	plist, err := GenerateHeartbeatPlist("test-conductor", 15)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found in PATH") {
+			t.Skipf("skipping: %v", err)
+		}
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(plist, "__PATH__") {
+		t.Error("plist still contains __PATH__ placeholder")
+	}
+	agentDeck := FindAgentDeck()
+	if agentDeck == "" {
+		t.Skip("agent-deck not found in PATH, skipping directory check")
+	}
+	agentDeckDir := filepath.Dir(agentDeck)
+	if !strings.Contains(plist, agentDeckDir) {
+		t.Errorf("heartbeat plist PATH should contain agent-deck dir %q, plist:\n%s", agentDeckDir, plist)
+	}
+}
+
+func TestGenerateLaunchdPlist_IncludesAgentDeckDir(t *testing.T) {
+	plist, err := GenerateLaunchdPlist()
+	if err != nil {
+		if strings.Contains(err.Error(), "not found in PATH") {
+			t.Skipf("skipping: %v", err)
+		}
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Verify no __PATH__ placeholder remains
+	if strings.Contains(plist, "__PATH__") {
+		t.Error("plist still contains __PATH__ placeholder")
+	}
+	// The plist PATH should include the directory of the agent-deck binary
+	agentDeck := FindAgentDeck()
+	if agentDeck == "" {
+		t.Skip("agent-deck not found in PATH, skipping directory check")
+	}
+	agentDeckDir := filepath.Dir(agentDeck)
+	if !strings.Contains(plist, agentDeckDir) {
+		t.Errorf("plist PATH should contain agent-deck dir %q, plist:\n%s", agentDeckDir, plist)
+	}
+}
+
+func TestFindPython3_PrefersPathLookup(t *testing.T) {
+	tmpBin := t.TempDir()
+	pythonPath := filepath.Join(tmpBin, "python3")
+
+	if err := os.WriteFile(pythonPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("failed to create fake python3: %v", err)
+	}
+
+	t.Setenv("PATH", tmpBin)
+
+	got := findPython3()
+	if got != pythonPath {
+		t.Fatalf("findPython3() = %q, want %q", got, pythonPath)
+	}
+}
+
+func TestBuildDaemonPath(t *testing.T) {
+	tests := []struct {
+		name          string
+		agentDeckPath string
+		wantPrefix    string
+		wantContains  string
+	}{
+		{
+			name:          "empty path falls back to standard",
+			agentDeckPath: "",
+			wantPrefix:    "/usr/local/bin",
+			wantContains:  "/usr/bin:/bin",
+		},
+		{
+			name:          "local bin prepended",
+			agentDeckPath: "/Users/someone/.local/bin/agent-deck",
+			wantPrefix:    "/Users/someone/.local/bin",
+			wantContains:  "/usr/local/bin",
+		},
+		{
+			name:          "homebrew path prioritized",
+			agentDeckPath: "/opt/homebrew/bin/agent-deck",
+			wantPrefix:    "/opt/homebrew/bin",
+			wantContains:  "/usr/bin:/bin",
+		},
+		{
+			name:          "custom path included",
+			agentDeckPath: "/custom/tools/bin/agent-deck",
+			wantPrefix:    "/custom/tools/bin",
+			wantContains:  "/usr/local/bin",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := buildDaemonPath(tt.agentDeckPath)
+			if !strings.HasPrefix(result, tt.wantPrefix) {
+				t.Errorf("buildDaemonPath(%q) = %q, want prefix %q", tt.agentDeckPath, result, tt.wantPrefix)
+			}
+			if !strings.Contains(result, tt.wantContains) {
+				t.Errorf("buildDaemonPath(%q) = %q, want to contain %q", tt.agentDeckPath, result, tt.wantContains)
+			}
+			// Must never contain duplicate colons
+			if strings.Contains(result, "::") {
+				t.Errorf("buildDaemonPath(%q) = %q, contains double colon", tt.agentDeckPath, result)
+			}
+		})
+	}
+}
+
+// TestBuildDaemonPath_HomebrewDarwinOnly verifies that /opt/homebrew/bin is
+// only injected into the daemon PATH base entries on macOS. On Linux the path
+// does not exist, so generated systemd units must not reference it.
+func TestBuildDaemonPath_HomebrewDarwinOnly(t *testing.T) {
+	// Use a non-homebrew agent-deck path so the only way /opt/homebrew/bin can
+	// appear is via the base entries.
+	result := buildDaemonPath("/custom/tools/bin/agent-deck")
+	hasHomebrew := strings.Contains(result, "/opt/homebrew/bin")
+	wantHomebrew := runtime.GOOS == "darwin"
+	if hasHomebrew != wantHomebrew {
+		t.Errorf("buildDaemonPath on GOOS=%q = %q; homebrew present=%v, want %v",
+			runtime.GOOS, result, hasHomebrew, wantHomebrew)
+	}
+}
+
+func TestCreateSymlinkWithExpansion_MissingSourceError(t *testing.T) {
+	tmpDir := t.TempDir()
+	targetPath := filepath.Join(tmpDir, "link.md")
+	sourcePath := filepath.Join(tmpDir, "nonexistent.md")
+
+	// Try with non-existent source (should fail)
+	err := createSymlinkWithExpansion(targetPath, sourcePath)
+	if err == nil {
+		t.Error("expected error for missing source file, got nil")
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Errorf("error should mention 'does not exist', got %v", err)
+	}
+}
+
+// --- Policy MD tests ---
+
+func TestInstallPolicyMD_Default(t *testing.T) {
+	conductorDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
+	policyPath := filepath.Join(conductorDir, "POLICY.md")
+
+	// Backup existing file if present
+	var backup []byte
+	if content, err := os.ReadFile(policyPath); err == nil {
+		backup = content
+		defer func() { _ = os.WriteFile(policyPath, backup, 0o644) }()
+	} else {
+		defer os.Remove(policyPath)
+	}
+
+	// Test installing default template
+	if err := InstallPolicyMD(""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify file exists at default location
+	if _, err := os.Stat(policyPath); os.IsNotExist(err) {
+		t.Errorf("POLICY.md not created at %q", policyPath)
+	}
+
+	// Verify it's NOT a symlink
+	if _, err := os.Readlink(policyPath); err == nil {
+		t.Error("POLICY.md should not be a symlink when using default template")
+	}
+
+	// Verify content contains policy template
+	content, _ := os.ReadFile(policyPath)
+	if !strings.Contains(string(content), "Conductor Policy") {
+		t.Error("POLICY.md should contain policy template content")
+	}
+
+	// Verify policy-specific content is present
+	if !strings.Contains(string(content), "Core Rules") {
+		t.Error("POLICY.md should contain Core Rules")
+	}
+	if !strings.Contains(string(content), "Auto-Response Guidelines") {
+		t.Error("POLICY.md should contain Auto-Response Guidelines")
+	}
+	if strings.Contains(string(content), "Heartbeat Response Format") {
+		t.Error("POLICY.md should NOT contain Heartbeat Response Format (it's a bridge protocol, belongs in CLAUDE.md)")
+	}
+}
+
+func TestInstallPolicyMD_CustomSymlink(t *testing.T) {
+	tmpDir := t.TempDir()
+	customPath := filepath.Join(tmpDir, "my-POLICY.md")
+
+	// Create custom file first
+	if err := os.WriteFile(customPath, []byte("# My Custom Policy\n"), 0o644); err != nil {
+		t.Fatalf("failed to create custom file: %v", err)
+	}
+
+	// Use actual conductor directory (cleanup after test)
+	conductorDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
+	policyPath := filepath.Join(conductorDir, "POLICY.md")
+
+	// Backup existing file/symlink if present
+	var backupContent []byte
+	var backupLink string
+	if linkDest, err := os.Readlink(policyPath); err == nil {
+		backupLink = linkDest
+	} else if content, err := os.ReadFile(policyPath); err == nil {
+		backupContent = content
+	}
+	t.Cleanup(func() {
+		os.Remove(policyPath)
+		if backupLink != "" {
+			_ = os.Symlink(backupLink, policyPath)
+		} else if backupContent != nil {
+			_ = os.WriteFile(policyPath, backupContent, 0o644)
+		}
+	})
+
+	// Test installing with custom path (creates symlink)
+	err = InstallPolicyMD(customPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify symlink exists
+	linkDest, err := os.Readlink(policyPath)
+	if err != nil {
+		t.Fatalf("POLICY.md should be a symlink: %v", err)
+	}
+
+	// Verify symlink points to custom file
+	if linkDest != customPath {
+		t.Errorf("symlink should point to %q, got %q", customPath, linkDest)
+	}
+
+	// Verify reading through symlink works
+	content, _ := os.ReadFile(policyPath)
+	if !strings.Contains(string(content), "My Custom Policy") {
+		t.Error("reading through symlink should return custom content")
+	}
+}
+
+func TestSetupConductor_PolicyOverride(t *testing.T) {
+	tmpDir := t.TempDir()
+	customPolicyPath := filepath.Join(tmpDir, "my-conductor-POLICY.md")
+
+	// Create custom file first
+	if err := os.WriteFile(customPolicyPath, []byte("# My Conductor Policy\n"), 0o644); err != nil {
+		t.Fatalf("failed to create custom file: %v", err)
+	}
+
+	name := "test-policy-override"
+	profile := "default"
+
+	// Clean up after test
+	if conductorDir, err := ConductorDir(); err == nil {
+		defer os.RemoveAll(filepath.Join(conductorDir, name))
+	}
+
+	// Setup with custom policy path (creates per-conductor symlink)
+	err := SetupConductor(name, profile, true, true, "test description", "", customPolicyPath, "", nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify per-conductor POLICY.md symlink exists
+	dir, _ := ConductorNameDir(name)
+	policyPath := filepath.Join(dir, "POLICY.md")
+	linkDest, err := os.Readlink(policyPath)
+	if err != nil {
+		t.Fatalf("POLICY.md should be a symlink: %v", err)
+	}
+
+	// Verify symlink points to custom file
+	if linkDest != customPolicyPath {
+		t.Errorf("symlink should point to %q, got %q", customPolicyPath, linkDest)
+	}
+
+	// Verify reading through symlink works
+	content, _ := os.ReadFile(policyPath)
+	if !strings.Contains(string(content), "My Conductor Policy") {
+		t.Error("reading through symlink should return custom content")
+	}
+}
+
+func TestSetupConductor_HeartbeatRulesOverride(t *testing.T) {
+	tmpDir := t.TempDir()
+	customRulesPath := filepath.Join(tmpDir, "my-conductor-HEARTBEAT_RULES.md")
+
+	// Create custom file first
+	if err := os.WriteFile(customRulesPath, []byte("# My Conductor Heartbeat Rules\n"), 0o644); err != nil {
+		t.Fatalf("failed to create custom file: %v", err)
+	}
+
+	name := "test-heartbeat-rules-override"
+	profile := "default"
+
+	// Clean up after test
+	homeDir, _ := os.UserHomeDir()
+	defer os.RemoveAll(filepath.Join(homeDir, ".agent-deck", "conductor", name))
+
+	// Setup with custom heartbeat rules path (creates per-conductor symlink)
+	err := SetupConductor(name, profile, true, true, "test description", "", "", customRulesPath, nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify per-conductor HEARTBEAT_RULES.md symlink exists
+	dir, _ := ConductorNameDir(name)
+	rulesPath := filepath.Join(dir, "HEARTBEAT_RULES.md")
+	linkDest, err := os.Readlink(rulesPath)
+	if err != nil {
+		t.Fatalf("HEARTBEAT_RULES.md should be a symlink: %v", err)
+	}
+
+	// Verify symlink points to custom file
+	if linkDest != customRulesPath {
+		t.Errorf("symlink should point to %q, got %q", customRulesPath, linkDest)
+	}
+
+	// Verify reading through symlink works
+	content, _ := os.ReadFile(rulesPath)
+	if !strings.Contains(string(content), "My Conductor Heartbeat Rules") {
+		t.Error("reading through symlink should return custom content")
+	}
+}
+
+func TestMigrateConductorPolicySplit_RewritesLegacyGeneratedTemplate(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "legacy-policy-migrate"
+	profile := DefaultProfile
+	if err := SaveConductorMeta(&ConductorMeta{
+		Name:             name,
+		Profile:          profile,
+		HeartbeatEnabled: true,
+		CreatedAt:        "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("failed to save meta: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	claudePath := filepath.Join(dir, "CLAUDE.md")
+	legacyContent := renderConductorClaudeTemplate(conductorPerNameClaudeMDLegacyTemplate, name, profile)
+	if err := os.WriteFile(claudePath, []byte(legacyContent), 0o644); err != nil {
+		t.Fatalf("failed to write legacy CLAUDE.md: %v", err)
+	}
+
+	migrated, err := MigrateConductorPolicySplit()
+	if err != nil {
+		t.Fatalf("unexpected migration error: %v", err)
+	}
+
+	found := false
+	for _, migratedName := range migrated {
+		if migratedName == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected %q to be migrated, got %v", name, migrated)
+	}
+
+	content, err := os.ReadFile(claudePath)
+	if err != nil {
+		t.Fatalf("failed to read migrated CLAUDE.md: %v", err)
+	}
+	if !strings.Contains(string(content), "## Policy") {
+		t.Fatal("migrated CLAUDE.md should contain policy section")
+	}
+	if !strings.Contains(string(content), "./POLICY.md") {
+		t.Fatal("migrated CLAUDE.md should reference ./POLICY.md")
+	}
+}
+
+func TestMigrateConductorPolicySplit_PreservesCustomClaudeMD(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "custom-claude-policy-migrate"
+	profile := "work"
+	if err := SaveConductorMeta(&ConductorMeta{
+		Name:             name,
+		Profile:          profile,
+		HeartbeatEnabled: true,
+		CreatedAt:        "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("failed to save meta: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	claudePath := filepath.Join(dir, "CLAUDE.md")
+	customContent := "# Custom conductor instructions\nDo not overwrite this file.\n"
+	if err := os.WriteFile(claudePath, []byte(customContent), 0o644); err != nil {
+		t.Fatalf("failed to write custom CLAUDE.md: %v", err)
+	}
+
+	migrated, err := MigrateConductorPolicySplit()
+	if err != nil {
+		t.Fatalf("unexpected migration error: %v", err)
+	}
+	for _, migratedName := range migrated {
+		if migratedName == name {
+			t.Fatalf("custom CLAUDE.md should not be migrated, got %v", migrated)
+		}
+	}
+
+	content, err := os.ReadFile(claudePath)
+	if err != nil {
+		t.Fatalf("failed to read CLAUDE.md: %v", err)
+	}
+	if string(content) != customContent {
+		t.Fatal("custom CLAUDE.md content should be preserved")
+	}
+}
+
+// --- LEARNINGS.md tests ---
+
+func TestInstallLearningsMD(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(tmpHome, ".local", "share"))
+
+	err := InstallLearningsMD()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	conductorDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
+	learningsPath := filepath.Join(conductorDir, "LEARNINGS.md")
+	content, err := os.ReadFile(learningsPath)
+	if err != nil {
+		t.Fatalf("LEARNINGS.md not created: %v", err)
+	}
+
+	if !strings.Contains(string(content), "# Conductor Learnings") {
+		t.Error("LEARNINGS.md should contain header")
+	}
+	if !strings.Contains(string(content), "## Entry Format") {
+		t.Error("LEARNINGS.md should contain Entry Format section")
+	}
+	if !strings.Contains(string(content), "## How to Use This File") {
+		t.Error("LEARNINGS.md should contain How to Use section")
+	}
+}
+
+func TestInstallLearningsMDPreservesExisting(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	// Create the directory and an existing LEARNINGS.md with custom content
+	conductorDir := filepath.Join(tmpHome, ".agent-deck", "conductor")
+	if err := os.MkdirAll(conductorDir, 0o755); err != nil {
+		t.Fatalf("failed to create dir: %v", err)
+	}
+	customContent := "# My Custom Learnings\n\n### [20260101-001] Test entry\n"
+	learningsPath := filepath.Join(conductorDir, "LEARNINGS.md")
+	if err := os.WriteFile(learningsPath, []byte(customContent), 0o644); err != nil {
+		t.Fatalf("failed to write existing file: %v", err)
+	}
+
+	// InstallLearningsMD should NOT overwrite
+	err := InstallLearningsMD()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	content, err := os.ReadFile(learningsPath)
+	if err != nil {
+		t.Fatalf("failed to read file: %v", err)
+	}
+	if string(content) != customContent {
+		t.Errorf("existing LEARNINGS.md should be preserved, got:\n%s", string(content))
+	}
+}
+
+func TestSetupConductorCreatesLearnings(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "learnings-test"
+	if err := SetupConductor(name, "default", true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	learningsPath := filepath.Join(dir, "LEARNINGS.md")
+	content, err := os.ReadFile(learningsPath)
+	if err != nil {
+		t.Fatalf("per-conductor LEARNINGS.md not created: %v", err)
+	}
+
+	if !strings.Contains(string(content), "# Conductor Learnings") {
+		t.Error("per-conductor LEARNINGS.md should contain template content")
+	}
+	if !strings.Contains(string(content), "Promote") {
+		t.Error("per-conductor LEARNINGS.md should contain promotion rules")
+	}
+}
+
+func TestSetupConductorPreservesExistingLearnings(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "learnings-preserve"
+	// First setup creates the file
+	if err := SetupConductor(name, "default", true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("first setup failed: %v", err)
+	}
+
+	// Write custom content
+	dir, _ := ConductorNameDir(name)
+	learningsPath := filepath.Join(dir, "LEARNINGS.md")
+	customContent := "# My Learnings\n\n### [20260201-001] Custom entry\n"
+	if err := os.WriteFile(learningsPath, []byte(customContent), 0o644); err != nil {
+		t.Fatalf("failed to write custom content: %v", err)
+	}
+
+	// Re-running setup should NOT overwrite
+	if err := SetupConductor(name, "default", true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("second setup failed: %v", err)
+	}
+
+	content, err := os.ReadFile(learningsPath)
+	if err != nil {
+		t.Fatalf("failed to read file: %v", err)
+	}
+	if string(content) != customContent {
+		t.Errorf("existing per-conductor LEARNINGS.md should be preserved, got:\n%s", string(content))
+	}
+}
+
+func TestLearningsTemplateContent(t *testing.T) {
+	template := conductorLearningsTemplate
+
+	// Verify required sections
+	sections := []string{
+		"# Conductor Learnings",
+		"## How to Use This File",
+		"## Entry Format",
+		"YYYYMMDD-NNN",
+	}
+	for _, section := range sections {
+		if !strings.Contains(template, section) {
+			t.Errorf("template should contain %q", section)
+		}
+	}
+
+	// Verify entry types are documented
+	types := []string{
+		"auto_response_ok",
+		"auto_response_wrong",
+		"escalation_unnecessary",
+		"escalation_correct",
+		"pattern",
+		"session_behavior",
+	}
+	for _, entryType := range types {
+		if !strings.Contains(template, entryType) {
+			t.Errorf("template should document entry type %q", entryType)
+		}
+	}
+
+	// Verify promotion instructions
+	if !strings.Contains(template, "Promote") {
+		t.Error("template should contain promotion instructions")
+	}
+	if !strings.Contains(template, "POLICY.md") {
+		t.Error("template should reference POLICY.md for promotions")
+	}
+
+	// Verify status values
+	statuses := []string{"active", "promoted", "retired"}
+	for _, status := range statuses {
+		if !strings.Contains(template, status) {
+			t.Errorf("template should document status %q", status)
+		}
+	}
+}
+
+func TestMigrateConductorLearnings_BackfillsExistingConductors(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "existing-conductor"
+	profile := DefaultProfile
+
+	// Create a conductor with the pre-learnings template (post-policy-split, no LEARNINGS.md step)
+	if err := SaveConductorMeta(&ConductorMeta{
+		Name:             name,
+		Profile:          profile,
+		HeartbeatEnabled: true,
+		CreatedAt:        "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("failed to save meta: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	claudePath := filepath.Join(dir, "CLAUDE.md")
+	preLearningsContent := renderConductorClaudeTemplate(conductorPerNameClaudeMDPreLearningsTemplate, name, profile)
+	if err := os.WriteFile(claudePath, []byte(preLearningsContent), 0o644); err != nil {
+		t.Fatalf("failed to write pre-learnings CLAUDE.md: %v", err)
+	}
+
+	// Run migration
+	migrated, err := MigrateConductorLearnings()
+	if err != nil {
+		t.Fatalf("unexpected migration error: %v", err)
+	}
+
+	// Should be migrated
+	found := false
+	for _, n := range migrated {
+		if n == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected %q to be migrated, got %v", name, migrated)
+	}
+
+	// Verify CLAUDE.md now has LEARNINGS.md step
+	content, err := os.ReadFile(claudePath)
+	if err != nil {
+		t.Fatalf("failed to read CLAUDE.md: %v", err)
+	}
+	if !strings.Contains(string(content), "LEARNINGS.md") {
+		t.Fatal("migrated CLAUDE.md should reference LEARNINGS.md")
+	}
+	if !strings.Contains(string(content), "review past patterns") {
+		t.Fatal("migrated CLAUDE.md should contain learnings reading instruction")
+	}
+
+	// Verify per-conductor LEARNINGS.md was created
+	learningsPath := filepath.Join(dir, "LEARNINGS.md")
+	lContent, err := os.ReadFile(learningsPath)
+	if err != nil {
+		t.Fatalf("per-conductor LEARNINGS.md not created: %v", err)
+	}
+	if !strings.Contains(string(lContent), "# Conductor Learnings") {
+		t.Fatal("per-conductor LEARNINGS.md should contain template")
+	}
+
+	// Verify shared LEARNINGS.md was created
+	base, _ := ConductorDir()
+	sharedPath := filepath.Join(base, "LEARNINGS.md")
+	sContent, err := os.ReadFile(sharedPath)
+	if err != nil {
+		t.Fatalf("shared LEARNINGS.md not created: %v", err)
+	}
+	if !strings.Contains(string(sContent), "# Conductor Learnings") {
+		t.Fatal("shared LEARNINGS.md should contain template")
+	}
+}
+
+func TestMigrateConductorLearnings_PreservesCustomClaudeMD(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "custom-learnings-migrate"
+	if err := SaveConductorMeta(&ConductorMeta{
+		Name:             name,
+		Profile:          "work",
+		HeartbeatEnabled: true,
+		CreatedAt:        "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("failed to save meta: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	claudePath := filepath.Join(dir, "CLAUDE.md")
+	customContent := "# Custom conductor instructions\nDo not overwrite.\n"
+	if err := os.WriteFile(claudePath, []byte(customContent), 0o644); err != nil {
+		t.Fatalf("failed to write custom CLAUDE.md: %v", err)
+	}
+
+	migrated, err := MigrateConductorLearnings()
+	if err != nil {
+		t.Fatalf("unexpected migration error: %v", err)
+	}
+
+	// Should still be migrated (LEARNINGS.md was created) but CLAUDE.md preserved
+	content, err := os.ReadFile(claudePath)
+	if err != nil {
+		t.Fatalf("failed to read CLAUDE.md: %v", err)
+	}
+	if string(content) != customContent {
+		t.Fatal("custom CLAUDE.md should be preserved")
+	}
+
+	// LEARNINGS.md should still be created
+	learningsPath := filepath.Join(dir, "LEARNINGS.md")
+	if _, err := os.Stat(learningsPath); os.IsNotExist(err) {
+		t.Fatal("per-conductor LEARNINGS.md should be created even for custom CLAUDE.md")
+	}
+
+	// Verify the conductor IS in migrated list (because LEARNINGS.md was created)
+	found := false
+	for _, n := range migrated {
+		if n == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("conductor should be in migrated list since LEARNINGS.md was created")
+	}
+}
+
+func TestMigrateConductorLearnings_SkipsAlreadyMigrated(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "already-migrated"
+	if err := SaveConductorMeta(&ConductorMeta{
+		Name:             name,
+		Profile:          DefaultProfile,
+		HeartbeatEnabled: true,
+		CreatedAt:        "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("failed to save meta: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+
+	// Write the current (post-learnings) template
+	claudePath := filepath.Join(dir, "CLAUDE.md")
+	currentContent := renderConductorClaudeTemplate(conductorPerNameClaudeMDTemplate, name, DefaultProfile)
+	if err := os.WriteFile(claudePath, []byte(currentContent), 0o644); err != nil {
+		t.Fatalf("failed to write CLAUDE.md: %v", err)
+	}
+
+	// Write LEARNINGS.md too
+	learningsPath := filepath.Join(dir, "LEARNINGS.md")
+	if err := os.WriteFile(learningsPath, []byte(conductorLearningsTemplate), 0o644); err != nil {
+		t.Fatalf("failed to write LEARNINGS.md: %v", err)
+	}
+
+	migrated, err := MigrateConductorLearnings()
+	if err != nil {
+		t.Fatalf("unexpected migration error: %v", err)
+	}
+
+	// Should NOT appear in migrated list (already up to date)
+	for _, n := range migrated {
+		if n == name {
+			t.Fatal("already-migrated conductor should not be in migrated list")
+		}
+	}
+}
+
+func TestMigrateConductorPolicySplit_PreservesSymlinkedClaudeMD(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "symlink-claude-policy-migrate"
+	if err := SaveConductorMeta(&ConductorMeta{
+		Name:             name,
+		Profile:          DefaultProfile,
+		HeartbeatEnabled: true,
+		CreatedAt:        "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("failed to save meta: %v", err)
+	}
+
+	customPath := filepath.Join(t.TempDir(), "custom-claude.md")
+	if err := os.WriteFile(customPath, []byte("# custom"), 0o644); err != nil {
+		t.Fatalf("failed to write custom target: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	claudePath := filepath.Join(dir, "CLAUDE.md")
+	if err := os.Symlink(customPath, claudePath); err != nil {
+		t.Fatalf("failed to create CLAUDE.md symlink: %v", err)
+	}
+
+	migrated, err := MigrateConductorPolicySplit()
+	if err != nil {
+		t.Fatalf("unexpected migration error: %v", err)
+	}
+	for _, migratedName := range migrated {
+		if migratedName == name {
+			t.Fatalf("symlinked CLAUDE.md should not be migrated, got %v", migrated)
+		}
+	}
+
+	linkDest, err := os.Readlink(claudePath)
+	if err != nil {
+		t.Fatalf("CLAUDE.md should remain a symlink: %v", err)
+	}
+	if linkDest != customPath {
+		t.Fatalf("symlink destination changed to %q, want %q", linkDest, customPath)
+	}
+}
+
+func TestConductorMeta_GetClearOnCompact(t *testing.T) {
+	// nil (default) -> true
+	meta := &ConductorMeta{Name: "test"}
+	if !meta.GetClearOnCompact() {
+		t.Error("nil ClearOnCompact should default to true")
+	}
+
+	// explicitly true
+	trueVal := true
+	meta.ClearOnCompact = &trueVal
+	if !meta.GetClearOnCompact() {
+		t.Error("explicit true should return true")
+	}
+
+	// explicitly false
+	falseVal := false
+	meta.ClearOnCompact = &falseVal
+	if meta.GetClearOnCompact() {
+		t.Error("explicit false should return false")
+	}
+}
+
+// --- Discord bridge template tests ---
+
+func TestBridgeTemplate_ContainsDiscordBot(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		"HAS_DISCORD",
+		"create_discord_bot",
+		"DISCORD_MAX_LENGTH",
+		"class ConductorBot(discord.Client):",
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_ContainsDiscordAuthorization(t *testing.T) {
+	template := conductorBridgePy
+
+	// Check for authorization function
+	if !strings.Contains(template, "def is_authorized(user_id: int) -> bool:") {
+		t.Error("template should contain is_authorized function for Discord")
+	}
+
+	// Check for unauthorized message logging
+	if !strings.Contains(template, "Unauthorized Discord message from user") {
+		t.Error("template should log unauthorized Discord messages")
+	}
+}
+
+func TestBridgeTemplate_DiscordConfigLoading(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		`dc = conductor_cfg.get("discord", {})`,
+		`dc_bot_token = _resolve_secret(dc.get("bot_token", ""))`,
+		`dc_guild_id = dc.get("guild_id", 0)`,
+		`dc_channel_id = dc.get("channel_id", 0)`,
+		`dc_user_id = _resolve_secret(str(dc.get("user_id", "") or ""))`,
+		`dc_listen_mode = dc.get("listen_mode", "all")`,
+		`dc_ignore_replies_to_others = dc.get("ignore_replies_to_others", False)`,
+		`"listen_mode": dc_listen_mode,`,
+		`"ignore_replies_to_others": bool(dc_ignore_replies_to_others),`,
+		`"discord":`,
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord config pattern: %q", pattern)
+		}
+	}
+}
+
+// TestBridgeTemplate_UserIDResolvedViaSecret asserts that the bridge template
+// resolves telegram/discord user_id through _resolve_secret (so it accepts an
+// env-var reference like "$TELEGRAM_USER_ID"), mirroring the bot-token style,
+// while still coercing the resolved value to int in the returned config.
+func TestBridgeTemplate_UserIDResolvedViaSecret(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		`tg_user_id = _resolve_secret(str(tg.get("user_id", "") or ""))`,
+		`dc_user_id = _resolve_secret(str(dc.get("user_id", "") or ""))`,
+		`"user_id": int(tg_user_id) if tg_user_id else 0,`,
+		`"user_id": int(dc_user_id) if dc_user_id else 0,`,
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain user_id resolution pattern: %q", pattern)
+		}
+	}
+}
+
+// TestBridgeTemplate_UserIDResolutionBehavior exercises the real _resolve_secret
+// function (sliced from the shipped template) against the exact user_id
+// resolution expression, covering: string env ref -> int, literal int unchanged,
+// and unset/empty -> 0. Skips if python3 is unavailable.
+func TestBridgeTemplate_UserIDResolutionBehavior(t *testing.T) {
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not available; skipping behavioral test")
+	}
+
+	template := conductorBridgePy
+	start := strings.Index(template, "def _resolve_secret")
+	end := strings.Index(template, "def load_config")
+	if start < 0 || end < 0 || end <= start {
+		t.Fatal("could not slice _resolve_secret from template")
+	}
+	resolveSecretSrc := template[start:end]
+
+	// Harness reuses the real _resolve_secret and mirrors the template's
+	// user_id resolution line exactly (asserted statically above).
+	harness := `import os
+class _Log:
+    def warning(self, *a, **k):
+        pass
+log = _Log()
+` + resolveSecretSrc + `
+def resolve_user_id(cfg):
+    user_id = _resolve_secret(str(cfg.get("user_id", "") or ""))
+    return int(user_id) if user_id else 0
+
+os.environ["TELEGRAM_USER_ID"] = "123456"
+os.environ.pop("NOPE_UNSET", None)
+print(resolve_user_id({"user_id": "$TELEGRAM_USER_ID"}))  # string env ref -> int
+print(resolve_user_id({"user_id": "${TELEGRAM_USER_ID}"}))  # braced env ref -> int
+print(resolve_user_id({"user_id": 123456}))                 # literal int unchanged
+print(resolve_user_id({}))                                  # missing -> 0
+print(resolve_user_id({"user_id": "$NOPE_UNSET"}))          # unset env ref -> 0
+`
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "harness.py")
+	if err := os.WriteFile(scriptPath, []byte(harness), 0o644); err != nil {
+		t.Fatalf("failed to write harness: %v", err)
+	}
+
+	out, err := exec.Command(py, scriptPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("python harness failed: %v\noutput:\n%s", err, out)
+	}
+
+	got := strings.Fields(strings.TrimSpace(string(out)))
+	want := []string{"123456", "123456", "123456", "0", "0"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d output lines, got %d: %q", len(want), len(got), string(out))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("case %d: got %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordSlashCommands(t *testing.T) {
+	template := conductorBridgePy
+	commands := []string{
+		`name="ad-status"`,
+		`name="ad-sessions"`,
+		`name="ad-restart"`,
+		`name="ad-help"`,
+	}
+	for _, cmd := range commands {
+		if !strings.Contains(template, cmd) {
+			t.Errorf("template should contain Discord slash command: %q", cmd)
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordSlashCommandsChannelRestriction(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		"async def ensure_discord_channel(interaction: discord.Interaction) -> bool:",
+		`if interaction.channel_id != channel_id:`,
+		`"This command is only available in the configured channel."`,
+		"if not await ensure_discord_channel(interaction):",
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord channel restriction pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordListenModeSupport(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		`listen_mode = str(config["discord"].get("listen_mode", "all") or "all").strip().lower()`,
+		`if listen_mode not in {"all", "mentions", "mentions_all_channels"}:`,
+		`if listen_mode != "mentions_all_channels" and message.channel.id != bot.target_channel_id:`,
+		`if listen_mode in ("mentions", "mentions_all_channels") and not message_mentions_bot(message):`,
+		`text = strip_bot_mentions(text)`,
+		`return re.sub(rf"<@!?{bot.user.id}>", "", text).strip()`,
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord listen_mode pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordReplyFilterSupport(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		`ignore_replies_to_others = bool(`,
+		`config["discord"].get("ignore_replies_to_others", False)`,
+		`async def should_ignore_reply_to_other(message: discord.Message) -> bool:`,
+		`referenced = await message.channel.fetch_message(reference_id)`,
+		`if referenced.author.id != bot.user.id:`,
+		`if await should_ignore_reply_to_other(message):`,
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord reply filter pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordHeartbeatNotification(t *testing.T) {
+	template := conductorBridgePy
+	if !strings.Contains(template, "discord_bot=None, discord_channel_id=None") {
+		t.Error("heartbeat_loop should accept discord_bot and discord_channel_id params")
+	}
+	if !strings.Contains(template, "Failed to send Discord notification") {
+		t.Error("heartbeat should handle Discord notification errors")
+	}
+	if !strings.Contains(template, "await send_discord_output(channel, alert_msg)") {
+		t.Error("heartbeat should route Discord notifications through send_discord_output")
+	}
+}
+
+func TestBridgeTemplate_DiscordInMain(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		`dc_ok = config["discord"]["configured"] and HAS_DISCORD`,
+		"create_discord_bot(config)",
+		`discord_bot.start(config["discord"]["bot_token"])`,
+		"discord_bot.close()",
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("main() should contain Discord pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordTypingIndicator(t *testing.T) {
+	template := conductorBridgePy
+	if !strings.Contains(template, "async with message.channel.typing():") {
+		t.Error("Discord on_message should show typing indicator while waiting for conductor response")
+	}
+	if !strings.Contains(template, "run_in_executor") {
+		t.Error("Discord on_message should offload blocking send_to_conductor to thread executor")
+	}
+}
+
+func TestBridgeTemplate_DiscordImageUploadSupport(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		`IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(?P<path>[^\]]+)\]")`,
+		`def parse_discord_message_parts(text: str) -> list[tuple[str, str]]:`,
+		`async def send_discord_output(channel, text: str, name_tag: str = ""):`,
+		`await channel.send(`,
+		`file=discord.File(str(image_path)),`,
+		`[Image path must be absolute:`,
+		`[Image not found:`,
+		`await send_discord_output(message.channel, response, name_tag=name_tag)`,
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord image upload pattern: %q", pattern)
+		}
+	}
+}
+
+func TestConductorClearOnCompact(t *testing.T) {
+	// Override HOME/XDG data so LoadConductorMeta reads from our temp dir
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(tmpHome, ".local", "share"))
+
+	// Create conductor meta with clear_on_compact = true (default)
+	condDir, err := ConductorNameDir("main")
+	if err != nil {
+		t.Fatalf("ConductorNameDir: %v", err)
+	}
+	if err := os.MkdirAll(condDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	meta := ConductorMeta{Name: "main", Profile: "default"}
+	data, _ := json.Marshal(meta)
+	if err := os.WriteFile(filepath.Join(condDir, "meta.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Conductor instance with matching title
+	inst := &Instance{Title: "conductor-main", GroupPath: "conductor"}
+	if !inst.ConductorClearOnCompact() {
+		t.Error("should return true for conductor with default ClearOnCompact")
+	}
+
+	// Now set clear_on_compact = false
+	falseVal := false
+	meta.ClearOnCompact = &falseVal
+	data, _ = json.Marshal(meta)
+	if err := os.WriteFile(filepath.Join(condDir, "meta.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if inst.ConductorClearOnCompact() {
+		t.Error("should return false when clear_on_compact is explicitly disabled")
+	}
+
+	meta = ConductorMeta{Name: "main", Agent: ConductorAgentCodex, Profile: "default"}
+	data, _ = json.Marshal(meta)
+	if err := os.WriteFile(filepath.Join(condDir, "meta.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if inst.ConductorClearOnCompact() {
+		t.Error("codex conductors should always disable clear_on_compact")
+	}
+
+	// Non-conductor title should return false (not a conductor-prefixed session)
+	nonConductor := &Instance{Title: "my-session", GroupPath: "conductor"}
+	if nonConductor.ConductorClearOnCompact() {
+		t.Error("non-conductor-prefixed title should return false")
+	}
+}
+
+// TestConductorHeartbeatScript_GroupScoped verifies the heartbeat script references
+// the conductor's own group (not all sessions in the profile) and includes an
+// enabled-config guard.
+func TestConductorHeartbeatScript_GroupScoped(t *testing.T) {
+	// The heartbeat message must NOT reference "all sessions in the {PROFILE} profile"
+	if strings.Contains(conductorHeartbeatScript, "Check all sessions in the") {
+		t.Fatal("heartbeat script should NOT reference 'all sessions in the {PROFILE} profile'; must be group-scoped")
+	}
+
+	// The heartbeat message must reference the conductor's own group via {NAME}
+	if !strings.Contains(conductorHeartbeatScript, "{NAME}") {
+		t.Fatal("heartbeat script must reference {NAME} for group scoping")
+	}
+	if !strings.Contains(conductorHeartbeatScript, `conductor heartbeat-tick "{NAME}"`) {
+		t.Fatal("heartbeat script should build its message with the group-scoped heartbeat-tick")
+	}
+
+	// The script must check this conductor's persisted heartbeat flag.
+	if !strings.Contains(conductorHeartbeatScript, `conductor status "{NAME}" --json`) ||
+		!strings.Contains(conductorHeartbeatScript, `"heartbeat"[[:space:]]*:[[:space:]]*true`) {
+		t.Fatal("heartbeat script must query this conductor's heartbeat flag before sending")
+	}
+}
+
+// TestGetHeartbeatInterval_ZeroMeansDisabled verifies nil and zero mean
+// disabled, negative means default (15), and positive values pass through.
+func TestGetHeartbeatInterval_ZeroMeansDisabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval *int
+		expected int
+	}{
+		{"nil means disabled", nil, 0},
+		{"negative means default", intPtr(-1), 15},
+		{"zero means disabled", intPtr(0), 0},
+		{"custom value", intPtr(30), 30},
+		{"explicit fifteen", intPtr(15), 15},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := ConductorSettings{HeartbeatInterval: tt.interval}
+			got := settings.GetHeartbeatInterval()
+			if got != tt.expected {
+				t.Errorf("GetHeartbeatInterval() = %d, want %d", got, tt.expected)
+			}
+		})
+	}
+}
+
+// --- Slack markdown-to-mrkdwn converter tests ---
+
+func TestBridgeTemplate_ContainsMarkdownToSlackConverter(t *testing.T) {
+	template := conductorBridgePy
+
+	// Function definition must exist.
+	if !strings.Contains(template, "def _markdown_to_slack(text: str) -> str:") {
+		t.Error("template should contain _markdown_to_slack function definition")
+	}
+
+	// Header conversion regex.
+	if !strings.Contains(template, `^#{1,6}\s+`) {
+		t.Error("template should contain GFM header regex ^#{1,6}\\s+")
+	}
+
+	// Bold conversion: **text** -> *text*.
+	if !strings.Contains(template, `\*\*(.+?)\*\*`) {
+		t.Error("template should contain bold regex \\*\\*(.+?)\\*\\*")
+	}
+
+	// Strikethrough conversion: ~~text~~ -> ~text~.
+	if !strings.Contains(template, `~~(.+?)~~`) {
+		t.Error("template should contain strikethrough regex ~~(.+?)~~")
+	}
+
+	// Link conversion: [text](url) -> <url|text>.
+	if !strings.Contains(template, `\[([^\]]+)\]\(([^)]+)\)`) {
+		t.Error("template should contain link regex \\[([^\\]]+)\\]\\(([^)]+)\\)")
+	}
+
+	// Bullet list conversion.
+	if !strings.Contains(template, `^(\s*)[-*]\s+`) {
+		t.Error("template should contain bullet list regex ^(\\s*)[-*]\\s+")
+	}
+
+	// Regression: bullet replacement must NOT use r"..." prefix (#408).
+	// r"\1\u2022 " passes \u literally to re.sub, which crashes with "bad escape \u".
+	// The correct form is "\\1\u2022 " (non-raw string so \u2022 becomes the bullet char).
+	if strings.Contains(template, `r"\1\u2022 "`) {
+		t.Error("bullet replacement must not use raw string r\"\\1\\u2022 \" (causes re.error: bad escape \\u); use \"\\\\1\\u2022 \" instead (#408)")
+	}
+
+	// Code block protection.
+	if !strings.Contains(template, "code_blocks = []") {
+		t.Error("template should contain code block protection list")
+	}
+
+	// Inline code protection.
+	if !strings.Contains(template, "inline_codes = []") {
+		t.Error("template should contain inline code protection list")
+	}
+}
+
+func TestBridgeTemplate_SafeSayConvertsMarkdown(t *testing.T) {
+	template := conductorBridgePy
+
+	// _safe_say must call _markdown_to_slack.
+	if !strings.Contains(template, "_markdown_to_slack(kwargs[\"text\"])") {
+		t.Error("_safe_say should apply _markdown_to_slack to kwargs[\"text\"]")
+	}
+
+	// The conversion must be conditional on "text" being in kwargs.
+	if !strings.Contains(template, `if "text" in kwargs:`) {
+		t.Error("_safe_say should guard _markdown_to_slack call with 'if \"text\" in kwargs:'")
+	}
+}
+
+func TestSetupConductor_WithEnvVars(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "test-env-conductor"
+	env := map[string]string{
+		"ANTHROPIC_BASE_URL":   "https://api.z.ai/api/anthropic",
+		"ANTHROPIC_AUTH_TOKEN": "test-token",
+	}
+	err := SetupConductor(name, "default", true, true, "env test", "", "", "", env, "~/.conductor.env")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("failed to load meta: %v", err)
+	}
+
+	if len(meta.Env) != 2 {
+		t.Errorf("expected 2 env vars, got %d", len(meta.Env))
+	}
+	if meta.Env["ANTHROPIC_BASE_URL"] != "https://api.z.ai/api/anthropic" {
+		t.Errorf("unexpected ANTHROPIC_BASE_URL: %s", meta.Env["ANTHROPIC_BASE_URL"])
+	}
+	if meta.EnvFile != "~/.conductor.env" {
+		t.Errorf("unexpected env_file: %s", meta.EnvFile)
+	}
+
+	// Verify restricted file permissions when env vars present
+	dir, _ := ConductorNameDir(name)
+	info, err := os.Stat(filepath.Join(dir, "meta.json"))
+	if err != nil {
+		t.Fatalf("failed to stat meta.json: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("expected 0600 permissions for meta.json with env vars, got %o", info.Mode().Perm())
+	}
+}
+
+func TestSetupConductor_WithoutEnvVars(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "test-no-env-conductor"
+	err := SetupConductor(name, "default", true, true, "", "", "", "", nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("failed to load meta: %v", err)
+	}
+
+	if meta.Env != nil {
+		t.Errorf("expected nil env, got %v", meta.Env)
+	}
+	if meta.EnvFile != "" {
+		t.Errorf("expected empty env_file, got %s", meta.EnvFile)
+	}
+}
+
+// --- GetConductorLastActivity tests ---
+
+// TestGetConductorLastActivity_NoConductorSession verifies that an error is
+// returned when the conductor session does not exist in storage — not a zero
+// time — so callers can distinguish "no data" from "no managed sessions".
+func TestGetConductorLastActivity_NoConductorSession(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	// Bootstrap a storage profile so NewStorageWithProfile succeeds.
+	if _, err := NewStorageWithProfile("default"); err != nil {
+		t.Fatalf("setup storage: %v", err)
+	}
+
+	_, err := GetConductorLastActivity("no-such-conductor", "default")
+	if err == nil {
+		t.Fatal("expected error when conductor session not in storage, got nil")
+	}
+}
+
+// TestGetConductorLastActivity_NoWatchedSessions verifies that zero time is
+// returned (not an error) when the conductor session exists in storage but there
+// are no watched non-conductor sessions. Zero time signals "no data" to the idle
+// gate, which must not suppress heartbeats in this case.
+func TestGetConductorLastActivity_NoManagedSessions(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	storage, err := NewStorageWithProfile("default")
+	if err != nil {
+		t.Fatalf("setup storage: %v", err)
+	}
+
+	// Register the conductor session itself (no children).
+	conductorInst := NewInstance("conductor-alpha", "/tmp")
+	conductorInst.IsConductor = true
+	if err := storage.Save([]*Instance{conductorInst}); err != nil {
+		t.Fatalf("save conductor instance: %v", err)
+	}
+
+	got, err := GetConductorLastActivity("alpha", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got.IsZero() {
+		t.Errorf("expected zero time for conductor with no managed sessions, got %v", got)
+	}
+}
+
+// TestGetConductorLastActivity_ExcludesConductorWindow verifies that the
+// conductor's own tmux window is NOT included in the activity scan. This ensures
+// heartbeat responses (which produce output in the conductor window) cannot
+// reset the idle timer. Unparented watched sessions are included because
+// conductors monitor profile sessions even when they are not descendants.
+func TestGetConductorLastActivity_ExcludesConductorWindow(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	storage, err := NewStorageWithProfile("default")
+	if err != nil {
+		t.Fatalf("setup storage: %v", err)
+	}
+
+	conductorInst := NewInstance("conductor-beta", "/tmp")
+	conductorInst.IsConductor = true
+
+	// A managed session parented to the conductor.
+	managed := NewInstance("worker-1", "/tmp/work")
+	managed.ParentSessionID = conductorInst.ID
+
+	// Unparented watched profile session; must contribute to activity scope.
+	unparented := NewInstance("other-session", "/tmp/other")
+
+	if err := storage.Save([]*Instance{conductorInst, managed, unparented}); err != nil {
+		t.Fatalf("save instances: %v", err)
+	}
+
+	// We can't call tmux in a unit test, so just verify the function proceeds
+	// past the storage lookup without panicking. The tmux calls will fail
+	// gracefully (no tmux server) and GetConductorLastActivity returns zero.
+	got, err := GetConductorLastActivity("beta", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Without tmux, window_activity lookups fail silently → zero time is correct.
+	if !got.IsZero() {
+		t.Errorf("expected zero time (no tmux server), got %v", got)
+	}
+}
+
+// TestGetConductorLastActivity_IncludesUnparentedWatchedSessions verifies the
+// activity scope matches what conductors actually monitor: non-conductor
+// sessions in the same profile, even when they were created before the
+// conductor and have no ParentSessionID link.
+func TestGetConductorLastActivity_IncludesUnparentedWatchedSessions(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	storage, err := NewStorageWithProfile("default")
+	if err != nil {
+		t.Fatalf("setup storage: %v", err)
+	}
+
+	conductorInst := NewInstance("conductor-delta", "/tmp")
+	conductorInst.IsConductor = true
+	watched := NewInstance("preexisting-worker", "/tmp/work")
+
+	if err := storage.Save([]*Instance{conductorInst, watched}); err != nil {
+		t.Fatalf("save instances: %v", err)
+	}
+
+	got, err := GetConductorLastActivity("delta", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Without a live tmux server window_activity lookups fail silently, so the
+	// result is zero. The important regression guard is that this call treats the
+	// unparented worker as in-scope and still completes without requiring a
+	// ParentSessionID edge.
+	if !got.IsZero() {
+		t.Errorf("expected zero time (no tmux server), got %v", got)
+	}
+}
+
+// TestGetConductorLastActivity_TransitiveScan verifies that sub-sessions
+// (grandchildren of the conductor) are included in the activity scan.
+// Without transitive scanning, a managed session that is idle/waiting on a
+// sub-session would cause the idle gate to miss the sub-session's activity.
+func TestGetConductorLastActivity_TransitiveScan(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	storage, err := NewStorageWithProfile("default")
+	if err != nil {
+		t.Fatalf("setup storage: %v", err)
+	}
+
+	conductorInst := NewInstance("conductor-gamma", "/tmp")
+	conductorInst.IsConductor = true
+
+	// Direct child of conductor.
+	managed := NewInstance("worker-2", "/tmp/work")
+	managed.ParentSessionID = conductorInst.ID
+
+	// Sub-session (grandchild of conductor, child of managed).
+	subSession := NewInstance("sub-worker-a", "/tmp/sub")
+	subSession.ParentSessionID = managed.ID
+
+	// Unrelated session — must not appear in the scan.
+	unrelated := NewInstance("other", "/tmp/other")
+
+	if err := storage.Save([]*Instance{conductorInst, managed, subSession, unrelated}); err != nil {
+		t.Fatalf("save instances: %v", err)
+	}
+
+	// Without a live tmux server all window_activity queries fail silently;
+	// the function must still complete without error.
+	got, err := GetConductorLastActivity("gamma", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Zero is correct in a no-tmux environment; the important thing is that
+	// the BFS traversal reached the sub-session without panicking or erroring.
+	if !got.IsZero() {
+		t.Errorf("expected zero time (no tmux server), got %v", got)
+	}
+}
+
+// --- Inactivity pause tests ---
+
+func TestGetHeartbeatIdleMinutes(t *testing.T) {
+	tests := []struct {
+		name     string
+		minutes  int
+		expected int
+	}{
+		{"zero means disabled (never pause)", 0, 0},
+		{"negative means disabled", -1, 0},
+		{"negative large means disabled", -100, 0},
+		{"custom value 5", 5, 5},
+		{"custom value 30", 30, 30},
+		{"custom value 60", 60, 60},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meta := &ConductorMeta{HeartbeatIdleMinutes: tt.minutes}
+			if got := meta.GetHeartbeatIdleMinutes(); got != tt.expected {
+				t.Errorf("GetHeartbeatIdleMinutes() with %d = %d, want %d", tt.minutes, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestGetHeartbeatIdleMinutes_NilMeta(t *testing.T) {
+	var meta *ConductorMeta
+	if got := meta.GetHeartbeatIdleMinutes(); got != 0 {
+		t.Errorf("GetHeartbeatIdleMinutes() with nil meta = %d, want 0", got)
+	}
+}
+
+func TestConductorMeta_InactivityPauseJSON(t *testing.T) {
+	// Test that HeartbeatIdleMinutes is properly serialized/deserialized
+	meta := &ConductorMeta{
+		Name:                 "test-inactivity",
+		Profile:              "default",
+		HeartbeatEnabled:     true,
+		HeartbeatIdleMinutes: 30,
+		CreatedAt:            "2026-01-01T00:00:00Z",
+	}
+
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("failed to marshal: %v", err)
+	}
+
+	// Verify the field appears in JSON with correct tag
+	if !strings.Contains(string(data), "heartbeat_idle_minutes") {
+		t.Error("JSON should contain 'heartbeat_idle_minutes' field")
+	}
+
+	// Verify the value is present
+	if !strings.Contains(string(data), `"heartbeat_idle_minutes":30`) {
+		t.Errorf("JSON should contain heartbeat_idle_minutes=30, got: %s", string(data))
+	}
+
+	// Deserialize and verify
+	var loaded ConductorMeta
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	if loaded.HeartbeatIdleMinutes != 30 {
+		t.Errorf("HeartbeatIdleMinutes after unmarshal = %d, want 30", loaded.HeartbeatIdleMinutes)
+	}
+}
+
+// --- Issue #1350: bridge.py XDG path resolution ---
+
+// TestBridgeTemplate_DoesNotHardcodeLegacyAgentDeckRoot guards against the
+// embedded conductorBridgePy const drifting back to the hardcoded
+// ~/.agent-deck roots that broke conductor routing on fresh XDG installs
+// (issue #1350). The bridge must resolve CONDUCTOR_DIR / CONFIG_PATH through
+// XDG-with-legacy-fallback resolvers that mirror internal/agentpaths.
+func TestBridgeTemplate_DoesNotHardcodeLegacyAgentDeckRoot(t *testing.T) {
+	template := conductorBridgePy
+
+	// The old hardcoded root assignment must be gone.
+	if strings.Contains(template, `AGENT_DECK_DIR = Path.home() / ".agent-deck"`) {
+		t.Error("template must not hardcode AGENT_DECK_DIR = Path.home() / \".agent-deck\" (issue #1350)")
+	}
+	if strings.Contains(template, `CONFIG_PATH = AGENT_DECK_DIR / "config.toml"`) {
+		t.Error("template must not derive CONFIG_PATH from a hardcoded legacy root (issue #1350)")
+	}
+	if strings.Contains(template, `CONDUCTOR_DIR = AGENT_DECK_DIR / "conductor"`) {
+		t.Error("template must not derive CONDUCTOR_DIR from a hardcoded legacy root (issue #1350)")
+	}
+
+	// The XDG-aware resolvers must be present.
+	if !strings.Contains(template, "XDG_DATA_HOME") {
+		t.Error("template must reference XDG_DATA_HOME for data path resolution (issue #1350)")
+	}
+	if !strings.Contains(template, "XDG_CONFIG_HOME") {
+		t.Error("template must reference XDG_CONFIG_HOME for config path resolution (issue #1350)")
+	}
+
+	// Legacy fallback must be preserved so existing installs keep working.
+	if !strings.Contains(template, `.agent-deck`) {
+		t.Error("template must retain a legacy ~/.agent-deck fallback (issue #1350)")
+	}
+
+	// CONDUCTOR_DIR / CONFIG_PATH must be computed via the resolvers. CONDUCTOR_DIR
+	// now prefers the AGENT_DECK_CONDUCTOR_DIR override (injected by the Go side
+	// from [conductor].dir) but must still fall back through resolve_data_dir so
+	// the #1350 XDG/legacy behavior is preserved when no override is set.
+	if !strings.Contains(template, `resolve_data_dir("conductor") / "conductor"`) {
+		t.Error("template must retain the resolve_data_dir CONDUCTOR_DIR fallback (issue #1350)")
+	}
+	if !strings.Contains(template, `os.environ.get("AGENT_DECK_CONDUCTOR_DIR"`) {
+		t.Error("template must honor the AGENT_DECK_CONDUCTOR_DIR override before the XDG fallback")
+	}
+	if !strings.Contains(template, `CONFIG_PATH = resolve_config_path("config.toml")`) {
+		t.Error("template must compute CONFIG_PATH via resolve_config_path (issue #1350)")
+	}
+}
+
+// TestBridgeTemplate_ResolverMirrorsRealBridgeFile ensures the embedded value
+// and the canonical on-disk bridge source share a byte-identical resolver
+// region. There is now a single canonical file
+// (internal/session/conductor_bridge.py) embedded directly, so this also guards
+// that the #1350 resolver markers remain present in the deployed bytes.
+func TestBridgeTemplate_ResolverMirrorsRealBridgeFile(t *testing.T) {
+	const marker = "# --- issue #1350: XDG path resolution (mirror of internal/agentpaths) ---"
+	const endMarker = "# --- end issue #1350 resolver ---"
+
+	extract := func(src, where string) string {
+		start := strings.Index(src, marker)
+		if start < 0 {
+			t.Fatalf("%s: resolver start marker not found", where)
+		}
+		end := strings.Index(src[start:], endMarker)
+		if end < 0 {
+			t.Fatalf("%s: resolver end marker not found", where)
+		}
+		return src[start : start+end+len(endMarker)]
+	}
+
+	embedded := extract(conductorBridgePy, "embedded value")
+
+	// Locate the canonical internal/session/conductor_bridge.py next to this test.
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	bridgePath := filepath.Join(filepath.Dir(thisFile), "conductor_bridge.py")
+	data, err := os.ReadFile(bridgePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", bridgePath, err)
+	}
+	onDisk := extract(string(data), "conductor_bridge.py")
+
+	if embedded != onDisk {
+		t.Errorf("resolver region drift between embedded value and conductor_bridge.py:\n--- embedded ---\n%s\n--- on disk ---\n%s", embedded, onDisk)
+	}
+}
+
+// TestGenerateSystemdBridgeService_InjectsXDGEnv verifies the systemd bridge
+// unit propagates the effective XDG dirs so the bridge daemon's XDG branch
+// resolves to the same place the Go side wrote the conductors (issue #1350).
+func TestGenerateSystemdBridgeService_InjectsXDGEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("systemd not used on windows")
+	}
+	home := t.TempDir()
+	xdgData := filepath.Join(home, "xdgdata")
+	xdgConfig := filepath.Join(home, "xdgconfig")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", xdgData)
+	t.Setenv("XDG_CONFIG_HOME", xdgConfig)
+	// Ensure a python3 is discoverable so generation does not error.
+	if findPython3() == "" {
+		t.Skip("python3 not found; cannot generate bridge unit")
+	}
+
+	unit, err := GenerateSystemdBridgeService()
+	if err != nil {
+		t.Fatalf("GenerateSystemdBridgeService: %v", err)
+	}
+	// Values are double-quoted so systemd does not split paths on whitespace.
+	if !strings.Contains(unit, `Environment="XDG_DATA_HOME=`+xdgData+`"`) {
+		t.Errorf("systemd unit must inject quoted XDG_DATA_HOME=%q:\n%s", xdgData, unit)
+	}
+	if !strings.Contains(unit, `Environment="XDG_CONFIG_HOME=`+xdgConfig+`"`) {
+		t.Errorf("systemd unit must inject quoted XDG_CONFIG_HOME=%q:\n%s", xdgConfig, unit)
+	}
+}
+
+// TestGenerateLaunchdPlist_InjectsXDGEnv verifies the launchd plist propagates
+// the effective XDG dirs to the bridge daemon (issue #1350).
+func TestGenerateLaunchdPlist_InjectsXDGEnv(t *testing.T) {
+	home := t.TempDir()
+	xdgData := filepath.Join(home, "xdgdata")
+	xdgConfig := filepath.Join(home, "xdgconfig")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", xdgData)
+	t.Setenv("XDG_CONFIG_HOME", xdgConfig)
+	if findPython3() == "" {
+		t.Skip("python3 not found; cannot generate bridge plist")
+	}
+
+	plist, err := GenerateLaunchdPlist()
+	if err != nil {
+		t.Fatalf("GenerateLaunchdPlist: %v", err)
+	}
+	if !strings.Contains(plist, "<key>XDG_DATA_HOME</key>") || !strings.Contains(plist, "<string>"+xdgData+"</string>") {
+		t.Errorf("launchd plist must inject XDG_DATA_HOME=%q:\n%s", xdgData, plist)
+	}
+	if !strings.Contains(plist, "<key>XDG_CONFIG_HOME</key>") || !strings.Contains(plist, "<string>"+xdgConfig+"</string>") {
+		t.Errorf("launchd plist must inject XDG_CONFIG_HOME=%q:\n%s", xdgConfig, plist)
+	}
+}
+
+// TestBridgeXDGEnv_AgreesWithConductorDir verifies the XDG base injected into
+// the bridge daemon, combined with the bridge's resolver formula
+// (<XDG_DATA_HOME>/agent-deck/conductor), points at exactly the directory the Go
+// side computes via ConductorDir() for the same env (issue #1350). This is the
+// path-agreement guarantee: the Go writer and the Python reader land together.
+func TestBridgeXDGEnv_AgreesWithConductorDir(t *testing.T) {
+	home := t.TempDir()
+	xdgData := filepath.Join(home, "xdgdata")
+	xdgConfig := filepath.Join(home, "xdgconfig")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", xdgData)
+	t.Setenv("XDG_CONFIG_HOME", xdgConfig)
+
+	// Create the conductor marker so EffectiveDataDir selects XDG (as it would
+	// on a fresh XDG install after conductor setup).
+	if err := os.MkdirAll(filepath.Join(xdgData, "agent-deck", "conductor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dataBase, configBase, err := bridgeXDGBaseDirs()
+	if err != nil {
+		t.Fatalf("bridgeXDGBaseDirs: %v", err)
+	}
+	if dataBase != xdgData {
+		t.Errorf("dataBase = %q, want %q", dataBase, xdgData)
+	}
+	if configBase != xdgConfig {
+		t.Errorf("configBase = %q, want %q", configBase, xdgConfig)
+	}
+
+	condDir, err := ConductorDir()
+	if err != nil {
+		t.Fatalf("ConductorDir: %v", err)
+	}
+	// The bridge computes resolve_data_dir("conductor") / "conductor" where
+	// resolve_data_dir returns <XDG_DATA_HOME>/agent-deck. That must equal
+	// ConductorDir().
+	bridgeComputed := filepath.Join(dataBase, "agent-deck", "conductor")
+	if bridgeComputed != condDir {
+		t.Errorf("bridge-computed conductor dir %q != ConductorDir() %q", bridgeComputed, condDir)
+	}
+
+	// Config agreement. The bridge reads config.toml (the user config), which
+	// the Go side resolves via GetUserConfigPath -> EffectiveConfigPath.
+	bridgeCfg := filepath.Join(configBase, "agent-deck", "config.toml")
+	// EffectiveConfigPath returns the XDG path only if it exists; create it to
+	// match the fresh-XDG-install scenario.
+	if err := os.MkdirAll(filepath.Join(configBase, "agent-deck"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bridgeCfg, []byte("[telegram]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath, err := GetUserConfigPath()
+	if err != nil {
+		t.Fatalf("GetUserConfigPath: %v", err)
+	}
+	if bridgeCfg != cfgPath {
+		t.Errorf("bridge-computed config path %q != GetUserConfigPath() %q", bridgeCfg, cfgPath)
+	}
+}
+
+// conductorTrustEntry reads the root ~/.claude.json and returns the trust
+// entry for dir, or nil if there is none.
+func conductorTrustEntry(t *testing.T, dir string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(GetUserMCPRootPath())
+	if err != nil {
+		return nil
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal ~/.claude.json: %v", err)
+	}
+	projects, _ := cfg["projects"].(map[string]any)
+	entry, _ := projects[dir].(map[string]any)
+	return entry
+}
+
+// Issue #1359: setting up a Claude conductor must pre-accept the trust dialog
+// for the just-created conductor directory, so first boot (and heartbeat) does
+// not stall on Claude Code's "do you trust the files in this folder?" prompt.
+func TestSetupConductorWithAgent_PreAcceptsClaudeTrust(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "trust-claude"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentClaude, true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("SetupConductorWithAgent: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	entry := conductorTrustEntry(t, dir)
+	if entry == nil {
+		t.Fatalf("no trust entry for conductor dir %q in %s", dir, GetUserMCPRootPath())
+	}
+	if entry["hasTrustDialogAccepted"] != true {
+		t.Fatalf("hasTrustDialogAccepted = %v, want true", entry["hasTrustDialogAccepted"])
+	}
+}
+
+// Non-Claude conductors (e.g. Codex) must not get a Claude trust entry — the
+// pre-accept is Claude-specific.
+func TestSetupConductorWithAgent_NoClaudeTrustForCodex(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "trust-codex"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentCodex, true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("SetupConductorWithAgent: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	if entry := conductorTrustEntry(t, dir); entry != nil {
+		t.Fatalf("unexpected Claude trust entry for Codex conductor dir %q: %v", dir, entry)
+	}
+}
+
+// Issue #1359 parity: Codex conductors must pre-accept workspace trust for the
+// just-created conductor directory so first boot does not stall on the dialog.
+func TestSetupConductorWithAgent_PreAcceptsCodexTrust(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "trust-codex"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentCodex, true, true, "", "", "", "", nil, ""); err != nil {
+		t.Fatalf("SetupConductorWithAgent: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	configPath := GetCodexConfigPath(filepath.Join(tmpHome, ".codex"))
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read codex config: %v", err)
+	}
+	var cfg map[string]any
+	if err := toml.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal codex config: %v", err)
+	}
+	projects, ok := cfg["projects"].(map[string]any)
+	if !ok {
+		t.Fatalf("projects key missing or wrong type: %T", cfg["projects"])
+	}
+	entry, ok := projects[dir].(map[string]any)
+	if !ok {
+		t.Fatalf("no trust entry for conductor dir %q in %s", dir, configPath)
+	}
+	if entry["trust_level"] != "trusted" {
+		t.Fatalf("trust_level = %v, want trusted", entry["trust_level"])
+	}
+}

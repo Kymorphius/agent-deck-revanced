@@ -1,0 +1,16 @@
+ subagent reviewer
+ ✓ reviewer | 9 tools, 00.0x xxx, 0x00x · done
+
+ Xxxxxxx xxx xxxxxx xxxxxxxxxx xxxx. Xxxxxxx:
+
+ - Xxx delegate_task xxxxxxxx xxx xxxx xxxxxxx; xxxxxxx xxx xxx xxx subagent xxxx.
+ - delegate_task agent=researcher in xxx xxx xxxx xxx xxxxxxxxx xx subagent researcher.
+ - No xxxx xxxxxxxxxx delegate_task xxx more.
+
+ Xxxxxxx xxxx xx xxxxxxx.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+~/xxx/xxxx • xxxxxxx
+↑0.0k ↓00 R0.0k CH00.0% $0.000 (sub) 0.0%/000k (auto)                              (openai-codex) gpt-5.6-sol • low

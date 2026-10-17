@@ -1,0 +1,50 @@
+  │ Xxxxxx: xxxxxxxx xxxxxxx               │ 00 XX       │ Xxxx x xxxx xxxxx                 │
+  ├────────────────────────────────────────┼─────────────┼───────────────────────────────────┤
+  │ xx xxxxxxx xxxxx (~/.xxxxx/xx)         │ 00 XX       │ Yes, xx xxxxx xxxxx               │
+  ├────────────────────────────────────────┼─────────────┼───────────────────────────────────┤
+  │ XxxXxxxxxx xxx xxxx (xxxxxx)           │ 00 XX       │ Xxxx xxxx, xxxxxx xx-xxxxxxxx     │
+  ├────────────────────────────────────────┼─────────────┼───────────────────────────────────┤
+  │ XxxxxXxxx xxxxx                        │ 00 XX       │ Yes, xx-xxxxxxxxxxxx              │
+  ├────────────────────────────────────────┼─────────────┼───────────────────────────────────┤
+  │ XXXX xxxxxxxx xxxxxxxx xxxx 0000-00-00 │ 00 XX       │ Xxxxxxxx, xx'x x xxxxx xxxx       │
+  ├────────────────────────────────────────┼─────────────┼───────────────────────────────────┤
+  │ XXXX search xxxxxxxx                   │ 00 XX       │ No, xxxx xxxx (xxx xxxxxxx)       │
+  ├────────────────────────────────────────┼─────────────┼───────────────────────────────────┤
+  │ xXX XxxxxxXxxxxxx xxxxxxx              │ 00 XX       │ Yes, Xxxxx xx-xxxxxxxxx xx xxxxxx │
+  ├────────────────────────────────────────┼─────────────┼───────────────────────────────────┤
+  │ XxxxXxxxxxxxx                          │ 00 XX       │ Xxxxxxxxx, xxxxxx xxxxxxxx        │
+  ├────────────────────────────────────────┼─────────────┼───────────────────────────────────┤
+  │ xx-xxxxx xxxxx                         │ 00 XX       │ Yes, xx xxxxx -xxxxx              │
+  ├────────────────────────────────────────┼─────────────┼───────────────────────────────────┤
+  │ XXXX xxxxxx xxxx xxxx 0000-00-00       │ 0 XX        │ Xxxxxxxx xxxxx                    │
+  ├────────────────────────────────────────┼─────────────┼───────────────────────────────────┤
+  │ Xxxxx Xxxxxxxx                         │ 0 XX        │ Xxxx xxxx, xxx xxx xxxxxx         │
+  ├────────────────────────────────────────┼─────────────┼───────────────────────────────────┤
+  │ Xxxxxxxxx                              │ 00 XX       │ Xxxx xxxx                         │
+  └────────────────────────────────────────┴─────────────┴───────────────────────────────────┘
+
+  xxxx x'x xxx xx xxxx xxx, xxxxx xxx xx xxxxx, xxx xxxxxxxxxxx:
+
+  xxxxxx xxxxxxxxx xxxxx -x
+  xxxxxx xxxxx xxxxx -x -x
+  xx xxxxx xxxxx
+  xx... (xx: xxxxx) ~/xxxxxxx/xxxxxx/xxxxxxxxx
+  xx xxxxx -xxxxx
+  xxxxx "~/xxxxxxx/xxxxxxxxx/xxxxx/xxx xxxxxxxxxxxxx"
+
+  xxxx xxx, xxxxx xxxx xxxxxxxx xxx: xxxxxx xxxxxx xxxxx (xx xx), xxx xxx xxxxx xxxx xxxxxx (xx xx, xxxx xxxxxxxxx xxxxxxxxx), xxxxxxxxxx xxxxxx (xx xx), xxxxx xxxxxxxx, xxxxxxxxx.
+
+  xxxxx "xxxx xxx" xxx x'xx xxx xx, xx xxxx xxxxxxxx xxxxx. xxxxx xxxx, xxx xxxx xxxx xxxxxxx xxx xxxxxxxxxx xxxxxx xx xxxxxxxxx xxxx xxxx xxxxx xx xxxx, xxx xxx xxxx xxxxxxxxx xxxxx xx
+  xxxxxx xxx xxxxxxx xxxxx xxxxxx xx-xxxxxxxx xxxxx-xxxx.
+
+✻ Sautéed for 3m 15s · done Xxxxxx, Xxx 0 xx 0:00 XX
+
+⏺ Remote Control disconnected — Remote Control xxxxxx xxxxxxxx xxx xxxxxxx (XXXX 000) — xxx /xxxxxx-xxxxxxx xx xxxxx
+
+⏺ Remote Control disconnected — XXxxx xxxxx xxxxxxx xxxxxx — xxx /xxxxx xx xx-xxxxxxxxxxxx
+                                                                                                                                                  ✔ Xxxxxx xxxxxxxxx · Xxxxxxx xx xxxxxx
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── search ─
+❯ x
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [xxxxxxxx] x@xxxx:/Xxxxx/x | [Fable 5.1] ctx:0% in:00.0k out:000
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

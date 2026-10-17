@@ -1,0 +1,50 @@
+      xxxx                  xxxxxx xxx
+      xxxx          }
+      xxxx -        xxxx, xxx := xxxxxxxxxxxxxxxxx(xxxx)
+      xxxx -        xx xxx != xxx {
+      xxxx -                xxxxxx xxx
+      xxxx -        }
+      xxxx -        xxxx.xxxxxxxxxxxxxxxx = xxxxx
+      xxxx -        xxxxxx xxxxxxxxxxxxxxxxx(xxxx)
+      xxxx +        xxxxxx xxx
+      xxxx  }
+      xxxx
+      xxxx  xxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx(xxxx xxxxxx) xxxxx {
+
+  Ran 1 shell xxxxxxx
+
+⏺ xxxxxxx xx xxx xxxx-xxx xxx xxx xxx xxxxxx (xxxx xxxxxxxx, xxxx=xxxx).
+
+⏺ xxx xxxxxx xxxx xxx xx xxxxx xxxxx xx xxx xxxx xxx. x'xx xxx x xxxxxxxxxxxx xxxx xx xxxxxxxx, xxx xxxxx xxxx x'xx xxx xxx xxxxxx/xxxx xxxxxxxx xxx xxx xx xxxxxx xxxxx xxx xx x xxxx.
+
+  xxxxx xx xxx:
+  - xxxxx-x xxxx xxxx xxxxxx. xxxxxxxx xxx xxxxxx xxx xxxxxxxxx xxxx xxx xxx xxxxxx xxxxxx xxxx xxxxxxxxx'x xxx xxxx. xxx xxxxxx xxxxxx xxxx xxxxx xx xxxxx-xxxx xxxxx xxx. xxx x xxx xxxxxx xxxxx xxxx
+    xxxx, xxx xxx x xxxxx xxxxxx xxxxxxxx xxxx xx xxxxxx/xxxx xxx.
+  - xxxxxx xxxxx (xxxxxx): x xxx xxx xxxxxx xxxx xxxx xx xxx xx xxx xxx x xx xxx x xxx xxxxx xxxx xxx, xx xxxx xxxxxx.
+  - xxxxx xxxxxx xxx xxxxx: xxxxx, xx xxxxx ./... xxx xx xxx ./... xxx xxxx.
+  - xxxxxx xxxx xxxxx:
+    - xxx xxxxxxxxx xxxxxx xxxxx xxx "xxxxxxx xxxxxxxxx" xxxxx xxxxxx xx xxxxx, xxx xxxxx xxxxxx xxxxxxx xxx xxxx xxxxxx. xx x xxxx xxxxx, xxxx xxxxxx xx xxxxx xxxxx xxxxx.
+    - xxxxxxx xxxxxx xx xxxxxx xxxxxxxx. xxxxxx xxxxxxx xxxx xxxxxx xxxx xxx xxxxxxxxx xxxx xxxxxx xxxxx xxxxxx x xxxx, xxx xxxxx xxxxx xxx xxxxx xx xxxx xx xxx.
+  - xxxxxxx xxxxxxx xxxx: xxxx xxxx xx xxx xxxx xx xxxxxx/xxxx, xx xx xx x xxxxxxxx xxxxxx-xx, xxx xxxx xx #xxxx. xx xxxx xxx, x xxxxxx xxxxxxxxx xxxxxx xxxxx xxxxxxxx xxxx xxxx x, xx xxxxxxxx xxxx
+    xxxx xxxx xxxxx xxx xxxxx xxx xxxxxxx xxxxxx.
+
+✻ Sautéed for 5m 10s · done 00:00 XX · 1 shell xxxxx running
+
+⏺ Background xxxxxxx "xx /xxx/xxxx-xxxxxx-0000-x0/xxx && xxx xxx-xxxxx XXXX && XXXX=0000 /Xxxxx/x/.agent-xxxx/xxxxxxxxx/agent-xxxx/xxx/x00-xxxx.xx /xxx/xxxx-xxxxxx-0000-x0/xxx -xxxxx=0
+./xxxxxxxx/xxxxxxx/... ./xxx/xxxxx-xxxx/... ./xxxxxxxx/xx/... > /xxx/xxxx-xxxxxx-xxxx-xx/xxx-xxxxxx.xxx x>&x; xxxx -x /xxx/xxxx-xxxxxx-xxxx-xx/xxx-xxxxxx.xxx" xxxxxxxxx (xxxx xxxx x)
+
+  Xxxxxxxx for 0 xxxxxxx
+
+⏺ xxxxxxxx/xxxxxxx xxxxxx xx xxxx xxxxxx, xxxx xxxx xxx xxxxx-xxxxx xxxxxxxxxxxxxxxxxx xxx xxxxxxxxxxxxxxxxxxxx xxxxx xxxxxxx. xxx x'xx xxx xxx xxxxxx/xxxx xxxxxxxx xxx xxxxxxxxxx. · xxxxxxx
+
+  Ran 1 shell xxxxxxx
+
+⏺ xxx xxxxxx/xxxx xxxxxxxx xx xxxxxxx xx xxx xxxx xxx; xxx xx xxxxxx xxxxx xxxxx xxxxx xx.
+
+✻ Worked for 7s · done 00:00 XX · 1 shell xxxxx running
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xxxxxx-0000-x0 ─
+❯ xxxxxxxx
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [xxxxxxxx] x@xxxx:/xxxxxxx/xxx/xxxx-xxxxxx-0000-x0/main | [Xxxx 0.0] ctx:00% in:000.0k out:00 5h:0% 7d:0%
+  ⏵⏵ bypass permissions on · 1 shell · ← for agents

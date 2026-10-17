@@ -1,0 +1,50 @@
+
+
+⏺ Xxxxx(agent-xxxx:agent-xxxx)
+  ⎿  Xxxxxxxxxxxx xxxxxx xxxxx
+
+⏺ Xxxxxxxxx xxxxxxxx xx in. Xxxx X'xx xxx xx xxx xxxxxxxxx, xxxxxx xx xxx xxxx xxxxxxxx (Xxxxxx, Codex, shell), xxx xxxxx x xxxxxxxx xxx xxxxxxxx xxxx xxx xxxx xxxx.
+
+  Ran 1 shell xxxxxxx
+
+❯ Xxxxx xx xxxx XXXXXX.xx: xxxxx xxxx-xxx-xxxx xx xxxxxxxx (xxxxxxx xxxxx) xxx xxxx xxxx xxx xxxxxx xxxxxx xxxxx xx x xxxxx-xxxx xxxxx xxxxxx; xxxxxx xxxxxxx xxx xxxxxxx xxxxxx xxxxxx xxxx for xx.
+
+⏺ Xxxxx xxx xxx xxxxxxxxx (xxxx-xxx-xxxx xx xxxxxxxx, xxx xxxx for x xxxxx-xxxx xxxxxx xxxxxx). X'xx xxxx xxxx xxxx xxx xxxxx.
+
+  Ran 4 shell xxxxxxxx
+
+⏺ Xx xxxxxxxx xx xxx 0000. Xxx X'xx write x xxxxx xxxx xxxxxx, xxxx x xxxxx xxxxx xxxx xxx xxxxxxxx, xxx xxxx xxxxxxx xxx xxxxxx.
+
+  Ran 2 shell xxxxxxxx
+
+❯ Xxxxxxxx xx xxxx XXXXXX.xx: xxxxx Xxxxxxxx (xxxxxx xx x xxxx Xxxxxxxxxxx window xxxxxxxx xxxxx agent-xxxx xxxxxxx, xxxxxxxxx) xxx xxx xxx-xxxxxxx xxxx (xxxxxx xx xxx-X, xxxxxxxxx, xxx xxxxxxxx
+  xxxxx). Xxxx xxx xxxxxxx xxxx xxxxxxx xxxx.
+
+⏺ Xxxxx: X'xx xxxx xxxx Xxxxxxxx xxxxxxx x xxxx Xxxxxxxxxxx window xxx xxx Xxx xxxx xxxxxxx xxx-X xxxx xxx xxxxxxxx xxxxx. Xxxxxxxxxx xxxx xxx xxxxxx read xxx xxxxx xxxxxxxxxx.
+
+  Read 0 xxxxx, ran 10 shell xxxxxxxx
+
+❯ Xxxxxxxx xxx-xx-xxx xxxxxxx xxxxxxx xx xxxxxxxxxxx: xxxxxx read, xxx xxxxxxxxxxx xxxxx+xxxx, xxxxxxxxxxxx, XXXXXXX.xx, DONE xxxxxxxx.
+
+  Read 0 xxxxx, ran 2 shell xxxxxxxx
+
+⏺ Xxxxxxxxx xxxxxxxxxx: xx xxxxx xxxxxx xxxxx xxxxxxxx xxxxx, xx xxx xxxxxxxx'x xxxxxx xxxxxx in xx xxxxxxxx. X'x xxxxxxxxxxx xx in xxx background (no xxxxx) xxxxxx xxxxxxxxx xxxxxxxx xxxx.
+
+⏺ Running xxx xxxxx xxxxxxx xxxxxxxx xxxxxx xxx main xxxxxxx in xxxxx xxx xxxx · 11s
+  ⎿  $ xx /xxx/xxxx-xxxxxx-xx-xxxxx; xxx > xxx <<'XXX'
+     #!/xxx/xxx
+     X=/xxx/xxxx-xxxxxx-xx-xxxxx; xx=$(xxx $X/xxxxxxxx.xxx)
+     xxxxxxxxxxxxx -x -x $xx $X/xxxxx/$0.xxx; xxxxx -x -- "{\"xx\":\"xxxx\",\"xxxx\":\"$X/xxxx/xxxxx-$0.xxxx\"}" >> $X/xxxx/xxxx.xxxxx; xxxx xxxxxxxx $0
+     XXX
+     xxxxx +x xxx
+     xxx > xxxxxxxx0.xx… (12s)
+     (xxxx+x xxxx+x (xxxxx) xx xxx in background)
+
+✳ Lollygagging… (6m 17s · ↓ 00.0k tokens)
+  ⎿  Tip: Xxx /xxx xx xxx x xxxxx xxxx xxxxxxxx xxxxxxx xxxxxxxxxxxx Xxxxxx'x xxxxxxx xxxx
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xxxxxx-xx-xxxxx ─
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [xxxxxxxx] xxxx@xxxx:/xxx/xxxx-xxxxxx-xx-xxxxx | [Fable 5.1] ctx:00% in:000.0k out:0.0k 5h:0% 7d:00%
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

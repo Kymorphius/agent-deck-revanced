@@ -1,0 +1,277 @@
+package session
+
+import (
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/logging"
+)
+
+// commsLog is the shared logger for the issue #1225 durable-comms paths
+// (inbox/outbox/stop-hook). Audit B4: error paths that were previously silent
+// (stop-block persist, dead-letter missed-log) surface here so an operator can
+// see a dropped completion or a broken loop-guard.
+var commsLog = logging.ForComponent(logging.CompSession)
+
+// Issue #1225 Step 3 — the busy-parent fix. A conductor's Stop hook drains the
+// durable outbox and returns {decision:"block",reason} so the completions are
+// injected as the conductor's next turn input, at the moment it is provably
+// free. This is how a BUSY parent still receives every completion at its very
+// next turn boundary, with zero forced interrupts and zero loss.
+//
+// Loop guard: blocking on Stop keeps the conductor alive for another turn. If a
+// child finishes a new turn every cycle, naive "block whenever pending" would
+// trap the conductor forever (Agent Teams #47930 token burn). We cap CONSECUTIVE
+// stop-hook-induced blocks at MaxStopHookBlocks; once tripped we stop blocking
+// and leave any new records for the heartbeat to drain, so the conductor can
+// reach idle. A genuine user turn (stop_hook_active=false) resets the budget.
+
+// MaxStopHookBlocks is the cap on consecutive stop-hook-induced blocks.
+const MaxStopHookBlocks = 3
+
+var stopBlockMu sync.Mutex
+
+// StopHookDecision mirrors the Claude Code Stop-hook JSON contract. Decision
+// "block" keeps the turn alive and feeds Reason back as the next turn's input.
+type StopHookDecision struct {
+	Decision string `json:"decision,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+func stopBlocksDir() string {
+	dir, err := runtimeDataPath("stop-blocks")
+	if err != nil {
+		return tempAgentDeckPath("runtime", "stop-blocks")
+	}
+	return dir
+}
+
+func stopBlocksPathFor(instanceID string) string {
+	return filepath.Join(stopBlocksDir(), sanitizeInboxName(instanceID)+".json")
+}
+
+type stopBlockState struct {
+	Count int `json:"count"`
+}
+
+func loadStopBlockCountLocked(instanceID string) int {
+	raw, err := os.ReadFile(stopBlocksPathFor(instanceID))
+	if err != nil {
+		return 0
+	}
+	var s stopBlockState
+	if json.Unmarshal(raw, &s) != nil {
+		return 0
+	}
+	return s.Count
+}
+
+// saveStopBlockCountLocked persists the consecutive-block counter durably.
+//
+// Audit B4: this MUST surface its error. A swallowed failure here is the most
+// dangerous bug in the design — if the counter never persists,
+// loadStopBlockCountLocked keeps returning 0, so every Stop blocks (0 < cap)
+// forever, the exact token-burn loop the guard prevents. Callers fail safe on a
+// non-nil error (do not block).
+func saveStopBlockCountLocked(instanceID string, count int) error {
+	data, err := json.Marshal(stopBlockState{Count: count})
+	if err != nil {
+		return err
+	}
+	return writeFileDurable(stopBlocksPathFor(instanceID), data, 0o644)
+}
+
+// DrainForStopHook implements the conductor Stop-hook contract for one instance.
+// stopHookActive is Claude Code's flag: true means this Stop is a continuation
+// induced by a previous block (so it counts against the budget); false is a
+// genuine user turn boundary (resets the budget).
+//
+// Returns the decision to emit, whether it blocked, and any error. When the
+// budget is exhausted it returns no-block WITHOUT draining, so pending records
+// are preserved for the heartbeat path (never lost to the guard).
+func DrainForStopHook(instanceID string, stopHookActive bool) (StopHookDecision, bool, error) {
+	decision, blocked, _, err := drainForStopHook(instanceID, stopHookActive, nil)
+	return decision, blocked, err
+}
+
+// drainForStopHook is DrainForStopHook leaving out the records whose turn
+// the caller already showed (consumed, not shown again).
+func drainForStopHook(instanceID string, stopHookActive bool, shown func(TransitionNotificationEvent) bool) (StopHookDecision, bool, []TransitionNotificationEvent, error) {
+	if strings.TrimSpace(instanceID) == "" {
+		return StopHookDecision{}, false, nil, nil
+	}
+
+	// Audit B12 fast path + scope: a session with nothing pending — every leaf /
+	// non-parent session — returns immediately with no block and ZERO ledger
+	// writes. Only a completion target (a conductor/parent that children commit
+	// to) ever has a pending inbox, so the global Stop-hook sync flip is inert
+	// for non-conductor sessions. Cheap stat, no consume.
+	if !InboxHasPending(instanceID) {
+		return StopHookDecision{}, false, nil, nil
+	}
+	// Issue #2469, design principle 4: a busy parent is interrupted at its
+	// turn boundary only for urgent records. Info records stay queued and are
+	// injected by the prompt-time drain of the next turn the parent takes
+	// anyway (or by the info digest). When an urgent record is present the
+	// whole queue is drained so the info rides along in the same block.
+	if !InboxHasUrgentPending(instanceID) {
+		return StopHookDecision{}, false, nil, nil
+	}
+
+	stopBlockMu.Lock()
+	defer stopBlockMu.Unlock()
+
+	count := loadStopBlockCountLocked(instanceID)
+	if !stopHookActive {
+		// Fresh user turn: reset the consecutive-block budget.
+		count = 0
+	}
+
+	// Budget exhausted: stop blocking so the conductor can reach idle. Leave any
+	// pending records untouched for the heartbeat to drain. The counter is
+	// already at its persisted value, so no write is needed.
+	if count >= MaxStopHookBlocks {
+		return StopHookDecision{}, false, nil, nil
+	}
+
+	// Audit B4: reserve the block slot durably BEFORE draining (which consumes
+	// the records). If the counter cannot be persisted we must neither block
+	// (an unpersistable counter would loop forever) nor drain (which would
+	// consume-and-lose the records). Fail safe: log, no block, records intact.
+	if err := saveStopBlockCountLocked(instanceID, count+1); err != nil {
+		commsLog.Warn("stop_block_count_persist_failed",
+			slog.String("instance", instanceID),
+			slog.String("error", err.Error()),
+		)
+		return StopHookDecision{}, false, nil, err
+	}
+
+	drained, err := DrainInboxForParent(instanceID)
+	if err != nil {
+		return StopHookDecision{}, false, nil, err
+	}
+	var events []TransitionNotificationEvent
+	for _, ev := range drained {
+		if shown == nil || !shown(ev) {
+			events = append(events, ev)
+		}
+	}
+	if dup := len(drained) - len(events); dup > 0 {
+		_ = BumpInboxStats(instanceID, func(s *InboxStats) { s.ShadowedByLedger += int64(dup) })
+	}
+	if len(events) == 0 {
+		// Race: another drain (heartbeat) emptied the inbox between the peek and
+		// here. No block; reset the budget to 0 — a non-blocking idle Stop breaks
+		// the consecutive-block chain.
+		if rbErr := saveStopBlockCountLocked(instanceID, 0); rbErr != nil {
+			commsLog.Warn("stop_block_count_reset_failed",
+				slog.String("instance", instanceID),
+				slog.String("error", rbErr.Error()),
+			)
+		}
+		return StopHookDecision{}, false, nil, nil
+	}
+
+	reason := FormatCompletionsForInjection(events)
+	_ = BumpInboxStats(instanceID, func(s *InboxStats) {
+		s.Drains++
+		s.RecordsDelivered += int64(len(events))
+		s.BytesInjected += int64(len(reason))
+		s.LastUrgentLatencyMS = urgentLatencyMS(events, time.Now())
+	})
+	return StopHookDecision{
+		Decision: "block",
+		Reason:   reason,
+	}, true, events, nil
+}
+
+// urgentLatencyMS returns the age of the newest urgent record in ms, or 0.
+func urgentLatencyMS(events []TransitionNotificationEvent, now time.Time) int64 {
+	var newest time.Time
+	for _, ev := range events {
+		if ev.IsUrgent() && ev.Timestamp.After(newest) {
+			newest = ev.Timestamp
+		}
+	}
+	if newest.IsZero() {
+		return 0
+	}
+	return now.Sub(newest).Milliseconds()
+}
+
+// FormatCompletionsForInjection renders drained completions as the human-
+// readable reason injected into the conductor's next turn.
+func FormatCompletionsForInjection(events []TransitionNotificationEvent) string {
+	return FormatInboxRecords(events, "Child session(s) completed while you were busy — handle each:")
+}
+
+// FormatInboxRecords renders records under a caller-chosen header line; one
+// renderer for the Stop block, the prompt-time drain and `inbox peek`, so a
+// record reads the same wherever the parent meets it.
+func FormatInboxRecords(events []TransitionNotificationEvent, header string) string {
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteByte('\n')
+	for _, ev := range events {
+		status := ev.ToStatus
+		if ev.Kind == transitionKindFinished && ev.DoneStatus != "" {
+			status = ev.DoneStatus
+		}
+		title := ev.ChildTitle
+		if title == "" {
+			title = ev.ChildSessionID
+		}
+		tierTag := ""
+		if ev.Tier != "" {
+			tierTag = "[" + ev.Tier + "] "
+		}
+		var line string
+		if ev.TargetKind == InboxTargetKindReply {
+			// Comms redesign PR5: a reply to this session's own tagged send,
+			// not a child's turn.
+			line = fmt.Sprintf("- [%s] reply from=%s %s: %s", ev.Tier, ev.ChildSessionID, title, status)
+		} else {
+			line = fmt.Sprintf("- %s%s (%s): %s", tierTag, title, ev.ChildSessionID, status)
+		}
+		if ev.Kind == transitionKindFinished && ev.DoneSummary != "" {
+			line += " — " + ev.DoneSummary
+		}
+		if ev.OverflowTurns > 0 {
+			// Issue #2481 item 7: this record stands for every turn past the
+			// per-child bound; it shows the newest of them.
+			line += fmt.Sprintf(" [overflow digest: %d turns past the %d-record limit, newest shown]", ev.OverflowTurns, maxPendingTurnsPerChild)
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+		// Issue #2469, design principle 2: the record carries the child's new
+		// text so the parent acts on it instead of re-reading the child.
+		if text := strings.TrimSpace(ev.Text); text != "" && text != strings.TrimSpace(ev.DoneSummary) {
+			b.WriteString(indentLines(text, "    "))
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// indentLines prefixes every line of text with indent.
+func indentLines(text, indent string) string {
+	lines := strings.Split(text, "\n")
+	for i, l := range lines {
+		lines[i] = indent + l
+	}
+	return strings.Join(lines, "\n")
+}
+
+// ResetStopBlockBudget clears an instance's consecutive-block counter. Used by
+// rm_sweep on removal and available to tests.
+func ResetStopBlockBudget(instanceID string) {
+	stopBlockMu.Lock()
+	defer stopBlockMu.Unlock()
+	_ = os.Remove(stopBlocksPathFor(instanceID))
+}

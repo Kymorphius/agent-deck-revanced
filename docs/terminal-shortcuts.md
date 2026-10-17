@@ -1,0 +1,296 @@
+# Terminal shortcuts and gotchas
+
+This page documents keyboard shortcuts that interact with agent-deck's
+tmux-backed session model — and the small set of platform / terminal
+quirks that can surprise users.
+
+## Search scope
+
+<!-- matrix/hardened: separate all-session, current-view, and current-group searches. -->
+`/` searches all managed local sessions and clears hiding view filters when a result is selected. `Alt+?` (`Alt+Shift+/`) searches only the current view and preserves its filters; `Alt+/` searches the selected group's direct local sessions. On macOS use `Option`; ordinary Option characters `¿` and `÷` also work. The overlay labels the active scope. See [session search scopes](session-search.md) for archive, folded groups and configuration details.
+
+## Text selection and copying
+
+**Why dragging doesn't select text.** The agent-deck TUI starts with mouse
+reporting enabled (`tea.WithMouseCellMotion`, mouse mode 1002), so button
+presses, releases and drag motion are delivered to the application as escape
+sequences. That is what powers click-to-select a row, double-click to attach,
+wheel scrolling and dragging the preview divider — and it is also why your
+terminal never interprets a drag as a selection gesture. This is expected
+behavior, not a bug.
+
+There are two ways around it.
+
+**1. Bypass mouse reporting at the terminal level:**
+
+| Keystroke | Where |
+| --------- | ----- |
+| `Shift`+drag | Most Linux terminals, Windows Terminal, WSL2 |
+| `Option`+drag | iTerm2 |
+
+**2. Use the built-in copy keys**, which go through the system clipboard with an
+OSC 52 fallback so they also work over SSH:
+
+| Key | Copies |
+| --- | ------ |
+| `c` | Last AI response |
+| `C` | Session info — repo / path / branch |
+| `V` | Current visible terminal pane, links included |
+| `Y` | A fenced code block from output (picker when there are several) |
+
+`c` and `V` are rebindable under `[hotkeys]` as `copy_output` and `copy_pane`;
+`C` and `Y` are fixed.
+
+If your terminal has no selection bypass, you can disable tmux mouse mode for
+new and reconnected sessions — this trades away tmux scrolling, pane resizing
+and mouse copy mode:
+
+```toml
+[tmux]
+mouse = false
+```
+
+Note that this applies to **attached sessions only**. The agent-deck list view
+keeps its own mouse capture either way, so `Shift`+drag and the copy keys remain
+the route there.
+
+## Detach from an attached session
+
+| Keystroke | What happens |
+| --------- | ------------ |
+| `Ctrl-Q`  | Detach from the currently attached agent-deck session and return to the agent-deck TUI. |
+
+`Ctrl-Q` is agent-deck's wrapper for tmux's session-detach binding. It
+works in every terminal emulator we ship support for (iTerm2, Terminal.app,
+Alacritty, Ghostty, gnome-terminal, kitty, WezTerm, the Linux console).
+
+## Switch sessions without detaching
+
+Cycle between sessions while staying attached — no detach-then-reattach
+round trip through the list.
+
+> **Opt-in — unbound by default.** Switching *while attached* requires
+> intercepting a control byte in the attach loop **before the attached
+> program sees it**, so the chord is taken from whatever runs inside the
+> session. There is no control byte that's safe to steal from every tool:
+> the previously-suggested `Ctrl-S` is Claude Code's "stash prompt" key and
+> the terminal XOFF flow-control freeze. The switcher therefore ships
+> **disabled**. Enable it by binding a `ctrl+<letter>` chord your attached
+> tools don't use:
+>
+> ```toml
+> [hotkeys]
+> switch_session = "ctrl+s"   # pick a key free in your inner tools
+> ```
+>
+> The examples below assume you've bound `Ctrl-S`.
+
+| Keystroke | What happens |
+| --------- | ------------ |
+| `Ctrl-S` | Open the session switcher, pre-highlighted on the session you're currently in. |
+
+With the switcher open from the overview or a full-screen attachment:
+
+- **`Ctrl-S`** again — cycle **forward** (the first step lands on the
+  most-recently-used *other* session); **`Ctrl-A`** — cycle **backward**.
+  Once you've cycled at least once this way, the switcher **auto-attaches
+  ~1 second after you stop** (the closest we can get to "switch when you
+  let go of the key"; see below). Holding the key down advances a step and
+  then stops — it does not spin through the list.
+- **`Up` / `Down`** — browse without auto-committing. Touching an arrow
+  cancels the pending auto-commit, so you stay put until you press Enter.
+- **`Enter`** — attach to the highlight immediately.
+- **`Esc`** — when you opened the switcher *while attached*, re-attach to
+  the session you came from (you meant to switch, not to leave). When you
+  opened it from the overview, it just closes.
+- **`Ctrl-Q`** (the detach key) — leave the switcher *and* the session,
+  dropping you in the overview.
+
+The same `Ctrl-S` also works **from the overview list** — it opens the
+switcher pre-highlighted on the session under the cursor, so you can hop
+to a recent session without scrolling the grouped list.
+
+> The switcher currently lists **local sessions only**. Remote (SSH) sessions
+> use a separate attach path and aren't yet included in the picker.
+
+A single `Ctrl-S` just opens the switcher (highlighting the session you're
+already in, so an immediate `Enter` is a no-op) and waits — it only starts
+the auto-attach countdown once you actually cycle inside it, so an
+accidental press never yanks you away.
+
+### Embedded layout
+
+When pressed in a focused embedded local pane, the configured switcher chord
+opens the local-session picker and reveals the sidebar. Cycling changes the highlight,
+but there is no automatic idle commit. Press `Enter` to attach to the highlight.
+Press `Esc` to return to the originating session. `Ctrl-Q` returns to the
+overview. A picker opened from the overview or a full-screen attachment keeps
+the timed behavior described above.
+
+The explicit choice keeps queued input from being redirected by a timer. The
+switcher remains unbound by default, and remote sessions do not intercept its
+chord. Changing the embedded-layout setting takes effect at the next launch.
+
+**Why a `ctrl+<letter>` chord and not `Ctrl-Tab` / `Ctrl-Shift-Tab`?**
+Those chords only produce a distinct keystroke on terminals running an
+enhanced keyboard protocol (kitty / Ghostty / WezTerm / foot), and not
+reliably through an attach — everywhere else `Ctrl-Tab` is indistinguishable
+from a plain `Tab`. A `ctrl+<letter>` byte is the only portable trigger.
+
+**Why is it opt-in, and why not a built-in default key?** Because the
+trigger is only useful if the attach loop grabs it *before* forwarding to
+the attached program — which means that program never receives the byte.
+Every `ctrl+<letter>` already means something to some tool: `Ctrl-S` is
+Claude Code's "stash prompt" (and XON/XOFF flow-control), readline binds
+`Ctrl-A`/`Ctrl-E`/`Ctrl-W`, and so on. There is no globally-safe choice, so
+the switcher ships unbound and you pick a key that's free in the tools you
+actually attach to.
+
+**Why does the overview/full-screen picker auto-commit instead of switching on key release?**
+Terminals don't deliver key-*release* events without an enhanced
+keyboard protocol that isn't available here, so "switch the moment you
+release Ctrl" can't be detected. The idle auto-commit (~1s) approximates
+it: tap to cycle, stop, and it lands. Press `Enter` to commit instantly
+or `Esc` to back out.
+
+The trigger is configured under `[hotkeys]` as `switch_session` (must be a
+`ctrl+<letter>` chord); it is unbound by default and never overrides the
+detach key.
+
+## Previous and next status views
+
+<!-- matrix/hardened: list-only navigation alongside the existing direct status shortcuts. -->
+Press **Ctrl+H** / **Ctrl+L** in the session list to move left / right through
+**All → Running → Waiting → Idle → Abnormal → Open → Archived → All**.
+The cycle wraps in both directions and visits views even when they are empty.
+The existing **Shift+1…6**, **0**, and **~** shortcuts remain available.
+From the interrupted-turn drill-down (`~`), left / right moves to Idle / Open,
+using Abnormal as its place in the cycle. Open uses the configured exclusions;
+the extra hide-stopped step remains on `%`.
+
+These keys preserve the current grouped, pinned or Recent presentation, time
+filter and group scope. Text inputs, dialogs and attached terminals keep their
+own key handling. Multi-repo path editing now defaults to **Alt+L**.
+Use `[hotkeys].previous_view`, `next_view`, and `edit_paths` to rebind each action,
+or set a value to `""` to disable it.
+
+## Recent interactions list
+
+<!-- matrix/hardened: use the persistent interaction timestamp, independent of agent output. -->
+Press **Ctrl+E** from the session list to open **最近 / Recent**. This is a flat
+list across groups, sorted by persisted `LastAccessedAt` (`last_accessed`) in
+descending order. A session moves up when you open or return from it, send a
+confirmed inline prompt from the list, or send accepted user input through the
+Web terminal. Background agent output does not change this order. Sessions
+without a recorded timestamp are omitted.
+
+Press **Ctrl+E** again to return to the normal grouped list. The **`t`** cycle
+also visits normal, active-on-top, populated-on-top, pinned-only, then Recent.
+<!-- matrix/hardened: explicit timeline navigation always begins with the newest match. -->
+Entering Recent starts at its first, newest row and scrolls to the top. Changing
+its status or time filter also starts at the newest match. Background refreshes
+and returning from an attached session retain the current conversation selection.
+Collapsed groups and parent sessions do not hide recent entries; existing
+status, time, archive and explicit group-scope filters continue to apply.
+Remote entries require a remote agent-deck version that reports their
+`last_accessed_at` timestamp; older remotes cannot provide a recent position.
+
+The shortcut applies to the list. Attached terminals and text inputs keep
+their own **Ctrl+E** behavior. Rebind it or disable the direct shortcut in
+`config.toml`:
+
+```toml
+[hotkeys]
+toggle_recent_view = "ctrl+e" # Another key is allowed; "" disables the shortcut.
+```
+
+## Jump to a recently used session
+
+The switcher above is one way to hop across the tree without scrolling;
+these two are faster for the common case of bouncing between a couple of
+sessions and don't open any overlay. Both are backed by the same persisted
+`last_accessed` column the switcher's MRU ordering uses, so the order
+survives a restart — see `agent-deck session recent` below for the CLI view
+of the same data.
+
+| Key | What happens |
+| --- | ------------ |
+| `` ` `` | **Alternate-session toggle.** Swap straight to the session you were on immediately before this one — vim's `Ctrl-^` for sessions. Press it again and you're back where you started. |
+| `Alt-Left` | **MRU walk back.** Step to the previous session in visit order. |
+| `Alt-Right` | **MRU walk forward.** Step to the next session in visit order (redo). |
+
+Both cross group boundaries, like the switcher does. A burst of `Alt-Left`/
+`Alt-Right` holds the walk order stable instead of reshuffling after every
+hop — only a genuinely new selection (an ordinary `Enter`, or the alternate
+toggle) advances the ring. Rebind them under `[hotkeys]` as `alt_session`,
+`mru_back` and `mru_forward` if they collide with your terminal.
+
+Unlike `switch_session`, these three work from the session list only — they
+are not intercepted inside an attach loop, so pressing them while attached
+to a session sends the keystroke to whatever is running inside that
+session instead.
+
+### `agent-deck session recent`
+
+The CLI counterpart, useful for scripting or checking the ordering agent-deck
+will walk without opening the TUI:
+
+```console
+$ agent-deck session recent
+2026-08-23 07:21:34  FP-Agent-Desk                  a1b2c3d4
+2026-08-23 07:20:19  Gog-Secure                      e5f6a7b8
+2026-08-23 07:19:54  FP-Max-Memory                   c9d0e1f2
+
+$ agent-deck session recent --json --limit 5
+```
+
+## Known terminal gotchas
+
+### iTerm2 tabs disconnect on `Ctrl-Q` (expected)
+
+When agent-deck is attached to a session inside an iTerm2 tab and you
+press `Ctrl-Q`, iTerm2 itself receives the keystroke first. iTerm2's
+default key map binds `Ctrl-Q` to "soft-quit / close window," which
+tears down the SSH tunnel and the visible agent-deck panes along with
+it. This is intentional iTerm2 behavior, not an agent-deck bug — the
+keystroke is consumed by the terminal before reaching tmux.
+
+Workarounds, in order of preference:
+
+1. **Use the agent-deck TUI's own back-out keys** (`q` from a session
+   list view, `Esc` from most overlays) instead of `Ctrl-Q` when inside
+   iTerm2. They go through the TUI's bubbletea event loop, never
+   through tmux's detach binding, and never reach iTerm2's hotkey
+   handler.
+2. **Remap iTerm2's `Ctrl-Q`**: open iTerm2 → Preferences → Keys → Key
+   Bindings, find `^Q`, and either delete the binding or change it to
+   "Send Escape Sequence" with no payload. After that `Ctrl-Q` flows
+   through to tmux exactly like every other terminal.
+3. **Attach via the macOS Terminal.app or a different terminal** for
+   workflows that rely heavily on `Ctrl-Q`. Terminal.app does not bind
+   the keystroke by default.
+
+This is the same class of conflict as macOS's system `Cmd-Q` (force-
+quit) — a terminal-level binding wins against any program running
+inside the terminal. Tracked at GitHub #1112 (bug 4). No code change
+ships in agent-deck for this case; the documentation here is the fix.
+
+### `Ctrl-Q` inside an outer tmux
+
+If you've launched `agent-deck` inside an outer tmux instance and that
+outer tmux's prefix is `Ctrl-Q`, the detach is consumed by the outer
+tmux instead of the agent-deck-owned tmux. Pick a non-default prefix
+for your outer tmux (`Ctrl-A` and `Ctrl-B` are the conventional
+choices) to keep `Ctrl-Q` reserved for agent-deck's detach.
+
+## Related references
+
+- `internal/tmux/pty.go` — the agent-deck-side intercept for `Ctrl-Q`
+  and the session-switch keys across keyboard-encoding modes (raw bytes,
+  xterm, kitty).
+- `internal/ui/session_switcher.go` — the in-attach switcher overlay.
+- GitHub #356, #357 — earlier hardening of `Ctrl-Q` detection across
+  encodings.
+- GitHub #1112 — the cluster of remote / direct-type bugs that
+  motivated this page; this entry covers sub-issue 4 (Ctrl-Q in iTerm
+  tabs).

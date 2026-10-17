@@ -1,0 +1,39 @@
+name: homebrew-verify
+
+# Regression gate for #873 - users on Mac/Linux/WSL run
+# `brew install asheshgoplani/tap/agent-deck` from README and release notes.
+# That path silently broke once when goreleaser's brews block was misconfigured;
+# this workflow probes the live tap so the next break is caught in CI.
+
+on:
+  pull_request:
+    paths:
+      - 'README.md'
+      - '.goreleaser.yml'
+      - 'scripts/verify-homebrew-install.sh'
+      - '.github/workflows/homebrew-verify.yml'
+  # Runs after the Release workflow finishes, NOT on the tag push (#1759).
+  # On the tag push the release is mid-flight: the tap formula still holds the
+  # previous version while the API may already advertise the new tag, so the
+  # version-match check below failed on a race rather than on a real break —
+  # and it was verifying the previous release, not the one being cut.
+  workflow_run:
+    workflows: ['Release']
+    types:
+      - completed
+  schedule:
+    # Weekly probe so a broken tap is detected even without commits.
+    - cron: '0 9 * * 1'
+  workflow_dispatch: {}
+
+jobs:
+  verify-formula:
+    runs-on: ubuntu-latest
+    # A failed release deliberately leaves the previous version published and
+    # the tap untouched, which is a consistent state — nothing to verify, and
+    # verifying it would just add a second red check to an already-red release.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify homebrew tap publishes a working formula
+        run: bash scripts/verify-homebrew-install.sh

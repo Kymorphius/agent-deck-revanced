@@ -1,0 +1,232 @@
+package session
+
+import (
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
+)
+
+// DiscoverExistingTmuxSessions finds all tmux sessions and converts them to instances
+func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, error) {
+	// Get all tmux sessions
+	tmuxSessions, err := tmux.DiscoverAllTmuxSessions()
+	if err != nil {
+		return nil, err
+	}
+
+	// Build a map of existing sessions by tmux name
+	existingMap := make(map[string]bool)
+	for _, inst := range existingInstances {
+		if inst.GetTmuxSession() != nil {
+			existingMap[inst.GetTmuxSession().Name] = true
+		}
+		// Also track by title
+		existingMap[inst.Title] = true
+	}
+
+	var discovered []*Instance
+	for _, sess := range tmuxSessions {
+		// Skip if already tracked
+		if existingMap[sess.Name] || existingMap[sess.DisplayName] {
+			continue
+		}
+
+		// For orphaned agent-deck sessions, extract the original title from the tmux name
+		// Format: agentdeck_<title>_<hash> -> extract <title>
+		title := sess.DisplayName
+		groupPath := ""
+		isOrphaned := false
+		if strings.HasPrefix(sess.Name, tmux.SessionPrefix) {
+			isOrphaned = true
+			// Extract title from session name: agentdeck_<title>_<8-char-hash>
+			namePart := strings.TrimPrefix(sess.Name, tmux.SessionPrefix)
+			if lastUnderscore := strings.LastIndex(namePart, "_"); lastUnderscore > 0 {
+				title = namePart[:lastUnderscore]
+			} else {
+				title = namePart
+			}
+			// Put orphaned sessions in a "Recovered" group so user knows they were recovered
+			groupPath = "recovered"
+		}
+
+		// Create instance for discovered session
+		projectPath := sess.WorkDir
+		if projectPath == "" {
+			projectPath = "~"
+		}
+
+		// Enable mouse mode for proper scrolling in imported sessions
+		// Ignore errors - non-fatal, older tmux versions may not support all options
+		_ = sess.EnableMouseMode()
+
+		// Determine tool type - for orphaned agent-deck sessions, assume claude (most common)
+		tool := detectToolFromName(title)
+		if isOrphaned && tool == "shell" {
+			tool = "claude" // Most agent-deck sessions are Claude sessions
+		}
+
+		inst := &Instance{
+			ID:             GenerateID(),
+			Title:          title,
+			ProjectPath:    projectPath,
+			GroupPath:      groupPath,
+			Status:         StatusIdle,
+			Tool:           tool,
+			TmuxSocketName: sess.SocketName, // Inherit from the tmux session we discovered (#687)
+			tmuxSession:    sess,
+		}
+		_ = inst.UpdateStatus()
+		discovered = append(discovered, inst)
+	}
+
+	return discovered, nil
+}
+
+// UntrackedTmuxSession describes a live tmux session carrying the
+// agentdeck_ prefix that is not referenced by any tracked (non-archived)
+// instance — a leftover from a crash, or the old side of a "Restart with
+// new session ID" whose tmux process was never torn down.
+type UntrackedTmuxSession struct {
+	Name        string
+	Age         time.Duration
+	PaneCommand string
+}
+
+// UntrackedTmuxSessions reports live agentdeck_-prefixed tmux sessions that
+// are not part of the tracked set (the same set VisibleInstances/list --json
+// enumerates). It never tears anything down — the caller (doctor/health)
+// only surfaces the list so the operator can decide.
+func UntrackedTmuxSessions(instances []*Instance) ([]UntrackedTmuxSession, error) {
+	tmuxSessions, err := tmux.DiscoverAllTmuxSessions()
+	if err != nil {
+		return nil, err
+	}
+
+	tracked := make(map[string]bool)
+	for _, inst := range VisibleInstances(instances) {
+		if ts := inst.GetTmuxSession(); ts != nil && ts.Name != "" {
+			tracked[ts.Name] = true
+		}
+	}
+
+	var untracked []UntrackedTmuxSession
+	for _, sess := range tmuxSessions {
+		if !strings.HasPrefix(sess.Name, tmux.SessionPrefix) {
+			continue
+		}
+		if tracked[sess.Name] {
+			continue
+		}
+		age := time.Duration(0)
+		if !sess.Created.IsZero() {
+			age = time.Since(sess.Created)
+		}
+		untracked = append(untracked, UntrackedTmuxSession{
+			Name:        sess.Name,
+			Age:         age,
+			PaneCommand: sess.Command,
+		})
+	}
+	return untracked, nil
+}
+
+// GroupByProject groups sessions by their parent project directory
+func GroupByProject(instances []*Instance) map[string][]*Instance {
+	groups := make(map[string][]*Instance)
+
+	for _, inst := range instances {
+		// Extract parent directory name
+		projectName := extractProjectName(inst.ProjectPath)
+		groups[projectName] = append(groups[projectName], inst)
+	}
+
+	return groups
+}
+
+// FilterByQuery filters sessions by title, project path, group, tool, or status.
+// Supports status filters: "waiting", "running", "idle", "error", "stopped".
+func FilterByQuery(instances []*Instance, query string) []*Instance {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return instances
+	}
+
+	// Check for status filters
+	statusFilters := map[string]Status{
+		"waiting": StatusWaiting,
+		"running": StatusRunning,
+		"idle":    StatusIdle,
+		"error":   StatusError,
+		"stopped": StatusStopped,
+	}
+
+	// If query matches a status filter exactly, filter by status
+	if status, ok := statusFilters[query]; ok {
+		return filterByStatus(instances, status)
+	}
+
+	// matrix/hardened: include groups and separator-insensitive fuzzy names,
+	// while ranking literal matches first and keeping state words exact.
+	return matrixFilterSessionSearch(instances, query)
+}
+
+// filterByStatus returns only instances with the specified status
+func filterByStatus(instances []*Instance, status Status) []*Instance {
+	filtered := make([]*Instance, 0)
+	for _, inst := range instances {
+		// matrix/hardened: an incomplete list must not panic during search.
+		if inst != nil && inst.Status == status {
+			filtered = append(filtered, inst)
+		}
+	}
+	return filtered
+}
+
+// detectToolFromName tries to detect tool type from session name
+func detectToolFromName(name string) string {
+	nameLower := strings.ToLower(name)
+
+	if strings.Contains(nameLower, "claude") {
+		return "claude"
+	}
+	if strings.Contains(nameLower, "gemini") {
+		return "gemini"
+	}
+	if strings.Contains(nameLower, "opencode") || strings.Contains(nameLower, "open-code") {
+		return "opencode"
+	}
+	if strings.Contains(nameLower, "codex") {
+		return "codex"
+	}
+
+	return "shell"
+}
+
+// extractProjectName extracts the parent directory name from a path
+func extractProjectName(projectPath string) string {
+	// Clean the path and split into parts
+	cleanPath := filepath.Clean(projectPath)
+	parts := strings.Split(cleanPath, string(filepath.Separator))
+
+	// Filter out empty parts
+	var filteredParts []string
+	for _, part := range parts {
+		if part != "" {
+			filteredParts = append(filteredParts, part)
+		}
+	}
+
+	// For /home/user/projects/devops, we want "projects" (second-to-last)
+	if len(filteredParts) >= 2 {
+		return filteredParts[len(filteredParts)-2]
+	}
+
+	// Fallback to the last part
+	if len(filteredParts) > 0 {
+		return filteredParts[len(filteredParts)-1]
+	}
+
+	return "unknown"
+}

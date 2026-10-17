@@ -1,0 +1,50 @@
+⏺ xxx xxxxxxxx xx xxxx, xxx xxx xxxxxxxxxx xxxxxx xx xxxx xxxxxxxxxx xx xxx xxxxxxxxx xx xxx xxxxxxx. xx xx xxxx xxx xxxx xxxxxxxx xxxxxxx xxxxxx.
+
+  xxxxx xxxxx xxxxxxxxxxxxx, xxx xxxx xx xxxxx, xxxx xxx xxxxxxxxxxx xxxxxxxxxx xxxxxxxx xxxx xxxxx xxxx (xxxxx xx xxxxxx):
+
+  ┌──────────────────────────────┬────────────────┬─────────────────┬──────────────────────────┬────────────────────────────────────┐
+  │           Xxxxxxx            │ Xxxxx xxx xxxx │       XXX       │    Xxxxxxxx xxxxxxxx     │        Xxxxx in XxxXxxxxxx         │
+  ├──────────────────────────────┼────────────────┼─────────────────┼──────────────────────────┼────────────────────────────────────┤
+  │ XxxxxxXxxx Xxxxxx x0         │ $0.00          │ 0.0%            │ Yes                      │ Yes, xxxxx in, xxx xxxxxxx xxxx xx │
+  ├──────────────────────────────┼────────────────┼─────────────────┼──────────────────────────┼────────────────────────────────────┤
+  │ Xxxxxxx Xxxxxxx Xxxxxxxxxx 0 │ $0.00          │ 0.0%            │ Yes                      │ Xxxxxxxx, xxx Xxxxxx Xxxxxxxx      │
+  ├──────────────────────────────┼────────────────┼─────────────────┼──────────────────────────┼────────────────────────────────────┤
+  │ XxxxxxxxXX Xxxxxxxxx-0 Xxx   │ xxxxx $0.00    │ 0.0%            │ Yes                      │ No                                 │
+  ├──────────────────────────────┼────────────────┼─────────────────┼──────────────────────────┼────────────────────────────────────┤
+  │ Xxxxxxxxxxxx                 │ $0.00          │ 0.0%            │ Yes                      │ No                                 │
+  ├──────────────────────────────┼────────────────┼─────────────────┼──────────────────────────┼────────────────────────────────────┤
+  │ OpenAI gpt-0x-xxxxxxxxxx     │ $0.00          │ 0.0%            │ Xxxx xxx xxxxxxx xxxxxxx │ Yes, xxxxx in                      │
+  ├──────────────────────────────┼────────────────┼─────────────────┼──────────────────────────┼────────────────────────────────────┤
+  │ Xxxxxxxx Xxxx-0              │ $0.00          │ 0.0%            │ Yes                      │ Yes, xxxxx in                      │
+  ├──────────────────────────────┼────────────────┼─────────────────┼──────────────────────────┼────────────────────────────────────┤
+  │ Xxxx Xxxxxxx Xxxxx           │ $0.00          │ 0.0%            │ No                       │ Yes, xxxxx in                      │
+  ├──────────────────────────────┼────────────────┼─────────────────┼──────────────────────────┼────────────────────────────────────┤
+  │ XxxxXxxxx Xxxx0-XXX          │ $0.00          │ xxx xxxxxxxxxxx │ No                       │ Yes, xxx Xxxxxx Xxxxxxxx           │
+  └──────────────────────────────┴────────────────┴─────────────────┴──────────────────────────┴────────────────────────────────────┘
+
+  xxxx xxxx xxxxx xxx xxx:
+
+  - xxxxxx xx xx xxx xxxx xxxxx xxxxx, xxxx xxxx. xxxxxx xxxxx xxxx xx xxx xxxxxxx, xxxxxxxx xxxxxxxx, xxx xxxxxxx xxxxx xxxx xxxx xxxxxxxxxx. xx xxx xxxxxx, xxxxxx xxxxx xx xxxxxxxx x
+    xxxxx xxxxx xxxxx xxxx xxxxxxx. xxx xxxxxxxxx xxxx xx xxxxxxxxxx xx xxx xxxxx xxxxxxxxxxxx, xxx xxx xxxxxxxxxxxxx xxx, xx xxxxx xxxx xxxx xxx xx xx xxx-xx-xxx-xx xxx xxxxxxx xxxxxx
+    xxxx x xxxx.
+  - xxxxxxx xxxxx xx xx xxxxxxxx xx xxx xxxxx. xxx xxxx xxxxxxx xxxxxxx xxxx xxxxxxxxxx xxxxxxx xxx xxxxxxx xxx xxxxxxxxxx, xxx xxxx xxx xxxx xxxxxxxx xxxxxxx xxxxx xxxxx xxxxxxx xxxx
+    xxxxxxxx.
+  - xxx xxxxx xxxxxx xxxxxx xxxx. xxxxxxxx xx xxx xxxxx-xxx xxx xx xxxx xxxx xxxx xxxxxxx xxxxxx, xx xxx xxxx xxx xxxxxxx xxxxx xxx xxxxxx xx xxxx x xxxxxxx xxxxxx xxxxxxx xx xxx xxxxx
+    xx xxx.
+
+  xxxxxxxxx xxxxx xx xxxxxxxxxx:
+
+  0. xxxxxxx xxxx xxxxx: xxxxxxxx xx, xxxxxxxx xxxx.
+  0. xxxxxxxxx xx xxxxx xxxxxxxx: xxxx xxxxxxxxxx xxxxxx xx xx xxx xxxxx xxxx.
+  0. xxxx xxxxxx xxxxxxx. xx xxxxx xxxx x xxx xxxxx xxx xxxx xxx xxxx xxxxxxxx.
+
+  xxx xxxxxx xx xxx xxxxxxx: xxx xxxxxxxxx xx xxxxxxx-xxxxxxxx, xxx xx xxxxxx xxxxxxxxx x xxxxxxxx xxxxxx xxxxx. xxxxxx xx xxx xxxxxxx xxxx xxxxx xxxxxx xxxxxx, xx xxx xxxxxx xx xx xxx
+  xx xxxx xxxxxx xxxxx xxxxxx xxxxxxx xx xx.
+
+✻ Brewed for 2m 57s · done 0:00 XX
+                                                                                                                                                  new task? /clear to save 000.0k tokens
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── xxxxxxxxxx ─
+❯ 
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [xxxxxxx-x] x@xxxx:/Xxxxx/x | [Fable 5.1] ctx:00% in:000.0k out:0.0k                                                                                             /xx
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

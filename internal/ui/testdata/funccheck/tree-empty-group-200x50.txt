@@ -1,0 +1,3 @@
+1 ▶ ▾ alpha (1) '1
+2    └─ ○ visible-root claude
+3     ▾ empty (0)

@@ -1,0 +1,2908 @@
+package ui
+
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+	"unicode"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
+
+	"github.com/asheshgoplani/agent-deck/internal/git"
+	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+func TestNewNewDialog(t *testing.T) {
+	d := NewNewDialog()
+
+	if d == nil {
+		t.Fatal("NewNewDialog returned nil")
+	}
+	if d.IsVisible() {
+		t.Error("Dialog should not be visible by default")
+	}
+	if len(d.presetCommands) == 0 {
+		t.Error("presetCommands should not be empty")
+	}
+}
+
+func TestDialogVisibility(t *testing.T) {
+	d := NewNewDialog()
+
+	d.Show()
+	if !d.IsVisible() {
+		t.Error("Dialog should be visible after Show()")
+	}
+
+	d.Hide()
+	if d.IsVisible() {
+		t.Error("Dialog should not be visible after Hide()")
+	}
+}
+
+func TestDialogSetSize(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(100, 50)
+
+	if d.width != 100 {
+		t.Errorf("Width = %d, want 100", d.width)
+	}
+	if d.height != 50 {
+		t.Errorf("Height = %d, want 50", d.height)
+	}
+}
+
+func TestNewDialog_SetSize_syncsPathInputWidth(t *testing.T) {
+	d := NewNewDialog()
+
+	d.SetSize(120, 40)
+	// Preferred outer width 84 → text fields 84 − 12 = 72.
+	if got := d.pathInput.Width; got != 72 {
+		t.Fatalf("wide terminal: pathInput.Width = %d, want 72", got)
+	}
+
+	d.SetSize(55, 40)
+	// Outer shrinks to terminal−10 (45), above min 44 → inputs 45 − 12 = 33.
+	if got := d.pathInput.Width; got != 33 {
+		t.Fatalf("narrow terminal: pathInput.Width = %d, want 33", got)
+	}
+}
+
+func TestNewDialog_ModelInputForCodex(t *testing.T) {
+	d := NewNewDialog()
+	d.SetDefaultTool("codex")
+	d.SetSize(100, 50)
+	d.Show()
+
+	if !d.selectedToolSupportsModel() {
+		t.Fatal("codex should support model selection")
+	}
+	if idx := d.indexOf(focusModel); idx < 0 {
+		t.Fatal("model input should be focusable for codex")
+	}
+	view := d.View()
+	if !strings.Contains(view, "Model ID") {
+		t.Fatal("codex new-session dialog should render a model input")
+	}
+	if !strings.Contains(view, "gpt-6-sol") || !strings.Contains(view, "gpt-5.5") {
+		t.Fatalf("codex model hints should include current ChatGPT versions: %q", view)
+	}
+
+	d.modelInput.SetValue("gpt-5.6-sol")
+	if got := d.GetLaunchModelID(); got != "gpt-5.6-sol" {
+		t.Fatalf("GetLaunchModelID() = %q, want gpt-5.6-sol", got)
+	}
+}
+
+func TestKnownModelIDsForTool_CodexStartsWithGPT6Tiers(t *testing.T) {
+	want := []string{"gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
+	got := knownModelIDsForTool("codex")
+	if len(got) < len(want) || !reflect.DeepEqual(got[:len(want)], want) {
+		t.Fatalf("Codex model catalog prefix = %v, want %v", got, want)
+	}
+}
+
+func TestNewDialog_ModelInputForClaude(t *testing.T) {
+	d := NewNewDialog()
+	d.SetDefaultTool("claude")
+	d.SetSize(100, 50)
+	d.Show()
+
+	if !d.selectedToolSupportsModel() {
+		t.Fatal("claude should support model selection")
+	}
+	if idx := d.indexOf(focusModel); idx < 0 {
+		t.Fatal("model input should be focusable for claude")
+	}
+	view := d.View()
+	if !strings.Contains(view, "Model ID") {
+		t.Fatal("claude new-session dialog should render a model input")
+	}
+	if !strings.Contains(view, "claude-opus-5-5") || !strings.Contains(view, "claude-sonnet-5") {
+		t.Fatalf("claude model hints should include current Claude versions: %q", view)
+	}
+
+	d.modelInput.SetValue("claude-opus-5")
+	if got := d.GetLaunchModelID(); got != "claude-opus-5" {
+		t.Fatalf("GetLaunchModelID() = %q, want claude-opus-5", got)
+	}
+}
+
+func TestNewDialog_ModelSuggestions_FilterAndSelectClaude(t *testing.T) {
+	d := NewNewDialog()
+	d.SetDefaultTool("claude")
+	d.SetSize(100, 50)
+	d.Show()
+	d.focusIndex = d.indexOf(focusModel)
+	d.updateFocus()
+
+	d.modelInput.SetValue("opus")
+	d.filterModelSuggestions()
+
+	if len(d.modelSuggestions) == 0 || d.modelSuggestions[0] != "claude-opus-5-5" {
+		t.Fatalf("filtered model suggestions = %v, want claude-opus-5-5 first", d.modelSuggestions)
+	}
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace}) // Space opens the list; Enter advances (newdialog_flow_test.go)
+	if !d.IsModelSuggestionsActive() {
+		t.Fatal("space on model input should activate the model suggestions dropdown")
+	}
+	if view := d.View(); !strings.Contains(view, "Type custom model ID") || !strings.Contains(view, "claude-opus-5") {
+		t.Fatalf("model dropdown should show custom entry and known model IDs after enter: %q", view)
+	}
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if d.modelSuggestionCursor != 1 {
+		t.Fatalf("modelSuggestionCursor = %d, want 1", d.modelSuggestionCursor)
+	}
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if got := d.GetLaunchModelID(); got != "claude-opus-5-5" {
+		t.Fatalf("GetLaunchModelID() = %q, want claude-opus-5-5", got)
+	}
+	// Accepting a model advances focus off the model field. The exact next
+	// target depends on the focus order rebuildFocusTargets produces — Path
+	// when it is present, Worktree when multi-repo hides it — so assert the
+	// advance rather than pinning a target the environment can change.
+	if got := d.currentTarget(); got == focusModel {
+		t.Fatal("accepting a model should advance focus off the model field")
+	}
+}
+
+// TestPreselectDefaultModel covers preselectDefaultModel. The model catalog
+// is a suggestion source, not an allowlist (#2388): a configured
+// [claude] default_model is always prefilled, even when this build's catalog
+// does not know it (a model newer than the build, or an alias). Dropping it
+// silently used to launch the session on the tool default instead.
+func TestPreselectDefaultModel(t *testing.T) {
+	withModel := func(id string) *session.UserConfig {
+		cfg := &session.UserConfig{}
+		cfg.Claude.DefaultModel = id
+		return cfg
+	}
+
+	cases := []struct {
+		name   string
+		config *session.UserConfig
+		tool   string
+		want   string
+	}{
+		{"in catalog is honored", withModel("claude-opus-5"), "claude", "claude-opus-5"},
+		{"newest Opus is honored", withModel("claude-opus-5-5"), "claude", "claude-opus-5-5"},
+		{"older in-catalog ID still honored", withModel("claude-opus-4-8"), "claude", "claude-opus-4-8"},
+		{"unknown ID passes through", withModel("claude-opus-9"), "claude", "claude-opus-9"},
+		{"bare alias passes through", withModel("opus"), "claude", "opus"},
+		{"surrounding whitespace tolerated", withModel("  claude-sonnet-5  "), "claude", "claude-sonnet-5"},
+		{"empty default is unset", withModel(""), "claude", ""},
+		{"nil config is safe", nil, "claude", ""},
+		{"non-claude tool ignores claude default", withModel("claude-opus-5"), "codex", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := preselectDefaultModel(tc.config, tc.tool); got != tc.want {
+				t.Fatalf("preselectDefaultModel(%q) = %q, want %q", tc.tool, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNewDialog_ModelSuggestions_FilterAndSelectCodex(t *testing.T) {
+	d := NewNewDialog()
+	d.SetDefaultTool("codex")
+	d.SetSize(100, 50)
+	d.Show()
+	d.focusIndex = d.indexOf(focusModel)
+	d.updateFocus()
+
+	d.modelInput.SetValue("5.6")
+	d.filterModelSuggestions()
+
+	if len(d.modelSuggestions) != 3 || d.modelSuggestions[0] != "gpt-5.6-sol" {
+		t.Fatalf("filtered model suggestions = %v, want three GPT-5.6 tiers with Sol first", d.modelSuggestions)
+	}
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace}) // Space opens the list; Enter advances (newdialog_flow_test.go)
+	if !d.IsModelSuggestionsActive() {
+		t.Fatal("space on model input should activate the model suggestions dropdown")
+	}
+	if view := d.View(); !strings.Contains(view, "Type custom model ID") || !strings.Contains(view, "gpt-5.6-terra") || !strings.Contains(view, "gpt-5.6-luna") {
+		t.Fatalf("model dropdown should show custom entry and known model IDs after enter: %q", view)
+	}
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if !d.IsModelSuggestionsActive() {
+		t.Fatal("down inside model dropdown should keep suggestions active")
+	}
+	if d.modelSuggestionCursor != 1 {
+		t.Fatalf("modelSuggestionCursor = %d, want 1", d.modelSuggestionCursor)
+	}
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if got := d.GetLaunchModelID(); got != "gpt-5.6-sol" {
+		t.Fatalf("GetLaunchModelID() = %q, want gpt-5.6-sol", got)
+	}
+	// Reasoning effort is grouped directly after the model, so accepting a
+	// model advances to the effort picker before Path.
+	if d.currentTarget() != focusReasoningEffort {
+		t.Fatalf("currentTarget after accepting model = %v, want focusReasoningEffort", d.currentTarget())
+	}
+}
+
+func TestNewDialog_ModelDropdownVisibleOnFocus(t *testing.T) {
+	d := NewNewDialog()
+	d.SetDefaultTool("codex")
+	d.SetSize(100, 50)
+	d.Show()
+	d.focusIndex = d.indexOf(focusModel)
+	d.updateFocus()
+
+	if d.IsModelSuggestionsActive() {
+		t.Fatal("model dropdown should be visible on focus without taking active dropdown control")
+	}
+	view := d.View()
+	if !strings.Contains(view, "Type custom model ID") || !strings.Contains(view, "gpt-5.6-sol") {
+		t.Fatalf("model dropdown should show custom entry and known model IDs on focus: %q", view)
+	}
+
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if !d.IsModelSuggestionsActive() {
+		t.Fatal("down on focused model input should activate model dropdown navigation")
+	}
+	if d.modelSuggestionCursor != 1 {
+		t.Fatalf("modelSuggestionCursor = %d, want 1", d.modelSuggestionCursor)
+	}
+}
+
+func TestNewDialog_ReasoningEffortPickerUsesToolSpecificChoices(t *testing.T) {
+	tests := []struct {
+		tool string
+		want string
+	}{
+		{tool: "claude", want: "low"},
+		{tool: "codex", want: "minimal"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.tool, func(t *testing.T) {
+			d := NewNewDialog()
+			d.SetDefaultTool(tt.tool)
+			d.Show()
+			idx := d.indexOf(focusReasoningEffort)
+			if idx < 0 {
+				t.Fatalf("%s dialog missing reasoning-effort focus target", tt.tool)
+			}
+			d.focusIndex = idx
+			d.updateFocus()
+			d, _ = d.Update(tea.KeyMsg{Type: tea.KeyRight})
+			if got := d.GetLaunchReasoningEffort(); got != tt.want {
+				t.Fatalf("GetLaunchReasoningEffort() = %q, want %q", got, tt.want)
+			}
+			view := d.View()
+			if !strings.Contains(view, "Reasoning effort") || !strings.Contains(strings.ToLower(view), tt.want) {
+				t.Fatalf("reasoning picker not rendered for %s: %q", tt.tool, view)
+			}
+		})
+	}
+}
+
+func TestNewDialog_ReasoningEffortHiddenForUnsupportedTool(t *testing.T) {
+	d := NewNewDialog()
+	d.SetDefaultTool("gemini")
+	d.Show()
+	if idx := d.indexOf(focusReasoningEffort); idx >= 0 {
+		t.Fatalf("Gemini dialog unexpectedly has reasoning-effort focus target at %d", idx)
+	}
+}
+
+func TestNewDialog_ModelDropdown_TabAndShiftTabMoveFocus(t *testing.T) {
+	d := NewNewDialog()
+	d.SetDefaultTool("codex")
+	d.SetSize(100, 50)
+	d.Show()
+	d.focusIndex = d.indexOf(focusModel)
+	d.updateFocus()
+
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	if d.currentTarget() != focusCommand {
+		t.Fatalf("currentTarget after shift+tab from model field = %v, want focusCommand", d.currentTarget())
+	}
+
+	d.focusIndex = d.indexOf(focusModel)
+	d.updateFocus()
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace}) // Space opens the list; Enter advances (newdialog_flow_test.go)
+	if !d.IsModelSuggestionsActive() {
+		t.Fatal("space on model input should activate model suggestions")
+	}
+
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	if d.IsModelSuggestionsActive() {
+		t.Fatal("shift+tab should close the model dropdown")
+	}
+	if d.currentTarget() != focusCommand {
+		t.Fatalf("currentTarget after shift+tab from model dropdown = %v, want focusCommand", d.currentTarget())
+	}
+
+	for d.currentTarget() != focusName {
+		d, _ = d.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	}
+	if d.currentTarget() != focusName {
+		t.Fatalf("currentTarget = %v, want focusName", d.currentTarget())
+	}
+
+	d.focusIndex = d.indexOf(focusModel)
+	d.updateFocus()
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace}) // Space opens the list; Enter advances (newdialog_flow_test.go)
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if d.IsModelSuggestionsActive() {
+		t.Fatal("tab should close the model dropdown")
+	}
+	// The effort picker follows Model, so Tab lands there before Path.
+	if d.currentTarget() != focusReasoningEffort {
+		t.Fatalf("currentTarget after tab from model dropdown = %v, want focusReasoningEffort", d.currentTarget())
+	}
+}
+
+func TestNewDialog_TabFromLastFieldCyclesToTop(t *testing.T) {
+	d := NewNewDialog()
+	d.SetDefaultTool("codex")
+	d.SetSize(100, 50)
+	d.Show()
+	d.focusIndex = d.indexOf(focusOptions)
+	if d.focusIndex < 0 {
+		t.Fatal("focusOptions should be present for codex")
+	}
+	d.updateFocus()
+
+	// matrix/hardened: Save defaults precedes Create, then Tab wraps to Name.
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if d.currentTarget() != focusSaveDefaults {
+		t.Fatalf("currentTarget after options = %v, want focusSaveDefaults", d.currentTarget())
+	}
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if d.currentTarget() != focusCreate {
+		t.Fatal("Save defaults must precede Create")
+	}
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if d.currentTarget() != focusName {
+		t.Fatalf("currentTarget after tab from last field = %v, want focusName", d.currentTarget())
+	}
+}
+
+func TestNewDialog_ModelInputHiddenForShell(t *testing.T) {
+	d := NewNewDialog()
+	d.SetDefaultTool("")
+	d.SetSize(100, 50)
+	d.Show()
+	d.modelInput.SetValue("gpt-5.5")
+
+	if got := d.GetLaunchModelID(); got != "" {
+		t.Fatalf("GetLaunchModelID() for shell = %q, want empty", got)
+	}
+	if strings.Contains(d.View(), "Model ID") {
+		t.Fatal("shell new-session dialog should not render a model input")
+	}
+}
+
+func TestRenderLaunchModelInfoLines_ShowsModelAndVersion(t *testing.T) {
+	inst := &session.Instance{Tool: "codex"}
+	if err := inst.ApplyLaunchModel("gpt-5.5"); err != nil {
+		t.Fatalf("ApplyLaunchModel: %v", err)
+	}
+
+	var b strings.Builder
+	renderLaunchModelInfoLines(&b, inst)
+	out := b.String()
+
+	for _, want := range []string{"Model:", "GPT", "Version:", "5.5", "Model ID:", "gpt-5.5"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("model status output missing %q: %q", want, out)
+		}
+	}
+}
+
+func TestDisplayCommandPreset(t *testing.T) {
+	// Both DefaultCursorCommand PATH outcomes are covered in
+	// session.TestDefaultCursorCommand_*; here we pin the UI wrapper and the
+	// two legal labels explicitly.
+	want := session.DefaultCursorCommand()
+	if want != "agent" && want != "cursor agent" {
+		t.Fatalf("DefaultCursorCommand() = %q, want agent or cursor agent", want)
+	}
+	if got := displayCommandPreset("cursor"); got != want {
+		t.Errorf("cursor → %q, want %q", got, want)
+	}
+	if got := displayCommandPreset("claude"); got != "claude" {
+		t.Errorf("claude passthrough: got %q", got)
+	}
+	if got := displayCommandPreset(""); got != "" {
+		t.Errorf("empty passthrough: got %q", got)
+	}
+}
+
+func TestDialogPresetCommands(t *testing.T) {
+	d := NewNewDialog()
+
+	// Should have shell (empty), claude, gemini, opencode, codex, pi, copilot, crush, muse, cursor, hermes, deepseek, omp
+	expectedCommands := []string{"", "codex", "claude", "gemini", "opencode", "pi", "copilot", "crush", "muse", "cursor", "hermes", "deepseek", "omp"}
+
+	if len(d.presetCommands) != len(expectedCommands) {
+		t.Errorf("Expected %d preset commands, got %d", len(expectedCommands), len(d.presetCommands))
+	}
+
+	for i, cmd := range expectedCommands {
+		if d.presetCommands[i] != cmd {
+			t.Errorf("presetCommands[%d] = %s, want %s", i, d.presetCommands[i], cmd)
+		}
+	}
+}
+
+func TestDialogGetValues(t *testing.T) {
+	d := NewNewDialog()
+	d.nameInput.SetValue("my-session")
+	d.pathInput.SetValue("/tmp/project")
+	d.SetDefaultTool("claude") // matrix/hardened: select by tool name
+
+	name, path, command := d.GetValues()
+
+	if name != "my-session" {
+		t.Errorf("name = %s, want my-session", name)
+	}
+	if path != "/tmp/project" {
+		t.Errorf("path = %s, want /tmp/project", path)
+	}
+	if command != "claude" {
+		t.Errorf("command = %s, want claude", command)
+	}
+}
+
+func TestDialogExpandTilde(t *testing.T) {
+	d := NewNewDialog()
+	d.nameInput.SetValue("test")
+	d.pathInput.SetValue("~/projects")
+
+	_, path, _ := d.GetValues()
+
+	home, _ := os.UserHomeDir()
+	if !strings.HasPrefix(path, home) {
+		t.Errorf("path should expand ~ to home directory, got %s", path)
+	}
+}
+
+func TestDialogView(t *testing.T) {
+	d := NewNewDialog()
+
+	// Not visible - should return empty
+	view := d.View()
+	if view != "" {
+		t.Error("View should be empty when not visible")
+	}
+
+	// Visible - should return content
+	d.SetSize(80, 24)
+	d.Show()
+	view = d.View()
+	if view == "" {
+		t.Error("View should not be empty when visible")
+	}
+	if !strings.Contains(view, "New Session") {
+		t.Error("View should contain 'New Session' title")
+	}
+}
+
+func TestNewDialog_SetPathSuggestions(t *testing.T) {
+	d := NewNewDialog()
+
+	paths := []string{
+		"/Users/test/project1",
+		"/Users/test/project2",
+		"/Users/test/other",
+	}
+
+	d.SetPathSuggestions(paths)
+
+	if len(d.pathSuggestions) != 3 {
+		t.Errorf("expected 3 pathSuggestions, got %d", len(d.pathSuggestions))
+	}
+
+	// Verify full set is stored in allPathSuggestions
+	if len(d.allPathSuggestions) != 3 {
+		t.Errorf("expected 3 allPathSuggestions, got %d", len(d.allPathSuggestions))
+	}
+}
+
+func TestNewDialog_ShowSuggestionsDisabled(t *testing.T) {
+	d := NewNewDialog()
+
+	// ShowSuggestions should be disabled — we use our own dropdown with filtering
+	if d.pathInput.ShowSuggestions {
+		t.Error("expected ShowSuggestions to be false on pathInput (we use custom dropdown)")
+	}
+}
+
+func TestNewDialog_SuggestionFiltering(t *testing.T) {
+	d := NewNewDialog()
+
+	paths := []string{
+		"/Users/test/project-alpha",
+		"/Users/test/project-beta",
+		"/Users/test/other-thing",
+	}
+
+	d.SetPathSuggestions(paths)
+
+	// Type "project" to filter
+	d.pathInput.SetValue("project")
+	d.filterPathSuggestions()
+
+	if len(d.pathSuggestions) != 2 {
+		t.Errorf("expected 2 filtered suggestions for 'project', got %d", len(d.pathSuggestions))
+	}
+
+	// Verify the correct paths are in the filtered list
+	for _, s := range d.pathSuggestions {
+		if !strings.Contains(s, "project") {
+			t.Errorf("filtered suggestion %q should contain 'project'", s)
+		}
+	}
+
+	// Full set should remain unchanged
+	if len(d.allPathSuggestions) != 3 {
+		t.Errorf("allPathSuggestions should still be 3, got %d", len(d.allPathSuggestions))
+	}
+}
+
+func TestNewDialog_MalformedPathFix(t *testing.T) {
+	home, _ := os.UserHomeDir()
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "normal tilde path",
+			input:    "~/projects/myapp",
+			expected: home + "/projects/myapp",
+		},
+		{
+			name:     "malformed path with cwd prefix",
+			input:    "/Users/someone/claude-deck~/projects/myapp",
+			expected: home + "/projects/myapp",
+		},
+		{
+			name:     "already expanded path",
+			input:    "/Users/ashesh/projects/myapp",
+			expected: "/Users/ashesh/projects/myapp",
+		},
+		{
+			name:     "just tilde",
+			input:    "~",
+			expected: home,
+		},
+		{
+			name:     "malformed path with different prefix",
+			input:    "/some/random/path~/other/path",
+			expected: home + "/other/path",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := NewNewDialog()
+			d.pathInput.SetValue(tt.input)
+
+			_, path, _ := d.GetValues()
+
+			if path != tt.expected {
+				t.Errorf("GetValues() path = %q, want %q", path, tt.expected)
+			}
+		})
+	}
+}
+
+// TestNewDialog_TabShowsCompletionMatches: when Tab autocompletes a partial
+// path with multiple matches, the matches must be listed in the dropdown
+// (terminal-style menu completion) with the current one highlighted, and
+// repeated Tab must move the highlight through the list.
+func TestNewDialog_TabShowsCompletionMatches(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(200, 50)
+	d.Show()
+
+	tmpDir := t.TempDir()
+	subdirs := []string{"alpha", "amber", "apple"}
+	for _, sub := range subdirs {
+		if err := os.MkdirAll(filepath.Join(tmpDir, sub), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Focus the path field.
+	d.focusIndex = 2
+	d.updateFocus()
+	if d.currentTarget() != focusPath {
+		t.Fatalf("expected focusPath, got %v", d.currentTarget())
+	}
+
+	d.pathInput.SetValue(filepath.Join(tmpDir, "a"))
+	d.pathInput.SetCursor(len(d.pathInput.Value()))
+
+	// First Tab: completes to the first match and shows the match list.
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	if !d.pathCycler.IsActive() {
+		t.Fatal("expected completion cycler to be active after Tab on partial path")
+	}
+	view := d.View()
+	for _, sub := range subdirs {
+		if !strings.Contains(view, sub) {
+			t.Errorf("completion list should show %q, view:\n%s", sub, view)
+		}
+	}
+	first := d.pathCycler.Matches()[0]
+	if !strings.Contains(view, "▶ "+pathDropdownLabel(first, d.effectiveDialogWidth()-8, d.height)) {
+		t.Errorf("current match %q should be highlighted with ▶", first)
+	}
+
+	// Second Tab: cycles to the next match and moves the highlight.
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+	second := d.pathCycler.Matches()[1]
+	if got := d.pathInput.Value(); got != second {
+		t.Errorf("second Tab should complete to %q, got %q", second, got)
+	}
+	view = d.View()
+	if !strings.Contains(view, "▶ "+pathDropdownLabel(second, d.effectiveDialogWidth()-8, d.height)) {
+		t.Errorf("after second Tab, %q should be highlighted with ▶", second)
+	}
+	if strings.Contains(view, "▶ "+pathDropdownLabel(first, d.effectiveDialogWidth()-8, d.height)) {
+		t.Errorf("after second Tab, %q should no longer be highlighted", first)
+	}
+}
+
+// TestNewDialog_CompletionDropdown_SanitizesControlBytes: directory names can
+// carry ESC/BEL/OSC sequences and newlines (repo checkouts, extracted
+// archives). The dropdown renders filesystem-derived names, so control bytes
+// must be neutralized at the render boundary — while the raw names stay
+// intact in the match set so selection still targets the real directory.
+func TestNewDialog_CompletionDropdown_SanitizesControlBytes(t *testing.T) {
+	// Pin the global lipgloss profile to Ascii so the render carries no
+	// style-generated escapes (issue391 tests force TrueColor binary-wide);
+	// any control byte left in the output can then only come from a filename.
+	oldProfile := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.Ascii)
+	t.Cleanup(func() { lipgloss.SetColorProfile(oldProfile) })
+
+	d := NewNewDialog()
+	d.SetSize(200, 50)
+	d.Show()
+
+	tmpDir := t.TempDir()
+	oscName := "evil\x1b]52;c;cGF5bG9hZA==\x07osc"
+	nlName := "evil\nnewline"
+	for _, sub := range []string{oscName, nlName, "evilclean"} {
+		if err := os.Mkdir(filepath.Join(tmpDir, sub), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Focus the path field and Tab on a prefix matching all three.
+	d.focusIndex = 2
+	d.updateFocus()
+	d.pathInput.SetValue(filepath.Join(tmpDir, "evil"))
+	d.pathInput.SetCursor(len(d.pathInput.Value()))
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if !d.pathCycler.IsActive() {
+		t.Fatal("expected completion cycler to be active after Tab on partial path")
+	}
+
+	// Raw bytes must survive in the match set used for selection.
+	var rawOSC, rawNL bool
+	for _, m := range d.pathCycler.Matches() {
+		if strings.HasSuffix(m, oscName) {
+			rawOSC = true
+		}
+		if strings.HasSuffix(m, nlName) {
+			rawNL = true
+		}
+	}
+	if !rawOSC || !rawNL {
+		t.Errorf("raw control-byte names must remain selectable, matches: %q", d.pathCycler.Matches())
+	}
+
+	// The rendered menu must carry no control bytes (newlines between menu
+	// rows are layout, not payload).
+	menu := d.renderCompletionDropdown()
+	for _, r := range menu {
+		if r != '\n' && unicode.IsControl(r) {
+			t.Fatalf("rendered dropdown contains control rune %q:\n%q", r, menu)
+		}
+	}
+}
+
+// TestNewDialog_TabDoesNotOverwriteCustomPath tests Issue #22:
+// When user enters a new folder path and presses Tab to move to agent selection,
+// the custom path should NOT be overwritten by a suggestion.
+func TestNewDialog_TabDoesNotOverwriteCustomPath(t *testing.T) {
+	d := NewNewDialog()
+	d.Show() // Dialog must be visible for Update to process keys
+
+	// Set up suggestions (simulating previously used paths)
+	suggestions := []string{
+		"/Users/test/old-project-1",
+		"/Users/test/old-project-2",
+	}
+	d.SetPathSuggestions(suggestions)
+
+	// User is on path field (focusIndex 1)
+	d.focusIndex = 2
+	d.updateFocus()
+
+	// User types a completely NEW path that doesn't match any suggestion.
+	// Use a real existing directory so the issue #896 "stay on invalid path"
+	// guard doesn't kick in — this test is specifically about #22 (suggestion
+	// overwrite), not #896 (focus advancement on invalid paths).
+	customPath := t.TempDir()
+	d.pathInput.SetValue(customPath)
+
+	startIdx := d.focusIndex
+	// matrix/hardened: Tab completes without leaving Path.
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	// The custom path should be PRESERVED, not overwritten
+	_, path, _ := d.GetValues()
+
+	if path != customPath {
+		t.Errorf("Tab overwrote custom path!\nGot: %q\nWant: %q\nThis is the bug from Issue #22", path, customPath)
+	}
+
+	// Focus should have advanced (path is valid).
+	if d.focusIndex != startIdx {
+		t.Errorf("Tab on valid custom path unexpectedly moved focus from %d", startIdx)
+	}
+}
+
+// matrix/hardened: leaving history browsing does not change Tab into history acceptance.
+func TestNewDialog_TabDoesNotApplyHistoryWhenNavigated(t *testing.T) {
+	// matrix/hardened: Path now enters direct editing; Tab completes only.
+	d := NewNewDialog()
+	d.Show()
+	d.pathInput.SetValue("/preset/project")
+	d.pathInput.CursorEnd()
+	d.focusIndex = d.indexOf(focusPath)
+	d.updateFocus()
+	if d.pathSoftSelected || !d.pathInput.Focused() {
+		t.Fatal("Path must be directly editable")
+	}
+	d.SetPathSuggestions([]string{"/history/deep/project"})
+	d.suggestionNavigated = true
+	d.pathSuggestionCursor = 1
+	d.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if d.pathInput.Value() != "/preset/project" {
+		t.Fatal("Tab must not insert a history project")
+	}
+}
+
+// TestNewDialog_TypingResetsSuggestionNavigation tests that typing after
+// navigating suggestions resets the navigation state.
+func TestNewDialog_TypingResetsSuggestionNavigation(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+
+	suggestions := []string{
+		"/Users/test/project-1",
+		"/Users/test/project-2",
+	}
+	d.SetPathSuggestions(suggestions)
+
+	d.focusIndex = 2
+	d.updateFocus()
+
+	// User edits the path, navigates with Down, then returns to input.
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyDown})
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyLeft})
+
+	// Verify navigation flag is set
+	if !d.suggestionNavigated {
+		t.Error("suggestionNavigated should be true after Down")
+	}
+
+	// User then types something new - simulate by sending a key
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+
+	// Flag should be reset
+	if d.suggestionNavigated {
+		t.Error("suggestionNavigated should be false after typing")
+	}
+
+	// Set a custom path and press Tab
+	d.pathInput.SetValue("/my/new/path")
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	_, path, _ := d.GetValues()
+
+	if path != "/my/new/path" {
+		t.Errorf("Typing should reset suggestion navigation\nGot: %q\nWant: %q", path, "/my/new/path")
+	}
+}
+
+func TestNewDialog_PreviewRecentSession_ShellCommand(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+
+	d.commandCursor = 2 // non-shell
+	d.commandInput.SetValue("old-command")
+
+	rs := &statedb.RecentSessionRow{
+		Title:       "recent-shell",
+		ProjectPath: "/tmp/recent-shell",
+		Tool:        "shell",
+		Command:     "uv run agent",
+	}
+	d.previewRecentSession(rs)
+
+	if d.commandCursor != 0 {
+		t.Fatalf("commandCursor = %d, want 0 (shell)", d.commandCursor)
+	}
+	if got := d.commandInput.Value(); got != "uv run agent" {
+		t.Fatalf("commandInput = %q, want %q", got, "uv run agent")
+	}
+	if d.nameInput.Value() != "recent-shell" {
+		t.Fatalf("nameInput = %q, want %q", d.nameInput.Value(), "recent-shell")
+	}
+}
+
+func TestNewDialog_RestoreSnapshot_RestoresToolOptionsAndCommandInput(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+
+	originalClaude := &session.ClaudeOptions{
+		SessionMode:          "resume",
+		ResumeSessionID:      "abc123",
+		SkipPermissions:      true,
+		AllowSkipPermissions: false,
+		UseChrome:            true,
+		UseTeammateMode:      true,
+	}
+	d.nameInput.SetValue("orig-name")
+	d.pathInput.SetValue("/tmp/orig")
+	d.commandCursor = 0
+	d.commandInput.SetValue("echo original")
+	d.claudeOptions.SetFromOptions(originalClaude)
+	d.geminiOptions.SetDefaults(true)
+	d.codexOptions.SetDefaults(true)
+
+	snapshot := d.saveSnapshot()
+
+	// Mutate state to ensure restore actually rewinds everything.
+	d.nameInput.SetValue("mutated-name")
+	d.pathInput.SetValue("/tmp/mutated")
+	d.commandCursor = 1
+	d.commandInput.SetValue("echo mutated")
+	d.claudeOptions.SetFromOptions(&session.ClaudeOptions{SessionMode: "new"})
+	d.geminiOptions.SetDefaults(false)
+	d.codexOptions.SetDefaults(false)
+
+	d.restoreSnapshot(snapshot)
+
+	if got := d.nameInput.Value(); got != "orig-name" {
+		t.Fatalf("nameInput = %q, want %q", got, "orig-name")
+	}
+	if got := d.pathInput.Value(); got != "/tmp/orig" {
+		t.Fatalf("pathInput = %q, want %q", got, "/tmp/orig")
+	}
+	if d.commandCursor != 0 {
+		t.Fatalf("commandCursor = %d, want 0", d.commandCursor)
+	}
+	if got := d.commandInput.Value(); got != "echo original" {
+		t.Fatalf("commandInput = %q, want %q", got, "echo original")
+	}
+
+	restoredClaude := d.claudeOptions.GetOptions()
+	if restoredClaude == nil {
+		t.Fatal("restored Claude options are nil")
+	}
+	if restoredClaude.SessionMode != "resume" || restoredClaude.ResumeSessionID != "abc123" {
+		t.Fatalf("restored Claude session mode/id = %q/%q, want resume/abc123",
+			restoredClaude.SessionMode, restoredClaude.ResumeSessionID)
+	}
+	if !restoredClaude.SkipPermissions || !restoredClaude.UseChrome || !restoredClaude.UseTeammateMode {
+		t.Fatalf("restored Claude toggles incorrect: %+v", restoredClaude)
+	}
+	if !d.geminiOptions.GetYoloMode() {
+		t.Fatal("gemini yolo mode was not restored")
+	}
+	if !d.codexOptions.GetYoloMode() {
+		t.Fatal("codex yolo mode was not restored")
+	}
+}
+
+// ===== Worktree Support Tests =====
+
+func TestNewDialog_WorktreeToggle(t *testing.T) {
+	dialog := NewNewDialog()
+	if dialog.worktreeEnabled {
+		t.Error("Worktree should be disabled by default")
+	}
+	dialog.ToggleWorktree()
+	if !dialog.worktreeEnabled {
+		t.Error("Worktree should be enabled after toggle")
+	}
+	dialog.ToggleWorktree()
+	if dialog.worktreeEnabled {
+		t.Error("Worktree should be disabled after second toggle")
+	}
+}
+
+func TestNewDialog_IsWorktreeEnabled(t *testing.T) {
+	dialog := NewNewDialog()
+	if dialog.IsWorktreeEnabled() {
+		t.Error("IsWorktreeEnabled should return false by default")
+	}
+	dialog.worktreeEnabled = true
+	if !dialog.IsWorktreeEnabled() {
+		t.Error("IsWorktreeEnabled should return true when enabled")
+	}
+}
+
+func TestNewDialog_GetValuesWithWorktree(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("feature/test")
+	dialog.nameInput.SetValue("test-session")
+	dialog.pathInput.SetValue("/tmp/project")
+
+	name, path, command, branch, enabled := dialog.GetValuesWithWorktree()
+
+	if !enabled {
+		t.Error("worktreeEnabled should be true")
+	}
+	if branch != "feature/test" {
+		t.Errorf("Branch: got %q, want %q", branch, "feature/test")
+	}
+	if name != "test-session" {
+		t.Errorf("Name: got %q, want %q", name, "test-session")
+	}
+	if path != "/tmp/project" {
+		t.Errorf("Path: got %q, want %q", path, "/tmp/project")
+	}
+	// command should be empty or shell when commandCursor is 0
+	_ = command
+}
+
+func TestNewDialog_GetValuesWithWorktree_Disabled(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.worktreeEnabled = false
+	dialog.branchInput.SetValue("feature/test")
+
+	_, _, _, branch, enabled := dialog.GetValuesWithWorktree()
+
+	if enabled {
+		t.Error("worktreeEnabled should be false")
+	}
+	// Branch value is still returned even when disabled
+	if branch != "feature/test" {
+		t.Errorf("Branch: got %q, want %q", branch, "feature/test")
+	}
+}
+
+func TestNewDialog_Validate_WorktreeEnabled_EmptyBranch(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.nameInput.SetValue("test-session")
+	dialog.pathInput.SetValue("/tmp/project")
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("")
+
+	err := dialog.Validate()
+	if err == "" {
+		t.Error("Validation should fail when worktree enabled but branch is empty")
+	}
+	if err != "Branch name required for worktree" {
+		t.Errorf("Unexpected error message: %q", err)
+	}
+}
+
+func TestNewDialog_Validate_WorktreeEnabled_InvalidBranch(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.nameInput.SetValue("test-session")
+	dialog.pathInput.SetValue("/tmp/project")
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("feature..test") // Invalid: contains ..
+
+	err := dialog.Validate()
+	if err == "" {
+		t.Error("Validation should fail for invalid branch name")
+	}
+	if err != "branch name cannot contain '..'" {
+		t.Errorf("Unexpected error message: %q", err)
+	}
+}
+
+func TestNewDialog_Validate_WorktreeEnabled_ValidBranch(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.nameInput.SetValue("test-session")
+	dialog.pathInput.SetValue("/tmp/project")
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("feature/test-branch")
+
+	err := dialog.Validate()
+	if err != "" {
+		t.Errorf("Validation should pass for valid branch, got: %q", err)
+	}
+}
+
+func TestNewDialog_Validate_WorktreeDisabled_IgnoresBranch(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.nameInput.SetValue("test-session")
+	dialog.pathInput.SetValue("/tmp/project")
+	dialog.worktreeEnabled = false
+	dialog.branchInput.SetValue("") // Empty branch, but worktree disabled
+
+	err := dialog.Validate()
+	if err != "" {
+		t.Errorf("Validation should pass when worktree disabled, got: %q", err)
+	}
+}
+
+func TestNewDialog_ShowInGroup_ResetsWorktree(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("feature/old-branch")
+
+	dialog.ShowInGroup("projects", "Projects", "", nil, "")
+
+	if dialog.worktreeEnabled {
+		t.Error("worktreeEnabled should be reset to false on ShowInGroup")
+	}
+	if dialog.branchInput.Value() != "" {
+		t.Errorf("branchInput should be reset, got: %q", dialog.branchInput.Value())
+	}
+}
+
+func TestNewDialog_ShowInGroup_ResetsMultiRepo(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.multiRepoEnabled = true
+	dialog.multiRepoPaths = []string{"/path/a", "/path/b"}
+	dialog.multiRepoPathCursor = 1
+	dialog.multiRepoEditing = true
+
+	dialog.ShowInGroup("projects", "Projects", "", nil, "")
+
+	if dialog.multiRepoEnabled {
+		t.Error("multiRepoEnabled should be reset to false on ShowInGroup")
+	}
+	if dialog.multiRepoPaths != nil {
+		t.Errorf("multiRepoPaths should be nil, got: %v", dialog.multiRepoPaths)
+	}
+	if dialog.multiRepoPathCursor != 0 {
+		t.Errorf("multiRepoPathCursor should be 0, got: %d", dialog.multiRepoPathCursor)
+	}
+	if dialog.multiRepoEditing {
+		t.Error("multiRepoEditing should be false on ShowInGroup")
+	}
+}
+
+func TestNewDialog_ShowInGroup_UsesConfiguredWorktreeDefault(t *testing.T) {
+	setXDGTestHome(t)
+	if err := session.SaveUserConfig(&session.UserConfig{
+		Worktree: session.WorktreeSettings{DefaultEnabled: true},
+	}); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	session.ClearUserConfigCache()
+
+	dialog := NewNewDialog()
+	dialog.ShowInGroup("projects", "Projects", "", nil, "")
+
+	if !dialog.worktreeEnabled {
+		t.Error("worktreeEnabled should default to true from config on ShowInGroup")
+	}
+}
+
+func TestNewDialog_ShowInGroup_SetsDefaultPath(t *testing.T) {
+	dialog := NewNewDialog()
+
+	dialog.ShowInGroup("projects", "Projects", "/test/default/path", nil, "")
+
+	// Verify path input is set to the default path
+	if dialog.pathInput.Value() != "/test/default/path" {
+		t.Errorf("pathInput should be set to default path, got: %q", dialog.pathInput.Value())
+	}
+}
+
+func TestNewDialog_ShowInGroup_EmptyDefaultPath(t *testing.T) {
+	dialog := NewNewDialog()
+
+	dialog.ShowInGroup("projects", "Projects", "", nil, "")
+
+	// With empty default path, it should fall back to current working directory
+	// We can't test the exact value, but we can verify it's not empty
+	// (assuming we're not in a system temp directory)
+	value := dialog.pathInput.Value()
+	if value == "" {
+		t.Error("pathInput should not be empty when defaultPath is empty (should use cwd)")
+	}
+}
+
+// TestNewDialog_ShowInGroup_MovesCursorToEndOfPrefilledPath is the #1702
+// regression test.
+//
+// The dialog is a reused singleton, so on every open but the first pathInput
+// still holds the previous open's value AND its cursor position. bubbles'
+// textinput.setValueInternal only snaps the cursor to the end when the OLD
+// value was empty or the old cursor sat past the new value's end
+// (`(pos == 0 && empty) || pos > len(value)`). Reopening on a path longer than
+// the old cursor position therefore left the cursor stale mid-string, and
+// handleOverflow scrolled the view around it — hiding the path tail until the
+// user pressed Ctrl+K or jumped to the end by hand.
+func TestNewDialog_ShowInGroup_MovesCursorToEndOfPrefilledPath(t *testing.T) {
+	// firstPath is deliberately short so the carried-over cursor lands inside
+	// reopenPath, which is the condition bubbles does not correct for us.
+	const firstPath = "/tmp/b"
+
+	tests := []struct {
+		name       string
+		reopenPath string
+	}{
+		{"deeper local path", "/Users/dev/work/deep/nested/project-alpha"},
+		{"remote session path", "/srv/remote/host/checkouts/agent-deck"},
+		{"non-ascii path", "/Users/dev/projekte/größer/ünïcode-checkout"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dialog := NewNewDialog()
+
+			dialog.ShowInGroup("projects", "Projects", firstPath, nil, "")
+			// Normal editing state after the first open: cursor at the end of
+			// the current value.
+			dialog.pathInput.SetCursor(len(firstPath))
+			if got, want := dialog.pathInput.Position(), len(firstPath); got != want {
+				t.Fatalf("setup: cursor should start at end of %q, got %d want %d", firstPath, got, want)
+			}
+			dialog.Hide()
+
+			// Reopen the reused dialog on a longer path.
+			dialog.ShowInGroup("projects", "Projects", tt.reopenPath, nil, "")
+
+			if got := dialog.pathInput.Value(); got != tt.reopenPath {
+				t.Fatalf("pathInput value = %q, want %q", got, tt.reopenPath)
+			}
+			// Cursor position is measured in runes by bubbles.
+			if got, want := dialog.pathInput.Position(), len([]rune(tt.reopenPath)); got != want {
+				t.Errorf("cursor should sit at the end of the pre-filled path so the tail stays visible: got %d, want %d (value %q)", got, want, tt.reopenPath)
+			}
+		})
+	}
+}
+
+// TestNewDialog_ShowInGroup_MovesCursorToEndOfCwdFallback covers the other
+// prefill branch of ShowInGroup (#1702): the cwd fallback taken when the group
+// has no default path.
+func TestNewDialog_ShowInGroup_MovesCursorToEndOfCwdFallback(t *testing.T) {
+	dialog := NewNewDialog()
+
+	const firstPath = "/a"
+	dialog.ShowInGroup("projects", "Projects", firstPath, nil, "")
+	dialog.pathInput.SetCursor(len(firstPath))
+	dialog.Hide()
+
+	dialog.ShowInGroup("projects", "Projects", "", nil, "")
+
+	value := dialog.pathInput.Value()
+	if len(value) <= len(firstPath) {
+		t.Skipf("cwd %q is not longer than %q, so the stale cursor cannot be observed", value, firstPath)
+	}
+	if got, want := dialog.pathInput.Position(), len([]rune(value)); got != want {
+		t.Errorf("cursor should sit at the end of the cwd fallback path: got %d, want %d (value %q)", got, want, value)
+	}
+}
+
+func TestNewDialog_BranchInputInitialized(t *testing.T) {
+	dialog := NewNewDialog()
+
+	// Verify branch input is properly initialized
+	if dialog.branchInput.Placeholder != "feature/branch-name" {
+		t.Errorf("branchInput placeholder: got %q, want %q",
+			dialog.branchInput.Placeholder, "feature/branch-name")
+	}
+}
+
+func TestNewDialog_WorktreeToggle_ViaKeyPress(t *testing.T) {
+	setXDGTestHome(t)
+
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.sandboxEnabled = false
+	dialog.inheritedSettings = nil
+	dialog.commandCursor = 1 // preset command (not custom input)
+	dialog.rebuildFocusTargets()
+	dialog.focusIndex = dialog.indexOf(focusCommand) // Command field
+
+	// Press 'w' to toggle worktree.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+
+	if !dialog.worktreeEnabled {
+		t.Error("Worktree should be enabled after pressing 'w' on command field")
+	}
+
+	// Focus should move to branch field.
+	if dialog.focusIndex != dialog.indexOf(focusBranch) {
+		t.Errorf("Focus should move to branch field (%d), got %d", dialog.indexOf(focusBranch), dialog.focusIndex)
+	}
+
+	// Press 'w' again to disable (need to be on command field).
+	dialog.focusIndex = dialog.indexOf(focusCommand)
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+
+	if dialog.worktreeEnabled {
+		t.Error("Worktree should be disabled after pressing 'w' again")
+	}
+}
+
+func TestNewDialog_ShortcutsBlockedDuringTextInput(t *testing.T) {
+	setXDGTestHome(t)
+
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.sandboxEnabled = false
+	dialog.inheritedSettings = nil
+	dialog.commandCursor = 0 // custom command input (text field active)
+	dialog.rebuildFocusTargets()
+
+	// Navigate to command field.
+	cmdIdx := dialog.indexOf(focusCommand)
+	dialog.focusIndex = cmdIdx
+	dialog.updateFocus()
+
+	// Press 's' — should NOT toggle sandbox when custom command input is focused.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if dialog.sandboxEnabled {
+		t.Error("Pressing 's' on custom command input should type, not toggle sandbox")
+	}
+
+	// Press 'w' — should NOT toggle worktree.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	if dialog.worktreeEnabled {
+		t.Error("Pressing 'w' on custom command input should type, not toggle worktree")
+	}
+
+	// Press 'm' — should NOT toggle multi-repo.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	if dialog.multiRepoEnabled {
+		t.Error("Pressing 'm' on custom command input should type, not toggle multi-repo")
+	}
+
+	// Also verify shortcuts don't fire on name field.
+	dialog.focusIndex = 0 // focusName
+	dialog.updateFocus()
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if dialog.sandboxEnabled {
+		t.Error("Pressing 's' on name input should not toggle sandbox")
+	}
+}
+
+// UX top-3 change #3: reorder the hot path to Name -> Tool -> Path and move the
+// Multi-repo toggle below the common fields ("below the fold"). The 90% flow is
+// type name -> Enter (advances to Tool) -> (tool already right) -> Ctrl+S.
+func TestNewDialog_FocusOrder_HotPathNameToolPath(t *testing.T) {
+	d := NewNewDialog()
+	d.Show() // default: shell selected (no model field), multi-repo off.
+
+	if len(d.focusTargets) < 3 {
+		t.Fatalf("focusTargets too short: %v", d.focusTargets)
+	}
+	if d.focusTargets[0] != focusName {
+		t.Fatalf("focusTargets[0] = %v, want focusName", d.focusTargets[0])
+	}
+	if d.focusTargets[1] != focusCommand {
+		t.Fatalf("focusTargets[1] = %v, want focusCommand (Tool immediately after Name)", d.focusTargets[1])
+	}
+	cmdIdx := d.indexOf(focusCommand)
+	pathIdx := d.indexOf(focusPath)
+	mrIdx := d.indexOf(focusMultiRepo)
+	sbIdx := d.indexOf(focusSandbox)
+	if !(cmdIdx < pathIdx) {
+		t.Fatalf("want Tool(%d) before Path(%d) — the hot path is Name->Tool->Path", cmdIdx, pathIdx)
+	}
+	if !(pathIdx < mrIdx) {
+		t.Fatalf("want Path(%d) before Multi-repo(%d) — multi-repo moves below the fold", pathIdx, mrIdx)
+	}
+	if !(sbIdx < mrIdx) {
+		t.Fatalf("want Sandbox(%d) before Multi-repo(%d) — multi-repo is below the common fields", sbIdx, mrIdx)
+	}
+}
+
+// With a reasoning-capable tool, Model and Reasoning sit between Tool and Path.
+func TestNewDialog_FocusOrder_ModelAndReasoningBetweenToolAndPath(t *testing.T) {
+	d := NewNewDialog()
+	d.SetDefaultTool("claude")
+	d.Show()
+
+	cmdIdx := d.indexOf(focusCommand)
+	modelIdx := d.indexOf(focusModel)
+	reasoningIdx := d.indexOf(focusReasoningEffort)
+	pathIdx := d.indexOf(focusPath)
+	if modelIdx < 0 {
+		t.Fatal("focusModel should be present for a model-capable tool (claude)")
+	}
+	if reasoningIdx < 0 {
+		t.Fatal("focusReasoningEffort should be present for Claude")
+	}
+	if !(cmdIdx < modelIdx && modelIdx < reasoningIdx && reasoningIdx < pathIdx) {
+		t.Fatalf("want Tool(%d) < Model(%d) < Reasoning(%d) < Path(%d)", cmdIdx, modelIdx, reasoningIdx, pathIdx)
+	}
+}
+
+func TestNewDialog_TabNavigationWithWorktree(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.sandboxEnabled = false
+	dialog.inheritedSettings = nil
+	dialog.focusIndex = 0
+	dialog.worktreeEnabled = true
+	dialog.rebuildFocusTargets()
+
+	branchIdx := dialog.indexOf(focusBranch)
+	maxIdx := len(dialog.focusTargets) - 1
+
+	// Tab walks the focus list sequentially (0 -> 1 -> ... -> wrap). Order is now
+	// Name, Command, Path, Worktree, Sandbox, Branch, Multi-repo (UX top-3 #3).
+	for i := 1; i <= maxIdx; i++ {
+		key := tea.KeyTab
+		if dialog.currentTarget() == focusPath {
+			key = tea.KeyEnter
+		}
+		dialog, _ = dialog.Update(tea.KeyMsg{Type: key})
+		want := i
+		if i == branchIdx {
+			want = branchIdx
+		}
+		if dialog.focusIndex != want {
+			t.Errorf("After Tab %d, focusIndex = %d, want %d", i, dialog.focusIndex, want)
+		}
+	}
+
+	// One more Tab should wrap to 0.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if dialog.focusIndex != 0 {
+		t.Errorf("After final Tab, focusIndex = %d, want 0 (wrap around)", dialog.focusIndex)
+	}
+}
+
+func TestNewDialog_TabNavigationWithoutWorktree(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.sandboxEnabled = false
+	dialog.inheritedSettings = nil
+	dialog.focusIndex = 0
+	dialog.worktreeEnabled = false
+	dialog.rebuildFocusTargets()
+
+	maxIdx := len(dialog.focusTargets) - 1
+
+	// Tab walks the focus list sequentially and wraps. Order is now Name,
+	// Command, Path, Worktree, Sandbox, Multi-repo (UX top-3 #3).
+	for i := 1; i <= maxIdx; i++ {
+		key := tea.KeyTab
+		if dialog.currentTarget() == focusPath {
+			key = tea.KeyEnter
+		}
+		dialog, _ = dialog.Update(tea.KeyMsg{Type: key})
+		if dialog.focusIndex != i {
+			t.Errorf("After Tab %d, focusIndex = %d, want %d", i, dialog.focusIndex, i)
+		}
+	}
+
+	// One more Tab should wrap to 0.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if dialog.focusIndex != 0 {
+		t.Errorf("After final Tab, focusIndex = %d, want 0 (wrap around)", dialog.focusIndex)
+	}
+}
+
+func TestNewDialog_View_ShowsWorktreeCheckbox(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.SetSize(80, 40)
+	dialog.Show()
+	dialog.focusIndex = dialog.indexOf(focusCommand) // Command field
+
+	view := dialog.View()
+
+	// Should show worktree checkbox.
+	if !strings.Contains(view, "Create in worktree") {
+		t.Error("View should contain 'Create in worktree' checkbox")
+	}
+
+	// Should show shortcut hint when on command field.
+	if !strings.Contains(view, "(w)") {
+		t.Error("View should contain '(w)' hint when on command field")
+	}
+}
+
+func TestNewDialog_View_ShowsBranchInputWhenEnabled(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.SetSize(80, 40)
+	dialog.Show()
+	dialog.worktreeEnabled = true
+
+	view := dialog.View()
+
+	// Should show branch input
+	if !strings.Contains(view, "Branch:") {
+		t.Error("View should contain 'Branch:' label when worktree enabled")
+	}
+
+	// Checkbox should be checked
+	if !strings.Contains(view, "[x]") {
+		t.Error("View should show checked checkbox [x] when worktree enabled")
+	}
+}
+
+func TestNewDialog_View_HidesBranchInputWhenDisabled(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.SetSize(80, 40)
+	dialog.Show()
+	dialog.worktreeEnabled = false
+
+	view := dialog.View()
+
+	// Should NOT show branch input label
+	if strings.Contains(view, "Branch:") {
+		t.Error("View should NOT contain 'Branch:' label when worktree disabled")
+	}
+
+	// Checkbox should be unchecked
+	if !strings.Contains(view, "[ ]") {
+		t.Error("View should show unchecked checkbox [ ] when worktree disabled")
+	}
+}
+
+// ===== CharLimit & Inline Error Tests (Issue #93) =====
+
+func TestNewDialog_CharLimitMatchesMaxNameLength(t *testing.T) {
+	d := NewNewDialog()
+	if d.nameInput.CharLimit != MaxNameLength {
+		t.Errorf("nameInput.CharLimit = %d, want %d (MaxNameLength)", d.nameInput.CharLimit, MaxNameLength)
+	}
+}
+
+func TestNewDialog_CharLimitTruncatesLongNames(t *testing.T) {
+	d := NewNewDialog()
+	d.pathInput.SetValue("/tmp/project")
+	// Try to set a name longer than MaxNameLength via textinput
+	longName := strings.Repeat("a", MaxNameLength+10)
+	d.nameInput.SetValue(longName)
+
+	// CharLimit should truncate the value to MaxNameLength
+	actual := d.nameInput.Value()
+	if len(actual) > MaxNameLength {
+		t.Errorf("nameInput should truncate to MaxNameLength (%d), but got length %d", MaxNameLength, len(actual))
+	}
+
+	// Validation should pass since the textinput truncated
+	err := d.Validate()
+	if err != "" {
+		t.Errorf("Validate() should pass after CharLimit truncation, got: %q", err)
+	}
+}
+
+func TestNewDialog_Validate_NameAtMaxLength(t *testing.T) {
+	d := NewNewDialog()
+	d.pathInput.SetValue("/tmp/project")
+	exactName := strings.Repeat("a", MaxNameLength)
+	d.nameInput.SetValue(exactName)
+
+	err := d.Validate()
+	if err != "" {
+		t.Errorf("Validate() should accept name at exactly MaxNameLength, got: %q", err)
+	}
+}
+
+func TestNewDialog_SetError_ShowsInView(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(80, 40)
+	d.Show()
+
+	d.SetError("Something went wrong")
+	view := d.View()
+
+	if !strings.Contains(view, "Something went wrong") {
+		t.Error("View should display the inline error message")
+	}
+}
+
+func TestNewDialog_ClearError_HidesFromView(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(80, 40)
+	d.Show()
+
+	d.SetError("Something went wrong")
+	d.ClearError()
+	view := d.View()
+
+	if strings.Contains(view, "Something went wrong") {
+		t.Error("View should not display the error after ClearError()")
+	}
+}
+
+// ===== Checkbox Focus Tests =====
+
+func TestNewDialog_WorktreeCheckbox_SpaceToggle(t *testing.T) {
+	setXDGTestHome(t)
+
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.sandboxEnabled = false
+	dialog.inheritedSettings = nil
+	dialog.rebuildFocusTargets()
+	dialog.focusIndex = dialog.indexOf(focusWorktree) // Worktree checkbox
+
+	// Space toggles worktree on.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+
+	if !dialog.worktreeEnabled {
+		t.Error("Space on worktree checkbox should enable worktree")
+	}
+
+	// Focus should jump to branch field.
+	if dialog.focusIndex != dialog.indexOf(focusBranch) {
+		t.Errorf("Focus should move to branch field (%d), got %d", dialog.indexOf(focusBranch), dialog.focusIndex)
+	}
+
+	// Navigate back and space again to disable.
+	dialog.focusIndex = dialog.indexOf(focusWorktree)
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+
+	if dialog.worktreeEnabled {
+		t.Error("Space on worktree checkbox should disable worktree")
+	}
+}
+
+func TestNewDialog_SandboxCheckbox_SpaceToggle(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.sandboxEnabled = false                    // Ensure known initial state.
+	dialog.focusIndex = dialog.indexOf(focusSandbox) // Sandbox checkbox
+
+	// Space toggles sandbox on.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+
+	if !dialog.sandboxEnabled {
+		t.Error("Space on sandbox checkbox should enable sandbox")
+	}
+
+	// Space again toggles off.
+	dialog.focusIndex = dialog.indexOf(focusSandbox)
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+
+	if dialog.sandboxEnabled {
+		t.Error("Space on sandbox checkbox should disable sandbox")
+	}
+}
+
+func TestNewDialog_CheckboxesFocusIndependently(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.SetSize(80, 40)
+	dialog.Show()
+
+	// Focus on worktree checkbox — only it should highlight.
+	dialog.focusIndex = dialog.indexOf(focusWorktree)
+	view := dialog.View()
+
+	// Worktree line should have the focus indicator.
+	if !strings.Contains(view, "Create in worktree") {
+		t.Error("View should contain worktree checkbox")
+	}
+
+	// Focus on sandbox checkbox — only it should highlight.
+	dialog.focusIndex = dialog.indexOf(focusSandbox)
+	view = dialog.View()
+
+	if !strings.Contains(view, "Run in Docker sandbox") {
+		t.Error("View should contain sandbox checkbox")
+	}
+}
+
+func TestNewDialog_ShowInGroup_ClearsError(t *testing.T) {
+	d := NewNewDialog()
+	d.SetError("Previous error")
+	d.ShowInGroup("group", "Group", "", nil, "")
+
+	if d.validationErr != "" {
+		t.Error("ShowInGroup should clear validationErr")
+	}
+}
+
+// ===== Worktree Branch Auto-Matching Tests =====
+
+func TestNewDialog_ToggleWorktree_AutoPopulatesBranch(t *testing.T) {
+	d := NewNewDialog()
+	d.nameInput.SetValue("amber-falcon")
+
+	// Toggling worktree ON should auto-populate branch from session name
+	d.ToggleWorktree()
+
+	if !d.worktreeEnabled {
+		t.Fatal("worktreeEnabled should be true after toggle")
+	}
+	if d.branchInput.Value() != "feature/amber-falcon" {
+		t.Errorf("branch = %q, want %q", d.branchInput.Value(), "feature/amber-falcon")
+	}
+	if !d.branchAutoSet {
+		t.Error("branchAutoSet should be true after auto-population")
+	}
+}
+
+func TestNewDialog_ToggleWorktree_SanitizesBranchFromName(t *testing.T) {
+	tests := []struct {
+		name        string
+		sessionName string
+		wantBranch  string
+	}{
+		{"spaces", "my new feature", "feature/my-new-feature"},
+		{"colon and question mark", "fix: why?", "feature/fix-why"},
+		{"tabs and repeated spaces", "add\tretry  logic", "feature/add-retry-logic"},
+		{"already clean", "amber-falcon", "feature/amber-falcon"},
+		// The sanitizer alone leaves ".lock", "/x" and ".foo" here, which either
+		// the dialog's own validator or git itself would then reject.
+		{"sanitizes to a .lock suffix", "*.lock*", "feature/lock"},
+		{"sanitizes to a leading slash", "~/x", "feature/x"},
+		{"sanitizes to a leading dot", "*.foo", "feature/foo"},
+		// An interior component the sanitizer leaves invalid: git rejects
+		// "feature/a-/.b", so the prefill must be dropped rather than handed to
+		// `worktree add`.
+		{"interior dot-leading component", "a?/.b", ""},
+		{"interior empty component", "a//b", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := NewNewDialog()
+			d.nameInput.SetValue(tt.sessionName)
+
+			d.ToggleWorktree()
+
+			got := d.branchInput.Value()
+			if got != tt.wantBranch {
+				t.Errorf("branch = %q, want %q", got, tt.wantBranch)
+			}
+			// An empty want means the name yields nothing git would accept, so
+			// the field must be left empty and the refusal must be the dialog's
+			// own "branch required" rather than a late `worktree add` failure.
+			if tt.wantBranch == "" {
+				if msg := d.Validate(); msg != "Branch name required for worktree" {
+					t.Errorf("Validate() = %q, want the branch-required refusal", msg)
+				}
+				return
+			}
+			if err := git.ValidateBranchName(got); err != nil {
+				t.Errorf("prefilled branch %q is invalid: %v", got, err)
+			}
+			if msg := d.Validate(); msg != "" {
+				t.Errorf("dialog refused its own prefill: %s", msg)
+			}
+		})
+	}
+}
+
+// A name that sanitizes to nothing must not prefill a bare "feature/" that git
+// would reject.
+func TestNewDialog_ToggleWorktree_UnsanitizableName_NoBranch(t *testing.T) {
+	d := NewNewDialog()
+	d.nameInput.SetValue("***")
+
+	d.ToggleWorktree()
+
+	if got := d.branchInput.Value(); got != "" {
+		t.Errorf("branch = %q, want empty", got)
+	}
+	if msg := d.Validate(); msg != "Branch name required for worktree" {
+		t.Errorf("Validate() = %q, want the branch-required refusal", msg)
+	}
+}
+
+// Editing the name to something unsanitizable must clear the auto-derived
+// branch, not leave the one derived from the previous name. Otherwise submit
+// silently creates (or checks out) a branch belonging to unrelated work.
+func TestNewDialog_AutoBranch_NameEditedToUnsanitizable_ClearsStaleBranch(t *testing.T) {
+	d := NewNewDialog()
+	d.nameInput.SetValue("hi")
+	d.ToggleWorktree()
+
+	if got := d.branchInput.Value(); got != "feature/hi" {
+		t.Fatalf("setup: branch = %q, want %q", got, "feature/hi")
+	}
+
+	// Mirrors the name-input handler, which re-derives on every keystroke
+	// while branchAutoSet is true.
+	d.nameInput.SetValue("***")
+	d.autoBranchFromName()
+
+	if got := d.branchInput.Value(); got != "" {
+		t.Errorf("branch = %q, want empty; stale branch from the previous name was kept", got)
+	}
+}
+
+func TestNewDialog_ToggleWorktree_EmptyName_NoBranch(t *testing.T) {
+	d := NewNewDialog()
+	// Name is empty
+
+	d.ToggleWorktree()
+
+	if d.branchInput.Value() != "" {
+		t.Errorf("branch should be empty when name is empty, got %q", d.branchInput.Value())
+	}
+}
+
+func TestNewDialog_ShowInGroup_ResetsBranchAutoSet(t *testing.T) {
+	setXDGTestHome(t)
+
+	d := NewNewDialog()
+	d.branchAutoSet = true
+
+	d.ShowInGroup("projects", "Projects", "", nil, "")
+
+	if d.branchAutoSet {
+		t.Error("branchAutoSet should be reset to false on ShowInGroup")
+	}
+}
+
+func TestNewDialog_ShowInGroup_DefaultWorktree_SetsBranchAutoSet(t *testing.T) {
+	setXDGTestHome(t)
+	if err := session.SaveUserConfig(&session.UserConfig{
+		Worktree: session.WorktreeSettings{DefaultEnabled: true},
+	}); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	session.ClearUserConfigCache()
+
+	d := NewNewDialog()
+	d.ShowInGroup("projects", "Projects", "", nil, "")
+
+	if !d.worktreeEnabled {
+		t.Fatal("worktreeEnabled should be true from config default")
+	}
+	if !d.branchAutoSet {
+		t.Error("branchAutoSet should be true when worktree is enabled by config default")
+	}
+}
+
+func TestNewDialog_ShowInGroup_DefaultWorktree_AutoPopulatesBranchFromName(t *testing.T) {
+	setXDGTestHome(t)
+	if err := session.SaveUserConfig(&session.UserConfig{
+		Worktree: session.WorktreeSettings{DefaultEnabled: true},
+	}); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	session.ClearUserConfigCache()
+
+	d := NewNewDialog()
+	d.ShowInGroup("projects", "Projects", "", nil, "")
+	d.nameInput.SetValue("amber-falcon")
+
+	// Simulate the name-change handler: it calls autoBranchFromName() only when branchAutoSet is true.
+	if d.worktreeEnabled && d.branchAutoSet {
+		d.autoBranchFromName()
+	}
+
+	if got := d.branchInput.Value(); got != "feature/amber-falcon" {
+		t.Errorf("branch = %q, want %q; branch should auto-populate when worktree is default-enabled", got, "feature/amber-falcon")
+	}
+}
+
+// ===== Soft-Select Tests =====
+
+func TestNewDialog_PathEditor_InitialState(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(80, 40)
+	d.Show()
+
+	// matrix/hardened: preserve the prefill without soft-selecting it.
+	if d.pathSoftSelected {
+		t.Error("Path should not start soft-selected")
+	}
+	if d.pathInput.Value() == "" {
+		t.Error("path should be pre-filled with CWD after Show()")
+	}
+}
+
+func TestNewDialog_PathEditor_TypeEditsPrefill(t *testing.T) {
+	// matrix/hardened: Path now enters direct editing; Tab completes only.
+	d := NewNewDialog()
+	d.Show()
+	d.pathInput.SetValue("/preset/project")
+	d.pathInput.CursorEnd()
+	d.focusIndex = d.indexOf(focusPath)
+	d.updateFocus()
+	if d.pathSoftSelected || !d.pathInput.Focused() {
+		t.Fatal("Path must be directly editable")
+	}
+	d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	if d.pathInput.Value() != "/preset/projectx" {
+		t.Fatal("typing must edit the existing path")
+	}
+}
+
+func TestNewDialog_PathEditor_BackspaceDeletesOneCharacter(t *testing.T) {
+	// matrix/hardened: Path now enters direct editing; Tab completes only.
+	d := NewNewDialog()
+	d.Show()
+	d.pathInput.SetValue("/preset/project")
+	d.pathInput.CursorEnd()
+	d.focusIndex = d.indexOf(focusPath)
+	d.updateFocus()
+	if d.pathSoftSelected || !d.pathInput.Focused() {
+		t.Fatal("Path must be directly editable")
+	}
+	d.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	if d.pathInput.Value() != "/preset/projec" {
+		t.Fatal("Backspace must delete one character")
+	}
+}
+
+func TestNewDialog_PathEditor_CursorMovementStaysInInput(t *testing.T) {
+	// matrix/hardened: Path now enters direct editing; Tab completes only.
+	d := NewNewDialog()
+	d.Show()
+	d.pathInput.SetValue("/preset/project")
+	d.pathInput.CursorEnd()
+	d.focusIndex = d.indexOf(focusPath)
+	d.updateFocus()
+	if d.pathSoftSelected || !d.pathInput.Focused() {
+		t.Fatal("Path must be directly editable")
+	}
+	d.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	d.Update(tea.KeyMsg{Type: tea.KeyRight})
+	if d.IsSuggestionsActive() || d.pathInput.Value() != "/preset/project" {
+		t.Fatal("cursor movement must stay in editor")
+	}
+}
+
+func TestNewDialog_PathEditor_TabWithoutMatchStays(t *testing.T) {
+	// matrix/hardened: Path now enters direct editing; Tab completes only.
+	d := NewNewDialog()
+	d.Show()
+	d.pathInput.SetValue("/preset/project")
+	d.pathInput.CursorEnd()
+	d.focusIndex = d.indexOf(focusPath)
+	d.updateFocus()
+	if d.pathSoftSelected || !d.pathInput.Focused() {
+		t.Fatal("Path must be directly editable")
+	}
+	d.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if d.currentTarget() != focusPath || d.pathInput.Value() != "/preset/project" {
+		t.Fatal("Tab must stay in editor without a match")
+	}
+}
+
+func TestNewDialog_MatrixCtrlNPPreservesPathEditor(t *testing.T) {
+	// matrix/hardened: Path now enters direct editing; Tab completes only.
+	d := NewNewDialog()
+	d.Show()
+	d.pathInput.SetValue("/preset/project")
+	d.pathInput.CursorEnd()
+	d.focusIndex = d.indexOf(focusPath)
+	d.updateFocus()
+	if d.pathSoftSelected || !d.pathInput.Focused() {
+		t.Fatal("Path must be directly editable")
+	}
+	for _, key := range []tea.KeyType{tea.KeyCtrlN, tea.KeyCtrlP} {
+		d.Update(tea.KeyMsg{Type: key})
+	}
+	if !d.pathInput.Focused() || d.pathInput.Value() != "/preset/project" || d.IsSuggestionsActive() {
+		t.Fatal("Ctrl+N/P must stay inert")
+	}
+}
+
+func TestNewDialog_PathEditor_RefocusIsEditable(t *testing.T) {
+	// matrix/hardened: Path now enters direct editing; Tab completes only.
+	d := NewNewDialog()
+	d.Show()
+	d.pathInput.SetValue("/preset/project")
+	d.pathInput.CursorEnd()
+	d.focusIndex = d.indexOf(focusPath)
+	d.updateFocus()
+	if d.pathSoftSelected || !d.pathInput.Focused() {
+		t.Fatal("Path must be directly editable")
+	}
+	d.pathInput.SetValue(t.TempDir())
+	d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	d.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	if d.currentTarget() != focusPath || d.pathSoftSelected || !d.pathInput.Focused() {
+		t.Fatal("refocus must return to editing")
+	}
+}
+
+// ===== Filter Path Tests =====
+
+func TestNewDialog_FilterPaths_SubstringMatch(t *testing.T) {
+	d := NewNewDialog()
+	d.SetPathSuggestions([]string{
+		"/Users/test/skulk-project",
+		"/Users/test/other-project",
+		"/Users/test/skulking-around",
+	})
+
+	d.pathInput.SetValue("skulk")
+	d.filterPathSuggestions()
+
+	if len(d.pathSuggestions) != 2 {
+		t.Errorf("expected 2 matching paths for 'skulk', got %d", len(d.pathSuggestions))
+	}
+}
+
+func TestNewDialog_FilterPaths_CaseInsensitive(t *testing.T) {
+	d := NewNewDialog()
+	d.SetPathSuggestions([]string{
+		"/Users/test/MyProject",
+		"/Users/test/other",
+	})
+
+	d.pathInput.SetValue("MYPROJECT")
+	d.filterPathSuggestions()
+
+	if len(d.pathSuggestions) != 1 {
+		t.Errorf("expected 1 matching path for 'MYPROJECT' (case insensitive), got %d", len(d.pathSuggestions))
+	}
+}
+
+func TestNewDialog_FilterPaths_NoMatch(t *testing.T) {
+	d := NewNewDialog()
+	d.SetPathSuggestions([]string{
+		"/Users/test/project-alpha",
+		"/Users/test/project-beta",
+	})
+
+	d.pathInput.SetValue("zzz")
+	d.filterPathSuggestions()
+
+	if len(d.pathSuggestions) != 0 {
+		t.Errorf("expected 0 matching paths for 'zzz', got %d", len(d.pathSuggestions))
+	}
+}
+
+func TestNewDialog_FilterPaths_EmptyInput(t *testing.T) {
+	d := NewNewDialog()
+	paths := []string{
+		"/Users/test/project-alpha",
+		"/Users/test/project-beta",
+		"/Users/test/other-thing",
+	}
+	d.SetPathSuggestions(paths)
+
+	d.pathInput.SetValue("")
+	d.filterPathSuggestions()
+
+	if len(d.pathSuggestions) != 3 {
+		t.Errorf("expected all 3 suggestions for empty input, got %d", len(d.pathSuggestions))
+	}
+}
+
+func TestNewDialog_BranchPrefix_Default(t *testing.T) {
+	d := NewNewDialog()
+	if d.branchPrefix != "feature/" {
+		t.Errorf("expected branchPrefix %q from constructor, got %q", "feature/", d.branchPrefix)
+	}
+}
+
+func TestNewDialog_BranchPrefix_Custom_AutoPopulates(t *testing.T) {
+	d := NewNewDialog()
+	d.branchPrefix = "dev/"
+	d.nameInput.SetValue("my-session")
+	d.autoBranchFromName()
+
+	if got := d.branchInput.Value(); got != "dev/my-session" {
+		t.Errorf("expected branch %q, got %q", "dev/my-session", got)
+	}
+}
+
+func TestNewDialog_BranchPrefix_Empty_NoPrefix(t *testing.T) {
+	d := NewNewDialog()
+	d.branchPrefix = ""
+	d.nameInput.SetValue("my-session")
+	d.autoBranchFromName()
+
+	if got := d.branchInput.Value(); got != "my-session" {
+		t.Errorf("expected branch %q, got %q", "my-session", got)
+	}
+}
+
+func TestNewDialog_BranchPrefix_Placeholder_Updated(t *testing.T) {
+	d := NewNewDialog()
+	d.branchPrefix = "fix/"
+	d.branchInput.Placeholder = d.branchPrefix + "branch-name"
+
+	if d.branchInput.Placeholder != "fix/branch-name" {
+		t.Errorf("expected placeholder %q, got %q", "fix/branch-name", d.branchInput.Placeholder)
+	}
+}
+
+func TestNewDialog_ToggleWorktree_CustomPrefix(t *testing.T) {
+	d := NewNewDialog()
+	d.branchPrefix = "dev/"
+	d.nameInput.SetValue("cool-feature")
+	d.ToggleWorktree()
+
+	if got := d.branchInput.Value(); got != "dev/cool-feature" {
+		t.Errorf("expected branch %q, got %q", "dev/cool-feature", got)
+	}
+}
+
+func TestOverlayDropdown_Basic(t *testing.T) {
+	base := "line0\nline1\nline2\nline3\nline4"
+	overlay := "AAA\nBBB"
+
+	result := overlayDropdown(base, overlay, 1, 0)
+	lines := strings.Split(result, "\n")
+
+	if len(lines) != 5 {
+		t.Fatalf("expected 5 lines, got %d", len(lines))
+	}
+	if lines[0] != "line0" {
+		t.Errorf("line 0: expected %q, got %q", "line0", lines[0])
+	}
+	// overlay at col 0: "AAA" replaces first 3 chars of "line1", remainder "e1" preserved
+	if lines[1] != "AAAe1" {
+		t.Errorf("line 1: expected %q, got %q", "AAAe1", lines[1])
+	}
+}
+
+func TestOverlayDropdown_WithOffset(t *testing.T) {
+	base := "0123456789\n0123456789\n0123456789"
+	overlay := "XX"
+
+	result := overlayDropdown(base, overlay, 1, 3)
+	lines := strings.Split(result, "\n")
+
+	// Line 1 should be "012XX56789"
+	if lines[1] != "012XX56789" {
+		t.Errorf("expected %q, got %q", "012XX56789", lines[1])
+	}
+	// Other lines unchanged
+	if lines[0] != "0123456789" {
+		t.Errorf("line 0 should be unchanged, got %q", lines[0])
+	}
+	if lines[2] != "0123456789" {
+		t.Errorf("line 2 should be unchanged, got %q", lines[2])
+	}
+}
+
+func TestOverlayDropdown_PreservesLineCount(t *testing.T) {
+	base := "a\nb\nc\nd\ne\nf"
+	overlay := "X\nY\nZ"
+
+	result := overlayDropdown(base, overlay, 2, 0)
+	lines := strings.Split(result, "\n")
+
+	if len(lines) != 6 {
+		t.Fatalf("overlay should not change line count: expected 6, got %d", len(lines))
+	}
+}
+
+func TestOverlayDropdown_OutOfBounds(t *testing.T) {
+	base := "a\nb"
+	overlay := "X\nY\nZ"
+
+	// Overlay starts at row 1, only 1 line fits (row 1), row 2 is out of bounds
+	result := overlayDropdown(base, overlay, 1, 0)
+	lines := strings.Split(result, "\n")
+
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 lines, got %d", len(lines))
+	}
+	if lines[0] != "a" {
+		t.Errorf("line 0 should be unchanged, got %q", lines[0])
+	}
+}
+
+// TestNewDialog_NameInput_AcceptsUnderscore verifies that typing '_' into the
+// name input reaches the textinput buffer (regression test for BUG-02).
+func TestNewDialog_NameInput_AcceptsUnderscore(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+
+	underscoreKey := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'_'}}
+	updated, _ := d.Update(underscoreKey)
+
+	if updated.nameInput.Value() != "_" {
+		t.Errorf("nameInput.Value() = %q after typing '_', want %q", updated.nameInput.Value(), "_")
+	}
+}
+
+// TestNewDialog_PathInput_AcceptsUnderscore verifies that typing '_' into the
+// path input reaches the textinput buffer (regression test for BUG-02).
+// Focus targets (UX top-3 #3 order): focusName(0), focusCommand(1), focusPath(2), ...
+// Two Tabs are required to reach focusPath from focusName.
+func TestNewDialog_PathInput_AcceptsUnderscore(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+
+	// Tab twice to reach the path input field (focusName -> focusCommand -> focusPath).
+	d = sendSpecialKey(d, tea.KeyTab)
+	d = sendSpecialKey(d, tea.KeyTab)
+
+	// Type '_' — the soft-select logic clears any pre-populated value and
+	// focuses the textinput before letting the rune reach it.
+	underscoreKey := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'_'}}
+	updated, _ := d.Update(underscoreKey)
+
+	if !strings.Contains(updated.pathInput.Value(), "_") {
+		t.Errorf("pathInput.Value() = %q after typing '_', want value to contain '_'", updated.pathInput.Value())
+	}
+}
+
+// TestNewDialog_View_ShowsStartQueryField_WhenClaudeSelected asserts the
+// v1.7.67 "Start query" input renders in the claude-options panel when
+// the claude preset is selected. The field is the dedicated entry point
+// for claude-code's positional startup-query argument, replacing the
+// extra-args misuse documented in @Clindbergh's GH #725 report.
+func TestNewDialog_View_ShowsStartQueryField_WhenClaudeSelected(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.SetSize(100, 50)
+	dialog.Show()
+	// matrix/hardened: tool order may change; select Claude by name.
+	dialog.SetDefaultTool("claude")
+	dialog.updateToolOptions()
+
+	view := dialog.View()
+
+	if !strings.Contains(view, "Start query") {
+		t.Errorf(
+			"View should contain 'Start query' label when claude is "+
+				"selected; without this label the user has no discoverable "+
+				"way to pass a per-session startup query. got:\n%s",
+			view,
+		)
+	}
+}
+
+// TestNewDialog_GetClaudeStartQuery_ReturnsInputValue asserts the
+// accessor returns the raw input string (multi-word, un-split). This is
+// the value the launch code path assigns to Instance.StartupQuery; if it
+// split on spaces here (as extra-args does via strings.Fields), the
+// bug @Clindbergh reported would reappear.
+func TestNewDialog_GetClaudeStartQuery_ReturnsInputValue(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.SetDefaultTool("claude") // matrix/hardened: select by tool name
+	dialog.updateToolOptions()
+
+	// Use reflection to drive the test even before GetClaudeStartQuery exists.
+	dv := reflect.ValueOf(dialog)
+	method := dv.MethodByName("GetClaudeStartQuery")
+	if !method.IsValid() {
+		t.Fatalf(
+			"NewDialog.GetClaudeStartQuery() does not exist; add it in " +
+				"internal/ui/newdialog.go next to GetClaudeExtraArgs. It " +
+				"must return string (NOT []string — the query is a single " +
+				"positional arg, never split on spaces).",
+		)
+	}
+
+	// Drive the underlying input through ClaudeOptionsPanel.SetStartQuery
+	// or direct field access; use reflection to stay compile-safe.
+	panelMethod := reflect.ValueOf(dialog.claudeOptions).MethodByName("SetStartQuery")
+	if !panelMethod.IsValid() {
+		t.Fatalf(
+			"ClaudeOptionsPanel.SetStartQuery(string) does not exist; " +
+				"add it next to SetExtraArgs in internal/ui/claudeoptions.go.",
+		)
+	}
+	panelMethod.Call([]reflect.Value{reflect.ValueOf("explain the codebase")})
+
+	out := method.Call(nil)
+	if len(out) != 1 || out[0].Kind() != reflect.String {
+		t.Fatalf("GetClaudeStartQuery must return (string); got %v", out)
+	}
+	got := out[0].String()
+	if got != "explain the codebase" {
+		t.Errorf(
+			"GetClaudeStartQuery() = %q, want %q (exact string, no space-split)",
+			got, "explain the codebase",
+		)
+	}
+}
+
+func TestNewDialog_ShowInGroup_LoadsConfiguredClaudeExtraArgs(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpHome := t.TempDir()
+	os.Setenv("HOME", tmpHome)
+	session.ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		session.ClearUserConfigCache()
+	}()
+
+	if err := session.SaveUserConfig(&session.UserConfig{
+		Claude: session.ClaudeSettings{
+			ExtraArgs:       []string{"--agent", "reviewer", "--model", "opus"},
+			UseChrome:       true,
+			UseTeammateMode: true,
+		},
+	}); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+
+	dialog := NewNewDialog()
+	dialog.SetDefaultTool("claude")
+	dialog.ShowInGroup("default", "default", "", nil, "")
+
+	got := dialog.GetClaudeExtraArgs()
+	want := []string{"--agent", "reviewer", "--model", "opus"}
+	if len(got) != len(want) {
+		t.Fatalf("GetClaudeExtraArgs() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("GetClaudeExtraArgs()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	opts := dialog.GetClaudeOptions()
+	if opts == nil {
+		t.Fatal("GetClaudeOptions() = nil")
+	}
+	if !opts.UseChrome {
+		t.Fatal("GetClaudeOptions().UseChrome = false, want true")
+	}
+	if !opts.UseTeammateMode {
+		t.Fatal("GetClaudeOptions().UseTeammateMode = false, want true")
+	}
+}
+
+// TestNewDialog_StartQuery_ClearsBetweenOpenings is the RED regression for
+// #741 (@Clindbergh). Filed against v1.7.67 after #725 shipped the dedicated
+// "Start query" field: opening the new-session dialog a second time showed
+// the previous invocation's query instead of an empty field. The backend is
+// correct (Instance.StartupQuery is `json:"-"` so SQLite doesn't persist it);
+// the leak is purely at the TUI layer — ShowInGroup clears nameInput,
+// pathInput, branchInput, etc. but never resets claudeOptions.startQueryInput.
+// This test opens the dialog, sets a query, closes, re-opens, and asserts
+// the field is empty.
+func TestNewDialog_MatrixCtrlNPCannotNavigateFields(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.worktreeEnabled = false
+	dialog.sandboxEnabled = false
+	dialog.inheritedSettings = nil
+	dialog.rebuildFocusTargets()
+	dialog.focusIndex = 1
+	dialog.updateFocus()
+	for _, key := range []tea.KeyType{tea.KeyCtrlN, tea.KeyCtrlP} {
+		dialog, _ = dialog.Update(tea.KeyMsg{Type: key})
+		if dialog.focusIndex != 1 {
+			t.Fatalf("%v moved focusIndex to %d", key, dialog.focusIndex)
+		}
+	}
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if dialog.focusIndex != 2 {
+		t.Fatalf("Tab: focusIndex = %d, want 2", dialog.focusIndex)
+	}
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	if dialog.focusIndex != 1 {
+		t.Fatalf("Shift+Tab: focusIndex = %d, want 1", dialog.focusIndex)
+	}
+}
+
+func TestNewDialog_MatrixCtrlPCannotWrapToLastField(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.worktreeEnabled = false
+	dialog.sandboxEnabled = false
+	dialog.inheritedSettings = nil
+	dialog.rebuildFocusTargets()
+	maxIdx := len(dialog.focusTargets) - 1
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	if dialog.focusIndex != 0 {
+		t.Fatalf("Ctrl+P moved focusIndex to %d", dialog.focusIndex)
+	}
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	if dialog.focusIndex != maxIdx {
+		t.Fatalf("Shift+Tab: focusIndex = %d, want %d (last)", dialog.focusIndex, maxIdx)
+	}
+}
+
+func TestNewDialog_MatrixCtrlNPCannotNavigateSuggestions(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.SetPathSuggestions([]string{"/a", "/b", "/c"})
+	dialog.focusIndex = dialog.indexOf(focusPath)
+	dialog.updateFocus()
+	dialog.suggestionsActive = true
+	dialog.pathSuggestionCursor = 1
+	for _, key := range []tea.KeyType{tea.KeyCtrlN, tea.KeyCtrlP} {
+		dialog, _ = dialog.Update(tea.KeyMsg{Type: key})
+		if dialog.pathSuggestionCursor != 1 || !dialog.suggestionsActive {
+			t.Fatalf("%v changed open dropdown: cursor=%d active=%t", key, dialog.pathSuggestionCursor, dialog.suggestionsActive)
+		}
+	}
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if dialog.pathSuggestionCursor != 2 {
+		t.Fatalf("Down: pathSuggestionCursor = %d, want 2", dialog.pathSuggestionCursor)
+	}
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if dialog.pathSuggestionCursor != 1 || !dialog.suggestionsActive {
+		t.Fatal("Up should restore cursor and keep dropdown open")
+	}
+}
+
+func TestNewDialog_RecentPicker_JK(t *testing.T) {
+	// j / k must navigate the recent-sessions picker, consistent with
+	// down / up.
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.recentSessions = []*statedb.RecentSessionRow{
+		{Title: "alpha", ProjectPath: "/a", Tool: "claude"},
+		{Title: "beta", ProjectPath: "/b", Tool: "claude"},
+		{Title: "gamma", ProjectPath: "/c", Tool: "claude"},
+	}
+	dialog.showRecentPicker = true
+	dialog.recentSessionCursor = 0
+
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if dialog.recentSessionCursor != 1 {
+		t.Fatalf("j: recentSessionCursor = %d, want 1", dialog.recentSessionCursor)
+	}
+
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if dialog.recentSessionCursor != 2 {
+		t.Fatalf("j x2: recentSessionCursor = %d, want 2", dialog.recentSessionCursor)
+	}
+
+	// Wrap around.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if dialog.recentSessionCursor != 0 {
+		t.Fatalf("j wrap: recentSessionCursor = %d, want 0", dialog.recentSessionCursor)
+	}
+
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if dialog.recentSessionCursor != 2 {
+		t.Fatalf("k from 0: recentSessionCursor = %d, want 2 (wrap)", dialog.recentSessionCursor)
+	}
+
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if dialog.recentSessionCursor != 1 {
+		t.Fatalf("k: recentSessionCursor = %d, want 1", dialog.recentSessionCursor)
+	}
+}
+
+func TestNewDialog_StartQuery_ClearsBetweenOpenings(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.SetDefaultTool("claude") // matrix/hardened: select by tool name
+	dialog.updateToolOptions()
+
+	dialog.claudeOptions.SetStartQuery("explain this repo")
+	if got := dialog.GetClaudeStartQuery(); got != "explain this repo" {
+		t.Fatalf("precondition: GetClaudeStartQuery() = %q, want %q", got, "explain this repo")
+	}
+
+	dialog.Hide()
+	dialog.Show()
+	dialog.SetDefaultTool("claude")
+	dialog.updateToolOptions()
+
+	if got := dialog.GetClaudeStartQuery(); got != "" {
+		t.Errorf(
+			"Start query must be empty on re-open; got %q. Per-session "+
+				"startup queries are ephemeral (Instance.StartupQuery is "+
+				"json:\"-\") and must not leak between dialog invocations.",
+			got,
+		)
+	}
+}
+
+// TestNewDialog_Tab_StaysOnInvalidPath verifies that Tab does not advance
+// focus away from the path field when the typed path is non-empty but does
+// not resolve to an existing directory. Issue #896 (problem 1): silently
+// jumping to the agent selector leaves the typed path dangling.
+func TestNewDialog_Tab_StaysOnInvalidPath(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+
+	for d.currentTarget() != focusPath {
+		d.focusIndex++
+		if d.focusIndex >= len(d.focusTargets) {
+			t.Fatal("focusPath not reachable")
+		}
+	}
+	d.updateFocus()
+
+	d.pathSoftSelected = false
+	d.pathInput.Focus()
+	// Path that is statistically guaranteed not to exist.
+	d.pathInput.SetValue("/this-path-should-not-exist-zzz-issue-896")
+	d.pathInput.SetCursor(len(d.pathInput.Value()))
+
+	startIdx := d.focusIndex
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	if d.focusIndex != startIdx {
+		t.Errorf(
+			"Tab on non-existing path advanced focus from %d to %d; expected to stay on path field",
+			startIdx, d.focusIndex,
+		)
+	}
+	if d.currentTarget() != focusPath {
+		t.Errorf("currentTarget = %v, want focusPath", d.currentTarget())
+	}
+}
+
+// TestNewDialog_PathEditor_EnterAdvancesOnValidPath ensures the invalid-path guard from
+// issue #896 (problem 1) does not regress the happy path: when the user has
+// typed a real directory, Tab still moves to the next field.
+func TestNewDialog_PathEditor_EnterAdvancesOnValidPath(t *testing.T) {
+	// matrix/hardened: Path now enters direct editing; Tab completes only.
+	d := NewNewDialog()
+	d.Show()
+	d.pathInput.SetValue("/preset/project")
+	d.pathInput.CursorEnd()
+	d.focusIndex = d.indexOf(focusPath)
+	d.updateFocus()
+	if d.pathSoftSelected || !d.pathInput.Focused() {
+		t.Fatal("Path must be directly editable")
+	}
+	d.pathInput.SetValue(t.TempDir())
+	d.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if d.currentTarget() != focusPath {
+		t.Fatal("Tab must complete and stay even on an existing directory")
+	}
+	d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if d.currentTarget() == focusPath {
+		t.Fatal("Enter must advance")
+	}
+}
+
+// TestNewDialog_CtrlW_DeletesPathSegment verifies that ctrl+w on the path
+// input deletes the trailing path segment instead of the whole field. Issue
+// #896 (problem 4): default bubbles textinput treats ctrl+w as delete-word
+// with whitespace boundaries, which wipes spaceless paths like
+// "/Users/dmitry/code/foo".
+func TestNewDialog_CtrlW_DeletesPathSegment(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+
+	// Move focus to the path field.
+	for d.currentTarget() != focusPath {
+		d.focusIndex++
+		if d.focusIndex >= len(d.focusTargets) {
+			t.Fatal("focusPath not reachable from default focus targets")
+		}
+	}
+	d.updateFocus()
+
+	d.pathSoftSelected = false
+	d.pathInput.Focus()
+	d.pathInput.SetValue("/Users/dmitry/code/foo")
+	d.pathInput.SetCursor(len("/Users/dmitry/code/foo"))
+
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyCtrlW})
+
+	if got, want := d.pathInput.Value(), "/Users/dmitry/code/"; got != want {
+		t.Errorf("pathInput after ctrl+w = %q, want %q", got, want)
+	}
+}
+
+// TestNewDialog_CtrlW_BranchField verifies the same path-aware ctrl+w
+// behaviour applies to the worktree branch input, where slashes are
+// common (e.g. "feature/issue-896").
+func TestNewDialog_CtrlW_BranchField(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+	d.worktreeEnabled = true
+	d.rebuildFocusTargets()
+
+	for d.currentTarget() != focusBranch {
+		d.focusIndex++
+		if d.focusIndex >= len(d.focusTargets) {
+			t.Fatal("focusBranch not reachable")
+		}
+	}
+	d.updateFocus()
+
+	d.branchInput.Focus()
+	d.branchInput.SetValue("feature/issue-896")
+	d.branchInput.SetCursor(len("feature/issue-896"))
+
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyCtrlW})
+
+	if got, want := d.branchInput.Value(), "feature/"; got != want {
+		t.Errorf("branchInput after ctrl+w = %q, want %q", got, want)
+	}
+}
+
+// Tests the overlay placement math. Dropdowns are placed relative
+// to the associated dialog's top-left corner.
+//
+// Remote-parity: NewDialog is also used for remote-aware creation. The routing
+// that marks it remote-targeted is covered by the #743 regression tests in
+// home_test.go; this test remains focused on shared overlay placement math.
+func TestDialogOrigin(t *testing.T) {
+	tests := []struct {
+		name                           string
+		termW, termH, dialogW, dialogH int
+		wantRow, wantCol               int
+	}{
+		{"fits centered", 120, 50, 80, 30, 10, 20},
+		{"taller than terminal clamps row", 120, 25, 80, 30, 0, 20},
+		{"wider than terminal clamps col", 60, 50, 80, 30, 10, 0},
+		{"larger than terminal both clamp", 60, 25, 80, 30, 0, 0},
+		{"exact fit", 80, 30, 80, 30, 0, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			row, col := dialogOrigin(tt.termW, tt.termH, tt.dialogW, tt.dialogH)
+			if row != tt.wantRow || col != tt.wantCol {
+				t.Errorf("dialogOrigin(%d,%d,%d,%d) = (row %d, col %d), want (row %d, col %d)",
+					tt.termW, tt.termH, tt.dialogW, tt.dialogH, row, col, tt.wantRow, tt.wantCol)
+			}
+		})
+	}
+}
+
+// --- Keyboard navigation improvements (Feedback Hub: smoother new-session nav) ---
+
+// Opt-in mode: Enter on the Name field must advance focus to the next field,
+// NOT submit the form. shouldHandleEnterLocally must report true so home.go
+// forwards Enter to the dialog rather than running its submit path.
+func TestNewDialog_EnterOnNameAdvancesFocus(t *testing.T) {
+	d := NewNewDialog()
+	d.enterAdvances = true // opt in: [ui].new_session_enter_advances = true
+	d.SetSize(100, 50)
+	d.Show()
+
+	if d.currentTarget() != focusName {
+		t.Fatalf("default focus = %v, want focusName", d.currentTarget())
+	}
+	if !d.shouldHandleEnterLocally() {
+		t.Fatal("shouldHandleEnterLocally on Name = false, want true (Enter must advance, not submit)")
+	}
+
+	before := d.currentTarget()
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if d.currentTarget() == before {
+		t.Fatalf("Enter on Name did not advance focus (still %v)", d.currentTarget())
+	}
+	// UX top-3 #3: hot path is Name -> Tool, so Enter on Name advances to the
+	// Command (tool) field — the 90% flow: type name, Enter, tool already right.
+	if d.currentTarget() != focusCommand {
+		t.Fatalf("focus after Enter on Name = %v, want focusCommand (next field)", d.currentTarget())
+	}
+}
+
+// Opt-in mode: Enter on the Branch field (worktree enabled) advances focus
+// instead of submitting, matching the Name-field behavior for free-text inputs.
+func TestNewDialog_EnterOnBranchAdvancesFocus(t *testing.T) {
+	d := NewNewDialog()
+	d.enterAdvances = true // opt in: [ui].new_session_enter_advances = true
+	d.SetSize(100, 50)
+	d.Show()
+	d.nameInput.SetValue("demo")
+	d.ToggleWorktree() // enables worktree -> branch field appears
+
+	idx := d.indexOf(focusBranch)
+	if idx < 0 {
+		t.Fatal("focusBranch should be present when worktree enabled")
+	}
+	d.focusIndex = idx
+	d.updateFocus()
+
+	if !d.shouldHandleEnterLocally() {
+		t.Fatal("shouldHandleEnterLocally on Branch = false, want true")
+	}
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if d.currentTarget() == focusBranch {
+		t.Fatal("Enter on Branch did not advance focus")
+	}
+}
+
+// Ctrl+S is recognized as an explicit submit shortcut from a plain text field.
+func TestNewDialog_CtrlSWantsSubmit(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(100, 50)
+	d.Show()
+	d.nameInput.SetValue("demo")
+
+	if !d.WantsSubmit(tea.KeyMsg{Type: tea.KeyCtrlS}) {
+		t.Fatal("WantsSubmit(Ctrl+S) on Name = false, want true")
+	}
+	// A non-Ctrl+S key must not be treated as submit.
+	if d.WantsSubmit(tea.KeyMsg{Type: tea.KeyEnter}) {
+		t.Fatal("WantsSubmit(Enter) = true, want false")
+	}
+}
+
+// Ctrl+S must be inert while a sub-picker is open so it never fires mid
+// selection (it would otherwise create a session from a half-picked state).
+func TestNewDialog_CtrlSInertWhileDropdownActive(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(100, 50)
+	d.Show()
+	d.SetPathSuggestions([]string{"/tmp/a", "/tmp/b"})
+
+	// Open the path suggestions dropdown (Space on the soft-selected pre-fill;
+	// Enter on an existing directory advances instead).
+	d.focusIndex = d.indexOf(focusPath)
+	d.updateFocus()
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if !d.IsSuggestionsActive() {
+		t.Fatal("path dropdown should be active after Enter on Path")
+	}
+	if d.WantsSubmit(tea.KeyMsg{Type: tea.KeyCtrlS}) {
+		t.Fatal("WantsSubmit(Ctrl+S) while path dropdown active = true, want false")
+	}
+}
+
+// Regression (Codex P2): Ctrl+S submitted while a multi-repo path is being
+// edited inline must use the in-flight edited value, not the stale
+// previously-committed path. The edited text lives only in pathInput until the
+// Enter handler writes it back, so the submit path must flush it first via
+// CommitInFlightMultiRepoEdit.
+func TestNewDialog_CtrlSDuringMultiRepoEditSubmitsEditedPath(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(100, 50)
+	d.Show()
+
+	// Enable multi-repo with one committed path and focus the multi-repo row.
+	d.pathInput.SetValue("/old/path")
+	d.ToggleMultiRepo()
+	d.rebuildFocusTargets()
+	d.focusIndex = d.indexOf(focusMultiRepo)
+	d.updateFocus()
+	if got, _ := d.GetMultiRepoPaths(); len(got) != 1 || got[0] != "/old/path" {
+		t.Fatalf("setup: GetMultiRepoPaths = %v, want [/old/path]", got)
+	}
+
+	// Enter edit mode for the path (mirrors the Enter handler entering edit).
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if !d.multiRepoEditing {
+		t.Fatal("expected multiRepoEditing=true after Enter on multi-repo path")
+	}
+
+	// User edits the path in-flight: clear and type a new value into pathInput.
+	d.pathInput.SetValue("/edited/path")
+
+	// Before the fix, GetMultiRepoPaths still returns the stale committed value
+	// because the edit lives only in pathInput.
+	if got, _ := d.GetMultiRepoPaths(); len(got) != 1 || got[0] != "/old/path" {
+		t.Fatalf("pre-commit: GetMultiRepoPaths = %v, want stale [/old/path]", got)
+	}
+
+	// Ctrl+S submit path: WantsSubmit must be true (no dropdown open), then the
+	// submit handler flushes the in-flight edit.
+	if !d.WantsSubmit(tea.KeyMsg{Type: tea.KeyCtrlS}) {
+		t.Fatal("WantsSubmit(Ctrl+S) during multi-repo edit = false, want true")
+	}
+	d.CommitInFlightMultiRepoEdit()
+
+	if d.multiRepoEditing {
+		t.Fatal("multiRepoEditing should be false after CommitInFlightMultiRepoEdit")
+	}
+	got, ok := d.GetMultiRepoPaths()
+	if !ok || len(got) != 1 || got[0] != "/edited/path" {
+		t.Fatalf("post-commit: GetMultiRepoPaths = %v (ok=%v), want [/edited/path]", got, ok)
+	}
+}
+
+// Regression (Codex round-2 P2): Ctrl+S submitted while editing a NON-primary
+// multi-repo entry must leave pathInput holding the PRIMARY path. The submit
+// path in home.go reads `path` from pathInput (via GetValuesWithWorktree) and
+// runs worktree resolution + the create-directory check against it BEFORE path
+// is reassigned to multiRepoPaths[0]. If pathInput were left on the secondary
+// entry being edited, those pre-create checks would run against the WRONG repo.
+func TestNewDialog_CtrlSEditingSecondaryEntry_PreCreateChecksUsePrimaryPath(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(100, 50)
+	d.Show()
+
+	// Two committed multi-repo paths: primary = /primary/repo, secondary = /secondary/repo.
+	d.pathInput.SetValue("/primary/repo")
+	d.ToggleMultiRepo()
+	d.multiRepoPaths = []string{"/primary/repo", "/secondary/repo"}
+	d.rebuildFocusTargets()
+
+	// Begin editing the SECONDARY entry (index 1), mirroring the Enter handler.
+	d.multiRepoPathCursor = 1
+	d.multiRepoEditing = true
+	d.pathInput.SetValue("/secondary/repo-edited")
+	d.pathInput.Focus()
+
+	// Sanity: before the commit, pathInput holds the secondary edit, so a naive
+	// GetValuesWithWorktree would resolve against the wrong repo.
+	if _, p, _, _, _ := d.GetValuesWithWorktree(); p != "/secondary/repo-edited" {
+		t.Fatalf("setup: GetValuesWithWorktree path = %q, want /secondary/repo-edited", p)
+	}
+
+	// Ctrl+S submit path: WantsSubmit true, then flush the in-flight edit.
+	if !d.WantsSubmit(tea.KeyMsg{Type: tea.KeyCtrlS}) {
+		t.Fatal("WantsSubmit(Ctrl+S) while editing secondary = false, want true")
+	}
+	d.CommitInFlightMultiRepoEdit()
+
+	// The edited secondary value must be flushed into multiRepoPaths[1]...
+	got, ok := d.GetMultiRepoPaths()
+	if !ok || len(got) != 2 || got[0] != "/primary/repo" || got[1] != "/secondary/repo-edited" {
+		t.Fatalf("post-commit: GetMultiRepoPaths = %v (ok=%v), want [/primary/repo /secondary/repo-edited]", got, ok)
+	}
+
+	// ...AND pathInput must now hold the PRIMARY path so the caller's pre-create
+	// checks (worktree resolution, create-directory) run against the primary repo.
+	if _, p, _, _, _ := d.GetValuesWithWorktree(); p != "/primary/repo" {
+		t.Fatalf("post-commit: GetValuesWithWorktree path = %q, want /primary/repo (primary), not the secondary entry", p)
+	}
+}
+
+// CommitInFlightMultiRepoEdit must be a safe no-op when no multi-repo edit is in
+// progress (the normal Ctrl+S-from-any-field case).
+func TestNewDialog_CommitInFlightMultiRepoEdit_NoopWhenNotEditing(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(100, 50)
+	d.Show()
+	// Not in multi-repo mode at all.
+	d.CommitInFlightMultiRepoEdit() // must not panic
+
+	// Multi-repo enabled but not editing.
+	d.pathInput.SetValue("/a")
+	d.ToggleMultiRepo()
+	d.CommitInFlightMultiRepoEdit()
+	if d.multiRepoEditing {
+		t.Fatal("multiRepoEditing flipped true unexpectedly")
+	}
+	if got, _ := d.GetMultiRepoPaths(); len(got) != 1 || got[0] != "/a" {
+		t.Fatalf("GetMultiRepoPaths = %v, want [/a] (unchanged)", got)
+	}
+}
+
+// Regression: Tab still advances Name -> next field (unchanged behavior,
+// independent of the Enter-mode toggle).
+func TestNewDialog_TabFromNameStillAdvances(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(100, 50)
+	d.Show()
+	if d.currentTarget() != focusName {
+		t.Fatalf("default focus = %v, want focusName", d.currentTarget())
+	}
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if d.currentTarget() == focusName {
+		t.Fatal("Tab on Name did not advance focus")
+	}
+}
+
+// --- Default behavior (UX top-3 #1: Enter-advances is now the DEFAULT) ---
+
+// DEFAULT (Enter-advances ON): Enter on the Name field is handled locally and
+// advances focus instead of submitting — typing a name + Enter no longer
+// silently creates a session with all defaults. This is the behavior flip.
+func TestNewDialog_DefaultEnterOnNameAdvances(t *testing.T) {
+	d := NewNewDialog()
+	// enterAdvances now defaults to true (no config → newSessionEnterAdvancesFromConfig
+	// returns true). Assert it explicitly so the new default is load-bearing here.
+	if !d.enterAdvances {
+		t.Fatal("enterAdvances default = false, want true (Enter-advances is now the default)")
+	}
+	d.SetSize(100, 50)
+	d.Show()
+
+	if d.currentTarget() != focusName {
+		t.Fatalf("default focus = %v, want focusName", d.currentTarget())
+	}
+	// shouldHandleEnterLocally must be true on Name so the dialog advances focus.
+	if !d.shouldHandleEnterLocally() {
+		t.Fatal("default mode: shouldHandleEnterLocally on Name = false, want true (Enter must advance, not submit)")
+	}
+	before := d.currentTarget()
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if d.currentTarget() == before {
+		t.Fatalf("default mode: Enter on Name did not advance focus (still %v)", before)
+	}
+}
+
+// OPT-OUT (new_session_enter_advances = false): Enter on Name submits, the
+// legacy behavior. We simulate the opt-out by forcing enterAdvances = false.
+func TestNewDialog_OptOutEnterOnNameSubmits(t *testing.T) {
+	d := NewNewDialog()
+	d.enterAdvances = false // simulate [ui].new_session_enter_advances = false
+	d.SetSize(100, 50)
+	d.Show()
+
+	if d.currentTarget() != focusName {
+		t.Fatalf("focus = %v, want focusName", d.currentTarget())
+	}
+	if d.shouldHandleEnterLocally() {
+		t.Fatal("opt-out mode: shouldHandleEnterLocally on Name = true, want false (Enter must submit)")
+	}
+	before := d.currentTarget()
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if d.currentTarget() != before {
+		t.Fatalf("opt-out mode: Enter on Name advanced focus to %v, want unchanged %v", d.currentTarget(), before)
+	}
+}
+
+// DEFAULT (Enter-advances ON): Enter on the Branch field advances focus.
+func TestNewDialog_DefaultEnterOnBranchAdvances(t *testing.T) {
+	d := NewNewDialog()
+	if !d.enterAdvances {
+		t.Fatal("enterAdvances default = false, want true")
+	}
+	d.SetSize(100, 50)
+	d.Show()
+	d.nameInput.SetValue("demo")
+	d.ToggleWorktree()
+
+	idx := d.indexOf(focusBranch)
+	if idx < 0 {
+		t.Fatal("focusBranch should be present when worktree enabled")
+	}
+	d.focusIndex = idx
+	d.updateFocus()
+
+	if !d.shouldHandleEnterLocally() {
+		t.Fatal("default mode: shouldHandleEnterLocally on Branch = false, want true (Enter must advance)")
+	}
+	before := d.currentTarget()
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if d.currentTarget() == before {
+		t.Fatalf("default mode: Enter on Branch did not advance focus (still %v)", before)
+	}
+}
+
+// OPT-OUT: Enter on Branch submits (legacy) when enter-advances is disabled.
+func TestNewDialog_OptOutEnterOnBranchSubmits(t *testing.T) {
+	d := NewNewDialog()
+	d.enterAdvances = false // simulate [ui].new_session_enter_advances = false
+	d.SetSize(100, 50)
+	d.Show()
+	d.nameInput.SetValue("demo")
+	d.ToggleWorktree()
+
+	idx := d.indexOf(focusBranch)
+	if idx < 0 {
+		t.Fatal("focusBranch should be present when worktree enabled")
+	}
+	d.focusIndex = idx
+	d.updateFocus()
+
+	if d.shouldHandleEnterLocally() {
+		t.Fatal("opt-out mode: shouldHandleEnterLocally on Branch = true, want false (Enter must submit)")
+	}
+	before := d.currentTarget()
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if d.currentTarget() != before {
+		t.Fatalf("opt-out mode: Enter on Branch advanced focus to %v, want unchanged %v", d.currentTarget(), before)
+	}
+}
+
+// Ctrl+S is additive: WantsSubmit(Ctrl+S) is true regardless of the toggle, so
+// the explicit-create shortcut works in BOTH default and opt-in modes.
+func TestNewDialog_CtrlSSubmitsInBothModes(t *testing.T) {
+	for _, advance := range []bool{false, true} {
+		d := NewNewDialog()
+		d.enterAdvances = advance
+		d.SetSize(100, 50)
+		d.Show()
+		d.nameInput.SetValue("demo")
+		if !d.WantsSubmit(tea.KeyMsg{Type: tea.KeyCtrlS}) {
+			t.Fatalf("WantsSubmit(Ctrl+S) with enterAdvances=%v = false, want true (additive in both modes)", advance)
+		}
+	}
+}

@@ -1,0 +1,235 @@
+//go:build capability_e2e
+
+package capability
+
+import (
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/testutil"
+)
+
+// newGitRepo creates a real throwaway git repository with one commit inside the
+// sandbox HOME and returns its path. Worktree creation requires a repo with at
+// least one commit and a branch to fork from. Uses CleanGitEnv so the
+// subprocess git never inherits the outer repo's GIT_DIR routing.
+func newGitRepo(t *testing.T, c *capSandbox) string {
+	t.Helper()
+	repo := filepath.Join(c.Home, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	env := append(testutil.CleanGitEnv(os.Environ()),
+		"GIT_AUTHOR_NAME=Cap", "GIT_AUTHOR_EMAIL=cap@test",
+		"GIT_COMMITTER_NAME=Cap", "GIT_COMMITTER_EMAIL=cap@test",
+		"HOME="+c.Home,
+	)
+	for _, args := range [][]string{
+		{"init", "-b", "main"},
+		{"commit", "--allow-empty", "-m", "init"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = env
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	return repo
+}
+
+// TestCapability_LaunchWTSetup proves the one-step launch path can create a
+// new worktree branch, run the repo's standard .agent-deck/worktree-setup.sh
+// inside that worktree, then start the agent and deliver the initial message.
+func TestCapability_LaunchWTSetup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell command fixture")
+	}
+
+	c := newCapSandbox(t)
+	setupEchobot(t, c)
+	repo := newGitRepo(t, c)
+	setupDir := filepath.Join(repo, ".agent-deck")
+	if err := os.MkdirAll(setupDir, 0o755); err != nil {
+		t.Fatalf("mkdir setup dir: %v", err)
+	}
+	setupScript := filepath.Join(setupDir, "worktree-setup.sh")
+	if err := os.WriteFile(setupScript, []byte("printf SETUP_OK > setup-marker.txt\n"), 0o644); err != nil {
+		t.Fatalf("write worktree setup script: %v", err)
+	}
+
+	// First use: the hook is not approved, so launch creates the worktree
+	// but skips the hook with a one-line notice naming the approve command.
+	out := c.run(t, "launch", repo, "-c", "echobot", "-t", "cap-launch-wt-unapproved", "-w", "capunapproved", "-b")
+	defer c.stopQuietly("cap-launch-wt-unapproved")
+	if !strings.Contains(out, "worktree trust-hooks") || !strings.Contains(out, "--hook setup") {
+		t.Fatalf("launch should name `agent-deck worktree trust-hooks <repo> --hook setup`, got:\n%s", out)
+	}
+	unapproved := c.worktreeInfo(t, "cap-launch-wt-unapproved")
+	if _, err := os.Stat(filepath.Join(unapproved.WorktreePath, "setup-marker.txt")); !os.IsNotExist(err) {
+		t.Fatalf("unapproved setup hook ran (stat err = %v)", err)
+	}
+
+	// trust-hooks refuses to approve without a terminal unless --yes.
+	if out, err := c.try("worktree", "trust-hooks", repo, "--hook", "setup"); err == nil || !strings.Contains(out, "--yes") {
+		t.Fatalf("trust-hooks without a TTY or --yes should refuse, err=%v out:\n%s", err, out)
+	}
+	out = c.run(t, "worktree", "trust-hooks", repo, "--hook", "setup", "--yes")
+	if !strings.Contains(out, "printf SETUP_OK") || !strings.Contains(out, "Trusted the setup hook") {
+		t.Fatalf("trust-hooks --yes should show the hook and trust it, got:\n%s", out)
+	}
+
+	token := "PINGLAUNCH-WORKTREE-SETUP"
+	c.run(t, "launch", repo,
+		"-c", "echobot",
+		"-t", "cap-launch-wt",
+		"-w", "caplaunch",
+		"-b",
+		"-m", token,
+	)
+	defer c.stopQuietly("cap-launch-wt")
+
+	row, ok := c.findByTitle(t, "cap-launch-wt")
+	if !ok {
+		t.Fatalf("launch did not create a worktree session row.\nrows: %+v", c.list(t))
+	}
+	wi := c.worktreeInfo(t, "cap-launch-wt")
+	if !wi.WorktreeExists {
+		t.Fatalf("worktree info reports the launch worktree missing: %+v", wi)
+	}
+	if row.Path != wi.WorktreePath {
+		t.Fatalf("session path = %q, want worktree path %q", row.Path, wi.WorktreePath)
+	}
+	marker := filepath.Join(wi.WorktreePath, "setup-marker.txt")
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("setup marker should be written inside worktree at %s: %v", marker, err)
+	}
+	if strings.TrimSpace(string(data)) != "SETUP_OK" {
+		t.Fatalf("setup marker = %q, want SETUP_OK", string(data))
+	}
+
+	want := "ECHO:" + token
+	pane, ok := c.waitForPaneContains(t, "cap-launch-wt", want, 20*time.Second)
+	if !ok {
+		t.Fatalf("launch worktree setup did not deliver %q.\nlast pane:\n%s", want, pane)
+	}
+
+	// Editing the approved hook withdraws the approval.
+	if err := os.WriteFile(setupScript, []byte("printf CHANGED > setup-marker.txt\n"), 0o644); err != nil {
+		t.Fatalf("edit worktree setup script: %v", err)
+	}
+	out = c.run(t, "launch", repo, "-c", "echobot", "-t", "cap-launch-wt-changed", "-w", "capchanged", "-b")
+	defer c.stopQuietly("cap-launch-wt-changed")
+	if !strings.Contains(out, "changed since it was approved") {
+		t.Fatalf("launch after an edit should say the hook changed, got:\n%s", out)
+	}
+	changed := c.worktreeInfo(t, "cap-launch-wt-changed")
+	if _, err := os.Stat(filepath.Join(changed.WorktreePath, "setup-marker.txt")); !os.IsNotExist(err) {
+		t.Fatalf("edited setup hook ran without re-approval (stat err = %v)", err)
+	}
+
+	// --run-hooks runs it once, printing its identity, without trusting it.
+	out = c.run(t, "launch", repo, "-c", "echobot", "-t", "cap-launch-wt-runonce", "-w", "caprunonce", "-b", "--run-hooks")
+	defer c.stopQuietly("cap-launch-wt-runonce")
+	if !strings.Contains(out, "sha256:") {
+		t.Fatalf("--run-hooks should print the hook's sha256, got:\n%s", out)
+	}
+	runOnce := c.worktreeInfo(t, "cap-launch-wt-runonce")
+	if data, err := os.ReadFile(filepath.Join(runOnce.WorktreePath, "setup-marker.txt")); err != nil || strings.TrimSpace(string(data)) != "CHANGED" {
+		t.Fatalf("--run-hooks should run the edited hook, marker=%q err=%v", data, err)
+	}
+	if out, _ := c.try("worktree", "trust-hooks", repo, "--hook", "setup"); strings.Contains(out, "Already trusted") {
+		t.Fatalf("--run-hooks must not record trust, got:\n%s", out)
+	}
+}
+
+// worktreeInfo is the subset of `worktree info --json` we assert on. It reads
+// the stored worktree fields (no cwd dependency), so it works from any dir.
+type worktreeInfo struct {
+	WorktreePath   string `json:"worktree_path"`
+	MainRepo       string `json:"main_repo"`
+	WorktreeExists bool   `json:"worktree_exists"`
+	Branch         string `json:"branch"`
+}
+
+func (c *capSandbox) worktreeInfo(t *testing.T, ref string) worktreeInfo {
+	t.Helper()
+	out := c.run(t, "worktree", "info", ref, "--json")
+	var wi worktreeInfo
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &wi); err != nil {
+		t.Fatalf("parse worktree info --json: %v\nraw: %s", err, out)
+	}
+	return wi
+}
+
+// TestCapability_Worktree_CreateFinish proves the full worktree lifecycle
+// through the binary: `add --worktree -b` creates a real git worktree on disk
+// for a new branch, and `worktree finish` removes the worktree + branch and
+// drops the session, WITHOUT touching the original repository (the #1185/#1200
+// data-loss guard).
+//
+// Surfaces: CLI (add --worktree, worktree info/finish) + Persistence (registry
+// WorktreePath/WorktreeRepoRoot) + Cross-platform (git worktree path handling).
+func TestCapability_Worktree_CreateFinish(t *testing.T) {
+	c := newCapSandbox(t)
+	repo := newGitRepo(t, c)
+
+	// Create the worktree session for a brand-new branch off the repo.
+	c.run(t, "add", "-c", "bash", "-t", "cap-wt", "-w", "capfeature", "-b", repo)
+
+	row, ok := c.findByTitle(t, "cap-wt")
+	if !ok {
+		t.Fatalf("worktree add did not create a registry row.\nrows: %+v", c.list(t))
+	}
+
+	wi := c.worktreeInfo(t, "cap-wt")
+	if !wi.WorktreeExists {
+		t.Fatalf("worktree info reports the worktree missing right after creation: %+v", wi)
+	}
+	if _, err := os.Stat(wi.WorktreePath); err != nil {
+		t.Fatalf("worktree dir should exist on disk at %s: %v", wi.WorktreePath, err)
+	}
+	if wi.WorktreePath == repo {
+		t.Fatalf("worktree path must be distinct from the main repo, both are %s", repo)
+	}
+	if !strings.Contains(wi.Branch, "capfeature") {
+		t.Errorf("worktree branch = %q, want it to contain capfeature", wi.Branch)
+	}
+	// The session's working dir is the worktree, not the original repo.
+	if row.Path != wi.WorktreePath {
+		t.Errorf("session path = %q, want the worktree path %q", row.Path, wi.WorktreePath)
+	}
+
+	// Capture the created-state snapshot before finish removes the session.
+	created := c.run(t, "worktree", "info", "cap-wt")
+
+	// Finish: no merge (PR-style), force past confirm/uncommitted checks.
+	c.run(t, "worktree", "finish", "cap-wt", "--no-merge", "--force", "--json")
+
+	// The worktree dir is gone, the session row is gone, but the ORIGINAL repo
+	// is untouched (the #1200 data-loss guard: dismissing a worktree must never
+	// delete the source repository).
+	if _, err := os.Stat(wi.WorktreePath); !os.IsNotExist(err) {
+		t.Fatalf("worktree dir should be removed after finish, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".git")); err != nil {
+		t.Fatalf("the original repo must survive finish (#1200 guard), but %s/.git is gone: %v", repo, err)
+	}
+	if _, ok := c.findByTitle(t, "cap-wt"); ok {
+		t.Fatalf("after worktree finish, the session row should be absent from the registry")
+	}
+
+	// Display proof: the worktree info a human sees after create (a live
+	// worktree on its own branch), then the registry after finish removed it.
+	snapshot(t, "worktree", "$ agent-deck worktree info cap-wt   (after add --worktree -b)\n"+
+		strings.TrimRight(created, "\n")+
+		"\n\n$ agent-deck list   (after worktree finish: session gone, repo intact)\n"+
+		c.run(t, "list"))
+}

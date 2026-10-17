@@ -1,0 +1,719 @@
+package session
+
+import (
+	"encoding/json"
+	"strings"
+)
+
+// ToolOptions is the interface for tool-specific launch options
+// Each AI tool (claude, codex, gemini, etc.) can have its own options struct
+// that implements this interface
+type ToolOptions interface {
+	// ToolName returns the name of the tool (e.g., "claude", "codex")
+	ToolName() string
+	// ToArgs returns command-line arguments for the tool
+	ToArgs() []string
+}
+
+// ClaudeOptions holds launch options for Claude Code sessions
+type ClaudeOptions struct {
+	// SessionMode: "new" (default), "continue" (-c), or "resume" (-r)
+	SessionMode string `json:"session_mode,omitempty"`
+	// ResumeSessionID is the session ID for -r flag (only when SessionMode="resume")
+	ResumeSessionID string `json:"resume_session_id,omitempty"`
+	// Model overrides the Claude model for this session. Aliases like "sonnet",
+	// "opus", and "haiku" let Claude Code resolve the latest version; full
+	// model IDs pin a specific version.
+	Model string `json:"model,omitempty"`
+	// Effort sets Claude Code's per-session --effort level.
+	Effort string `json:"effort,omitempty"`
+	// SkipPermissions adds --dangerously-skip-permissions flag
+	SkipPermissions bool `json:"skip_permissions,omitempty"`
+	// AllowSkipPermissions adds --allow-dangerously-skip-permissions flag
+	// Only used when SkipPermissions is false (SkipPermissions takes precedence)
+	AllowSkipPermissions bool `json:"allow_skip_permissions,omitempty"`
+	// AutoMode adds --permission-mode auto flag
+	// Uses a classifier model to auto-approve safe operations while blocking risky ones.
+	// Only used when SkipPermissions is false (SkipPermissions takes precedence).
+	AutoMode bool `json:"auto_mode,omitempty"`
+	// UseChrome adds --chrome flag
+	UseChrome bool `json:"use_chrome,omitempty"`
+	// UseTeammateMode adds --teammate-mode tmux flag
+	UseTeammateMode bool `json:"use_teammate_mode,omitempty"`
+
+	// Transient fields for worktree fork (not persisted)
+	WorkDir          string `json:"-"`
+	WorktreePath     string `json:"-"`
+	WorktreeRepoRoot string `json:"-"`
+	WorktreeBranch   string `json:"-"`
+}
+
+// ToolName returns "claude"
+func (o *ClaudeOptions) ToolName() string {
+	return "claude"
+}
+
+// ToArgs returns command-line arguments based on options
+func (o *ClaudeOptions) ToArgs() []string {
+	var args []string
+
+	// Session mode flags (mutually exclusive)
+	switch o.SessionMode {
+	case "continue":
+		args = append(args, "-c")
+	case "resume":
+		if o.ResumeSessionID != "" {
+			args = append(args, "--resume", o.ResumeSessionID)
+		}
+	}
+	// "new" or empty = default behavior, no special flag
+
+	if o.Model != "" {
+		args = append(args, "--model", o.Model)
+	}
+	if o.Effort != "" {
+		args = append(args, "--effort", o.Effort)
+	}
+
+	// Permission flags (mutually exclusive, SkipPermissions takes precedence)
+	if o.SkipPermissions {
+		args = append(args, "--dangerously-skip-permissions")
+	} else if o.AutoMode {
+		args = append(args, "--permission-mode", "auto")
+	} else if o.AllowSkipPermissions {
+		args = append(args, "--allow-dangerously-skip-permissions")
+	}
+	if o.UseChrome {
+		args = append(args, "--chrome")
+	}
+	if o.UseTeammateMode {
+		args = append(args, "--teammate-mode", "tmux")
+	}
+
+	return args
+}
+
+// ToArgsForFork returns arguments suitable for fork resume command
+// Fork always uses --resume internally, so session mode flags are not included
+func (o *ClaudeOptions) ToArgsForFork() []string {
+	var args []string
+
+	if o.Model != "" {
+		args = append(args, "--model", o.Model)
+	}
+	if o.Effort != "" {
+		args = append(args, "--effort", o.Effort)
+	}
+	if o.SkipPermissions {
+		args = append(args, "--dangerously-skip-permissions")
+	} else if o.AutoMode {
+		args = append(args, "--permission-mode", "auto")
+	} else if o.AllowSkipPermissions {
+		args = append(args, "--allow-dangerously-skip-permissions")
+	}
+	if o.UseChrome {
+		args = append(args, "--chrome")
+	}
+	if o.UseTeammateMode {
+		args = append(args, "--teammate-mode", "tmux")
+	}
+
+	return args
+}
+
+// NewClaudeOptions creates ClaudeOptions with defaults from config
+func NewClaudeOptions(config *UserConfig) *ClaudeOptions {
+	opts := &ClaudeOptions{
+		SessionMode: "new",
+	}
+	if config != nil {
+		opts.SkipPermissions = config.Claude.GetDangerousMode()
+		opts.AutoMode = config.Claude.AutoMode
+		opts.AllowSkipPermissions = config.Claude.AllowDangerousMode
+		opts.UseChrome = config.Claude.UseChrome
+		opts.UseTeammateMode = config.Claude.UseTeammateMode
+		// Apply [claude].default_model so sessions spawned without per-session
+		// options (CLI / programmatic / resume) honor the configured model. This
+		// matches OpenCode/Copilot, which already wire their default_model here;
+		// without it `--model` was never passed and Claude fell back to Opus even
+		// when default_model was set (#1172 parsed the key but never applied it).
+		opts.Model = config.Claude.DefaultModel
+	}
+	return opts
+}
+
+// CodexOptions holds launch options for Codex CLI sessions
+type CodexOptions struct {
+	// Model overrides the Codex model for this session (for example, "gpt-5").
+	Model string `json:"model,omitempty"`
+	// ReasoningEffort overrides Codex model_reasoning_effort for this session.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// YoloMode enables --yolo flag (bypass approvals and sandbox)
+	// nil = inherit from global config, true/false = explicit override
+	YoloMode *bool `json:"yolo_mode,omitempty"`
+	// matrix/hardened: SharedThread marks a session attached to an existing
+	// Codex thread (recall open, global search, add --resume-session) that may
+	// be open elsewhere, e.g. in the Codex app through the app-server daemon.
+	// Its resume carries no config overrides (identity -c, model, effort,
+	// --yolo): codex shares a thread between clients only when the resuming
+	// client changes nothing, and otherwise shows "This conversation is open in
+	// another app" until the other client closes it.
+	SharedThread bool `json:"shared_thread,omitempty"`
+}
+
+// ToolName returns "codex"
+func (o *CodexOptions) ToolName() string {
+	return "codex"
+}
+
+// ToArgs returns command-line arguments based on options
+func (o *CodexOptions) ToArgs() []string {
+	var args []string
+	if o.Model != "" {
+		args = append(args, "--model", o.Model)
+	}
+	if o.ReasoningEffort != "" {
+		args = append(args, "--config", "model_reasoning_effort="+o.ReasoningEffort)
+	}
+	if o.YoloMode != nil && *o.YoloMode {
+		args = append(args, "--yolo")
+	}
+	return args
+}
+
+// NewCodexOptions creates CodexOptions with defaults from global config
+func NewCodexOptions(config *UserConfig) *CodexOptions {
+	opts := &CodexOptions{}
+	if config != nil && config.Codex.YoloMode {
+		yolo := true
+		opts.YoloMode = &yolo
+	}
+	return opts
+}
+
+// UnmarshalCodexOptions deserializes CodexOptions from JSON wrapper
+func UnmarshalCodexOptions(data json.RawMessage) (*CodexOptions, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	var wrapper ToolOptionsWrapper
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return nil, err
+	}
+
+	if wrapper.Tool != "codex" {
+		return nil, nil
+	}
+
+	var opts CodexOptions
+	if err := json.Unmarshal(wrapper.Options, &opts); err != nil {
+		return nil, err
+	}
+
+	return &opts, nil
+}
+
+// ToolOptionsWrapper wraps tool options for JSON serialization
+// JSON structure: {"tool": "claude", "options": {...}}
+type ToolOptionsWrapper struct {
+	Tool    string          `json:"tool"`
+	Options json.RawMessage `json:"options"`
+}
+
+// MarshalToolOptions serializes tool options to JSON
+func MarshalToolOptions(opts ToolOptions) (json.RawMessage, error) {
+	if opts == nil {
+		return nil, nil
+	}
+
+	optBytes, err := json.Marshal(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	wrapper := ToolOptionsWrapper{
+		Tool:    opts.ToolName(),
+		Options: optBytes,
+	}
+
+	return json.Marshal(wrapper)
+}
+
+// OpenCodeOptions holds launch options for OpenCode CLI sessions
+type OpenCodeOptions struct {
+	// SessionMode: "new" (default), "continue" (-c), or "resume" (-s)
+	SessionMode string `json:"session_mode,omitempty"`
+	// ResumeSessionID is the session ID for -s flag (only when SessionMode="resume")
+	ResumeSessionID string `json:"resume_session_id,omitempty"`
+	// Model overrides the model (e.g., "anthropic/claude-sonnet-4-5-20250929")
+	Model string `json:"model,omitempty"`
+	// Agent overrides the agent to use
+	Agent string `json:"agent,omitempty"`
+}
+
+// ToolName returns "opencode"
+func (o *OpenCodeOptions) ToolName() string {
+	return "opencode"
+}
+
+// ToArgs returns command-line arguments based on options
+func (o *OpenCodeOptions) ToArgs() []string {
+	var args []string
+
+	switch o.SessionMode {
+	case "continue":
+		args = append(args, "-c")
+	case "resume":
+		if o.ResumeSessionID != "" {
+			args = append(args, "-s", o.ResumeSessionID)
+		}
+	}
+
+	if o.Model != "" {
+		args = append(args, "-m", o.Model)
+	}
+	if o.Agent != "" {
+		args = append(args, "--agent", o.Agent)
+	}
+
+	return args
+}
+
+// ToArgsForFork returns arguments suitable for fork resume command.
+// Fork uses -s internally, so session mode flags are excluded.
+func (o *OpenCodeOptions) ToArgsForFork() []string {
+	var args []string
+	if o.Model != "" {
+		args = append(args, "-m", o.Model)
+	}
+	if o.Agent != "" {
+		args = append(args, "--agent", o.Agent)
+	}
+	return args
+}
+
+// NewOpenCodeOptions creates OpenCodeOptions with defaults from config
+func NewOpenCodeOptions(config *UserConfig) *OpenCodeOptions {
+	opts := &OpenCodeOptions{
+		SessionMode: "new",
+	}
+	if config != nil {
+		opts.Model = config.OpenCode.DefaultModel
+		opts.Agent = config.OpenCode.DefaultAgent
+	}
+	return opts
+}
+
+// UnmarshalOpenCodeOptions deserializes OpenCodeOptions from JSON wrapper
+func UnmarshalOpenCodeOptions(data json.RawMessage) (*OpenCodeOptions, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	var wrapper ToolOptionsWrapper
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return nil, err
+	}
+
+	if wrapper.Tool != "opencode" {
+		return nil, nil
+	}
+
+	var opts OpenCodeOptions
+	if err := json.Unmarshal(wrapper.Options, &opts); err != nil {
+		return nil, err
+	}
+
+	return &opts, nil
+}
+
+// OMPOptions holds per-session launch options for Oh My Pi.
+type OMPOptions struct {
+	SessionMode   string   `json:"session_mode,omitempty"`
+	ResumeID      string   `json:"resume_id,omitempty"`
+	NoSession     bool     `json:"no_session,omitempty"`
+	Model         string   `json:"model,omitempty"`
+	Models        []string `json:"models,omitempty"`
+	SmolModel     string   `json:"smol_model,omitempty"`
+	SlowModel     string   `json:"slow_model,omitempty"`
+	PlanModel     string   `json:"plan_model,omitempty"`
+	PrintThoughts bool     `json:"print_thoughts,omitempty"`
+	ApprovalMode  string   `json:"approval_mode,omitempty"`
+	AutoApprove   bool     `json:"auto_approve,omitempty"`
+	MaxTime       string   `json:"max_time,omitempty"`
+	Profile       string   `json:"profile,omitempty"`
+	FromClaude    bool     `json:"from_claude,omitempty"`
+	FromCodex     bool     `json:"from_codex,omitempty"`
+}
+
+func (o *OMPOptions) ToolName() string { return "omp" }
+
+func (o *OMPOptions) ToArgs() []string {
+	return o.toArgs(true)
+}
+
+func (o *OMPOptions) harnessArgs() []string {
+	return o.toArgs(false)
+}
+
+func (o *OMPOptions) sessionArgs() []string {
+	if o == nil {
+		return []string{"--continue"}
+	}
+	if o.NoSession {
+		return []string{"--no-session"}
+	}
+	switch o.SessionMode {
+	case "new":
+		return nil
+	case "resume":
+		args := []string{"--resume"}
+		if id := strings.TrimSpace(o.ResumeID); id != "" {
+			args = append(args, id)
+		}
+		return args
+	default:
+		return []string{"--continue"}
+	}
+}
+
+func (o *OMPOptions) toArgs(includeSession bool) []string {
+	if o == nil {
+		return nil
+	}
+	var args []string
+	if includeSession && o.NoSession {
+		args = append(args, "--no-session")
+	} else if includeSession {
+		switch o.SessionMode {
+		case "new":
+		case "resume":
+			args = append(args, "--resume")
+			if id := strings.TrimSpace(o.ResumeID); id != "" {
+				args = append(args, id)
+			}
+		default:
+			args = append(args, "--continue")
+		}
+	}
+	appendValue := func(flag, value string) {
+		if value = strings.TrimSpace(value); value != "" {
+			args = append(args, flag, value)
+		}
+	}
+	appendValue("--model", o.Model)
+	if len(o.Models) > 0 {
+		appendValue("--models", strings.Join(o.Models, ","))
+	}
+	appendValue("--smol", o.SmolModel)
+	appendValue("--slow", o.SlowModel)
+	appendValue("--plan", o.PlanModel)
+	if o.PrintThoughts {
+		args = append(args, "--print-thoughts")
+	}
+	appendValue("--approval-mode", o.ApprovalMode)
+	if o.AutoApprove {
+		args = append(args, "--auto-approve")
+	}
+	appendValue("--max-time", o.MaxTime)
+	appendValue("--profile", o.Profile)
+	if o.FromClaude {
+		args = append(args, "--from-claude")
+	}
+	if o.FromCodex {
+		args = append(args, "--from-codex")
+	}
+	return args
+}
+
+func NewOMPOptions(config *UserConfig) *OMPOptions {
+	opts := &OMPOptions{SessionMode: "continue"}
+	if config != nil {
+		opts.Model = config.OMP.DefaultModel
+		opts.Profile = config.OMP.DefaultProfile
+		opts.ApprovalMode = config.OMP.ApprovalMode
+		opts.SmolModel = config.OMP.SmolModel
+		opts.SlowModel = config.OMP.SlowModel
+		opts.PlanModel = config.OMP.PlanModel
+	}
+	return opts
+}
+
+func UnmarshalOMPOptions(data json.RawMessage) (*OMPOptions, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	var wrapper ToolOptionsWrapper
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return nil, err
+	}
+	if wrapper.Tool != "omp" {
+		return nil, nil
+	}
+	var opts OMPOptions
+	if err := json.Unmarshal(wrapper.Options, &opts); err != nil {
+		return nil, err
+	}
+	return &opts, nil
+}
+
+// CopilotOptions holds launch options for GitHub Copilot CLI sessions
+// (the standalone `copilot` binary from @github/copilot, not the older
+// `gh copilot` extension).
+type CopilotOptions struct {
+	// SessionMode: "new" (default) or "resume" (--resume).
+	// When "resume" and ResumeSessionID is empty, Copilot CLI shows its
+	// session picker; when set, agent-deck passes the ID through as
+	// --resume <id>.
+	SessionMode string `json:"session_mode,omitempty"`
+	// ResumeSessionID is the Copilot session ID for --resume (only used
+	// when SessionMode == "resume").
+	ResumeSessionID string `json:"resume_session_id,omitempty"`
+	// Model overrides the default Copilot model (e.g., "claude-opus-4.6",
+	// "gpt-5.2"). Passed as --model <value>.
+	Model string `json:"model,omitempty"`
+	// AllowAll enables --allow-all (equivalent to --allow-all-tools
+	// --allow-all-paths --allow-all-urls). Required for non-interactive
+	// scripting scenarios.
+	AllowAll bool `json:"allow_all,omitempty"`
+}
+
+// ToolName returns "copilot"
+func (o *CopilotOptions) ToolName() string {
+	return "copilot"
+}
+
+// ToArgs returns command-line arguments based on options
+func (o *CopilotOptions) ToArgs() []string {
+	var args []string
+	if o.SessionMode == "resume" {
+		args = append(args, "--resume")
+		if o.ResumeSessionID != "" {
+			args = append(args, o.ResumeSessionID)
+		}
+	}
+	if o.Model != "" {
+		args = append(args, "--model", o.Model)
+	}
+	if o.AllowAll {
+		args = append(args, "--allow-all")
+	}
+	return args
+}
+
+// NewCopilotOptions creates CopilotOptions with defaults from config
+func NewCopilotOptions(config *UserConfig) *CopilotOptions {
+	opts := &CopilotOptions{SessionMode: "new"}
+	if config != nil {
+		if config.Copilot.DefaultModel != "" {
+			opts.Model = config.Copilot.DefaultModel
+		}
+		if config.Copilot.AllowAll {
+			opts.AllowAll = true
+		}
+	}
+	return opts
+}
+
+// UnmarshalCopilotOptions deserializes CopilotOptions from JSON wrapper
+func UnmarshalCopilotOptions(data json.RawMessage) (*CopilotOptions, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	var wrapper ToolOptionsWrapper
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return nil, err
+	}
+
+	if wrapper.Tool != "copilot" {
+		return nil, nil
+	}
+
+	var opts CopilotOptions
+	if err := json.Unmarshal(wrapper.Options, &opts); err != nil {
+		return nil, err
+	}
+
+	return &opts, nil
+}
+
+// CrushOptions holds launch options for charmbracelet/crush CLI sessions
+// (Issue #940). Binary: `crush` from github.com/charmbracelet/crush.
+type CrushOptions struct {
+	// YoloMode enables --yolo flag (auto-accept all permission prompts).
+	// nil = inherit from config, true/false = explicit override.
+	YoloMode *bool `json:"yolo_mode,omitempty"`
+	// ResumeSessionID is the crush session ID for --session/-s flag.
+	// Empty means start a fresh session.
+	ResumeSessionID string `json:"resume_session_id,omitempty"`
+	// ContinueLast maps to --continue/-C (resume the most recent session).
+	// Mutually exclusive with ResumeSessionID at the crush CLI level; if
+	// both are set, ResumeSessionID wins (it is the more specific signal).
+	ContinueLast bool `json:"continue_last,omitempty"`
+}
+
+// ToolName returns "crush"
+func (o *CrushOptions) ToolName() string {
+	return "crush"
+}
+
+// ToArgs returns command-line arguments based on options.
+// Ordering matches the crush CLI flag groups (session first, then yolo).
+func (o *CrushOptions) ToArgs() []string {
+	var args []string
+	switch {
+	case o.ResumeSessionID != "":
+		args = append(args, "--session", o.ResumeSessionID)
+	case o.ContinueLast:
+		args = append(args, "--continue")
+	}
+	if o.YoloMode != nil && *o.YoloMode {
+		args = append(args, "--yolo")
+	}
+	return args
+}
+
+// NewCrushOptions creates CrushOptions with defaults from global config.
+func NewCrushOptions(config *UserConfig) *CrushOptions {
+	opts := &CrushOptions{}
+	if config != nil && config.Crush.YoloMode {
+		yolo := true
+		opts.YoloMode = &yolo
+	}
+	return opts
+}
+
+// UnmarshalCrushOptions deserializes CrushOptions from JSON wrapper.
+func UnmarshalCrushOptions(data json.RawMessage) (*CrushOptions, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	var wrapper ToolOptionsWrapper
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return nil, err
+	}
+
+	if wrapper.Tool != "crush" {
+		return nil, nil
+	}
+
+	var opts CrushOptions
+	if err := json.Unmarshal(wrapper.Options, &opts); err != nil {
+		return nil, err
+	}
+
+	return &opts, nil
+}
+
+// MuseOptions holds launch options for Muse Code CLI sessions.
+// Binary: `muse`. Interactive TUI.
+// Session resume (`muse resume <uuid>`) is a subcommand, not a flag, so it
+// is built by buildMuseResumeCommand in muse.go, not expressed here.
+type MuseOptions struct {
+	// YoloMode enables --yolo flag (disable approval + sandboxing and
+	// trust the workspace for the run).
+	// nil = inherit from config, true/false = explicit override.
+	YoloMode *bool `json:"yolo_mode,omitempty"`
+}
+
+// ToolName returns "muse"
+func (o *MuseOptions) ToolName() string {
+	return "muse"
+}
+
+// ToArgs returns command-line arguments based on options.
+func (o *MuseOptions) ToArgs() []string {
+	var args []string
+	if o.YoloMode != nil && *o.YoloMode {
+		args = append(args, "--yolo")
+	}
+	return args
+}
+
+// NewMuseOptions creates MuseOptions with defaults from global config.
+func NewMuseOptions(config *UserConfig) *MuseOptions {
+	opts := &MuseOptions{}
+	if config != nil && config.Muse.YoloMode {
+		yolo := true
+		opts.YoloMode = &yolo
+	}
+	return opts
+}
+
+// UnmarshalMuseOptions deserializes MuseOptions from JSON wrapper.
+func UnmarshalMuseOptions(data json.RawMessage) (*MuseOptions, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	var wrapper ToolOptionsWrapper
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return nil, err
+	}
+
+	if wrapper.Tool != "muse" {
+		return nil, nil
+	}
+
+	var opts MuseOptions
+	if err := json.Unmarshal(wrapper.Options, &opts); err != nil {
+		return nil, err
+	}
+
+	return &opts, nil
+}
+
+// StripResumeFields removes session-specific fields (resume_session_id,
+// session_mode) from serialized ToolOptionsJSON so that a new session
+// inheriting another session's settings starts fresh instead of resuming
+// the source conversation.  Other options (skip_permissions, etc.) are
+// preserved.  Returns the input unchanged when it is nil/empty or when
+// unmarshalling fails.
+func StripResumeFields(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return raw
+	}
+
+	var wrapper struct {
+		Tool    string         `json:"tool"`
+		Options map[string]any `json:"options"`
+	}
+	if err := json.Unmarshal(raw, &wrapper); err != nil {
+		return raw
+	}
+
+	delete(wrapper.Options, "resume_session_id")
+	delete(wrapper.Options, "session_mode")
+
+	cleaned, err := json.Marshal(wrapper)
+	if err != nil {
+		return raw
+	}
+	return cleaned
+}
+
+// UnmarshalClaudeOptions deserializes ClaudeOptions from JSON wrapper
+func UnmarshalClaudeOptions(data json.RawMessage) (*ClaudeOptions, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	var wrapper ToolOptionsWrapper
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return nil, err
+	}
+
+	if wrapper.Tool != "claude" {
+		return nil, nil
+	}
+
+	var opts ClaudeOptions
+	if err := json.Unmarshal(wrapper.Options, &opts); err != nil {
+		return nil, err
+	}
+
+	return &opts, nil
+}

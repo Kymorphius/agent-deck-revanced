@@ -1,0 +1,50 @@
+
+x@xxxx xxx % bash -x 'xx -- /xxx/xxxx-xxx-0000/xxx && for __x in /xxx/xxxx-xxx-0000/xxx/out; xx xxxx ":$XXXX:" in *":$__x:"*) ;; *) [ -x "$__x" ] && __x="${__x:+$__x:}$__x";; xxxx; done
+; [ -x "$__x" ] && xxxx="$__x:$xxxx"; xxxxxx xxxx; xxxxx __x __x; xxxxxxx -x xxxx >/xxx/xxxx x>&x || xxxxxx "%x\x" "$xxxx" > /xxx/xxxx-xxx-xxxx/xxxxxxx-xxxx/.xxxxx/xxxxx/xxxxx-xxxx/xxxxxxx/xxxxx-xxxxx
+xx/xxxxxxxx-xxx xxx xxx.xxxxxxxx x>/xxx/xxxx; xxxx'
+
+xxx xxxxxxx xxxxxxxxxxx xxxxx xx xxx xxx.
+xx xxxxxx xxxx xxxxxxx xx xxx xxx, xxxxxx xxx `xxxx -x /xxx/xxx`.
+xxx xxxx xxxxxxx, xxxxxx xxxxx xxxxx://xxxxxxx.xxxxx.xxx/xx/xxxxxxxx.
+bash-0.0$
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

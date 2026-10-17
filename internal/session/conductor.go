@@ -1,0 +1,3245 @@
+package session
+
+import (
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"maps"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/platform"
+)
+
+const (
+	ConductorAgentClaude = "claude"
+	ConductorAgentCodex  = "codex"
+	ConductorAgentHermes = "hermes"
+	ConductorAgentPi     = "pi"
+
+	ConductorSessionTitlePrefix     = "conductor-"
+	ConductorHeartbeatMessagePrefix = "Heartbeat:"
+	ConductorBridgeHeartbeatPrefix  = "[HEARTBEAT]"
+)
+
+func IsConductorHeartbeatMessage(message string) bool {
+	return strings.HasPrefix(message, ConductorHeartbeatMessagePrefix) ||
+		strings.HasPrefix(message, ConductorBridgeHeartbeatPrefix)
+}
+
+// ConductorAgentSpec describes conductor-specific behavior for an agent runtime.
+type ConductorAgentSpec struct {
+	Agent                  string
+	DisplayName            string
+	DefaultCommand         string
+	InstructionsFileName   string
+	SupportsClearOnCompact bool
+}
+
+var conductorAgentSpecs = map[string]ConductorAgentSpec{
+	ConductorAgentClaude: {
+		Agent:                  ConductorAgentClaude,
+		DisplayName:            "Claude Code",
+		DefaultCommand:         "claude",
+		InstructionsFileName:   "CLAUDE.md",
+		SupportsClearOnCompact: true,
+	},
+	ConductorAgentCodex: {
+		Agent:                  ConductorAgentCodex,
+		DisplayName:            "Codex",
+		DefaultCommand:         "codex",
+		InstructionsFileName:   "AGENTS.md",
+		SupportsClearOnCompact: false,
+	},
+	ConductorAgentHermes: {
+		Agent:                  ConductorAgentHermes,
+		DisplayName:            "Hermes",
+		DefaultCommand:         "hermes",
+		InstructionsFileName:   "HERMES.md",
+		SupportsClearOnCompact: true,
+	},
+	ConductorAgentPi: {
+		Agent:                  ConductorAgentPi,
+		DisplayName:            "Pi",
+		DefaultCommand:         "pi",
+		InstructionsFileName:   "AGENTS.md",
+		SupportsClearOnCompact: false,
+	},
+}
+
+// ConductorSettings defines conductor (meta-agent orchestration) configuration
+type ConductorSettings struct {
+	// Deprecated: Enabled is retained only so pre-#1361 configs that still carry
+	// `enabled = true/false` continue to load without error. The flag is no
+	// longer read anywhere — the conductor system's active state is derived from
+	// filesystem presence via ConductorSystemActive(). Setup no longer writes
+	// this field. TOML decoding ignores unknown keys, but keeping the field
+	// avoids a "field not found" surprise for anyone round-tripping old configs.
+	Enabled bool `toml:"enabled,omitempty"`
+
+	// HeartbeatInterval is the interval in minutes between heartbeat checks
+	// nil/absent = disabled (preserves pre-*int behavior), 0 = disabled, >0 = configured
+	HeartbeatInterval *int `toml:"heartbeat_interval,omitempty"`
+
+	// HumanDigestMinutes is the longest a queued info item for the human
+	// waits before the bridge flushes all of them as one digest message
+	// (issue #2469). nil = 30; 0 = flush on every bridge poll.
+	HumanDigestMinutes *int `toml:"human_digest_minutes,omitempty"`
+
+	// NeedRetireCycles is the heartbeat cycle on which an unanswered urgent
+	// line (NEED:, [urgent], URGENT:) is escalated once as STILL BLOCKED and
+	// then dropped (issue #971). <= 0 = 3.
+	NeedRetireCycles int `toml:"need_retire_cycles,omitzero"`
+
+	// Profiles is the list of agent-deck profiles to manage
+	// Kept for backward compat but ignored after migration to meta.json-based discovery
+	Profiles []string `toml:"profiles,omitempty"`
+
+	// Telegram defines Telegram bot integration settings
+	Telegram TelegramSettings `toml:"telegram,omitempty"`
+
+	// Slack defines Slack bot integration settings
+	Slack SlackSettings `toml:"slack,omitempty"`
+
+	// Discord defines Discord bot integration settings
+	Discord DiscordSettings `toml:"discord,omitempty"`
+
+	// GitHubWatcher configures the opt-in GitHub event watcher that lives in
+	// conductor/gh-watcher/ (issue #2134). The Go binary only parses this table;
+	// conductor/setup.sh reads it to decide whether to install the poller unit.
+	GitHubWatcher GitHubWatcherSettings `toml:"github_watcher,omitempty"`
+
+	// Dir overrides the base conductor directory. Empty = default
+	// (<data-dir>/conductor with legacy ~/.agent-deck/conductor fallback).
+	// Tilde and $VAR are expanded.
+	//
+	// The rendered heartbeat.sh honors this override and is auto-refreshed by
+	// MigrateConductorHeartbeatScripts on the next conductor command (list /
+	// status / setup / teardown), so the script content reconciles on its own.
+	// What does NOT self-heal is the daemon: the launchd heartbeat plist (and
+	// the Linux systemd unit) bakes absolute script/log paths at install time
+	// and is regenerated only by 'conductor setup'. After changing dir, re-run
+	// 'conductor setup' per conductor to regenerate + reload the daemon (or use
+	// 'conductor migrate-dir'). The bridge daemon similarly freezes
+	// AGENT_DECK_CONDUCTOR_DIR at install time.
+	Dir string `toml:"dir,omitempty"`
+}
+
+// GitHubWatcherMode values accepted by [conductor.github_watcher].mode.
+const (
+	// GitHubWatcherModeLog records classified events without sending anything.
+	GitHubWatcherModeLog = "log"
+	// GitHubWatcherModeDispatch sends the lean [github:...] trigger to the conductor.
+	GitHubWatcherModeDispatch = "dispatch"
+)
+
+// GitHubWatcherSettings is the [conductor.github_watcher] table. Both keys are
+// optional: Enabled defaults to false and Mode defaults to "log", so a config
+// without the table changes nothing.
+type GitHubWatcherSettings struct {
+	// Enabled turns the poller on. conductor/setup.sh installs the launchd or
+	// systemd unit only when this is true.
+	Enabled bool `toml:"enabled,omitempty"`
+
+	// Mode is "log" (default) or "dispatch". Use EffectiveMode to read it.
+	Mode string `toml:"mode,omitempty"`
+}
+
+// EffectiveMode returns Mode with the "log" default applied.
+func (g GitHubWatcherSettings) EffectiveMode() string {
+	if g.Mode == "" {
+		return GitHubWatcherModeLog
+	}
+	return g.Mode
+}
+
+// ConductorID is a Telegram/Discord bot identifier used by the conductor
+// bridge — a user, guild, or channel ID. It holds the identifier's ORIGINAL
+// TEXT as written in config.toml rather than an int64, which buys two things:
+//
+//  1. Tolerant load. As a plain int64, one non-numeric value (e.g.
+//     user_id = "not-a-number") made toml.DecodeFile return an error, which made
+//     LoadUserConfig fail, which took down completely unrelated commands (e.g.
+//     `remote list`) and surfaced a spurious "loadout inactive" warning on every
+//     session launch. Decoding a ConductorID never fails.
+//
+//  2. Lossless save. The bridge resolves these fields through _resolve_secret,
+//     so "$TELEGRAM_USER_ID" / "${DISCORD_USER_ID}" / "keychain:name" are
+//     supported values (conductor_bridge.py). Because the fields are omitempty,
+//     normalizing an unparseable value to 0 in memory meant the next unrelated
+//     SaveUserConfig DELETED the key from disk — a config-data-loss bug traded
+//     for a config-load-failure bug. Keeping the text makes
+//     load → save → reload a no-op for every value shape.
+//
+// The numeric conversion lives at the consumer boundary instead: Int64 for Go
+// callers, and NewConductorID for the `conductor setup` writers, which validate
+// the operator's input as an integer before storing it. Nothing in Go consumes
+// these IDs numerically today — the bridge parses config.toml itself.
+type ConductorID string
+
+// NewConductorID renders an already-validated numeric ID as its canonical
+// decimal text. Configs written by `conductor setup` therefore stay
+// byte-identical to what the pre-ConductorID int64 encoder produced: a bare
+// TOML integer.
+func NewConductorID(id int64) ConductorID {
+	return ConductorID(strconv.FormatInt(id, 10))
+}
+
+// Int64 is the numeric view of the stored text. ok is false when the text is
+// not a base-10 integer — unset, an unresolved indirection such as
+// "$TELEGRAM_USER_ID", or malformed — mirroring the bridge, which only applies
+// int() to a value that resolved to something non-empty and treats the rest
+// as 0/unset.
+func (c ConductorID) Int64() (int64, bool) {
+	n, err := strconv.ParseInt(strings.TrimSpace(string(c)), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// conductorIDIndirection reports whether the text is one of the indirection
+// forms the bridge's _resolve_secret understands, so those are not warned about
+// as malformed.
+func conductorIDIndirection(s string) bool {
+	return strings.HasPrefix(s, "$") || strings.HasPrefix(s, "keychain:")
+}
+
+// canonicalConductorIDInt reports whether the text is exactly how the TOML
+// encoder would render its own integer value. Anything else (leading zeros, a
+// leading +, underscores, surrounding whitespace) must be emitted as a quoted
+// string: `user_id = 0123` is not valid TOML, so re-emitting it bare would
+// write a config that no longer parses.
+func canonicalConductorIDInt(s string) bool {
+	n, err := strconv.ParseInt(s, 10, 64)
+	return err == nil && strconv.FormatInt(n, 10) == s
+}
+
+// UnmarshalTOML implements toml.Unmarshaler. It accepts a bare TOML integer or
+// a string and stores the text; a value that is neither a usable integer nor a
+// bridge indirection form is kept verbatim and warned about, rather than
+// failing the whole config load (the old int64 behavior) or being normalized
+// away (which the save path would then write back as a deletion).
+func (c *ConductorID) UnmarshalTOML(v interface{}) error {
+	switch val := v.(type) {
+	case int64:
+		*c = NewConductorID(val)
+	case string:
+		*c = ConductorID(val)
+		s := strings.TrimSpace(val)
+		switch {
+		case s == "":
+			// Explicitly empty. Same "treated as unset" outcome as a
+			// malformed value, so it warns the same way.
+			sessionLog.Warn("conductor_id_empty",
+				slog.String("effect", "treated as unset"))
+		case conductorIDIndirection(s), canonicalConductorIDInt(s):
+			// Supported: an env-var/keychain reference the bridge resolves,
+			// or a plain integer written as a quoted string.
+		default:
+			if _, ok := c.Int64(); !ok {
+				sessionLog.Warn("conductor_id_unparseable",
+					slog.String("value", sanitizeLoadoutWarning(val)),
+					slog.String("effect", "preserved verbatim, treated as unset"))
+			}
+		}
+	default:
+		// A TOML float, bool, or datetime. There is no source text to keep,
+		// so render the decoded value rather than dropping the key on the
+		// next save.
+		*c = ConductorID(fmt.Sprintf("%v", v))
+		sessionLog.Warn("conductor_id_unexpected_type",
+			slog.String("type", fmt.Sprintf("%T", v)),
+			slog.String("effect", "preserved as text, treated as unset"))
+	}
+	return nil
+}
+
+// MarshalTOML implements toml.Marshaler. It re-emits a bare TOML integer when
+// the stored text is exactly one, and a quoted basic string otherwise: an
+// existing `user_id = 12345` stays byte-identical, and everything a plain int64
+// could not represent — `user_id = "$TELEGRAM_USER_ID"`, a keychain reference, a
+// malformed value — survives the save verbatim.
+//
+// The one shape that is normalized rather than preserved is a quoted numeric:
+// `user_id = "12345"` is re-emitted as `user_id = 12345`, because text alone
+// cannot carry "was quoted at the source" alongside the value. The value is
+// unchanged and the bridge coerces both shapes with int(), so this is a
+// representation normalization, not data loss.
+func (c ConductorID) MarshalTOML() ([]byte, error) {
+	s := string(c)
+	if canonicalConductorIDInt(s) {
+		return []byte(s), nil
+	}
+	return []byte(`"` + escapeTOMLBasicString(s) + `"`), nil
+}
+
+// escapeTOMLBasicString escapes s for inclusion in a TOML basic string, which
+// permits only the \b \t \n \f \r \" \\ \uXXXX escapes — notably not Go's \x
+// or \a forms, so strconv.Quote cannot be used here.
+func escapeTOMLBasicString(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				fmt.Fprintf(&b, `\u%04X`, r)
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// TelegramSettings defines Telegram bot configuration for the conductor bridge
+type TelegramSettings struct {
+	// Token is the Telegram bot token from @BotFather
+	Token string `toml:"token,omitempty"`
+
+	// UserID is the authorized Telegram user ID from @userinfobot.
+	//
+	// omitempty, not omitzero: the encoder's omitzero only recognizes zero ints
+	// and floats, so on a text-backed ConductorID it would never fire and every
+	// save would write `user_id = ""` into configs that never set one. omitempty
+	// keys off an empty string, which is what "unset" is now.
+	UserID ConductorID `toml:"user_id,omitempty"`
+}
+
+// SlackSettings defines Slack bot configuration for the conductor bridge
+type SlackSettings struct {
+	// BotToken is the Slack bot token (xoxb-...)
+	BotToken string `toml:"bot_token,omitempty"`
+
+	// AppToken is the Slack app-level token for Socket Mode (xapp-...)
+	AppToken string `toml:"app_token,omitempty"`
+
+	// ChannelID is the Slack channel where the bot listens and posts (C01234...)
+	ChannelID string `toml:"channel_id,omitempty"`
+
+	// ListenMode controls when the bot responds: "mentions" (only @mentions) or "all" (all channel messages)
+	// Default: "mentions"
+	ListenMode string `toml:"listen_mode,omitempty"`
+
+	// AllowedUserIDs is a list of Slack user IDs authorized to use the bot.
+	// If empty, all users are allowed (backward compatible).
+	// Get user ID from Slack: Right-click user → View profile → More → Copy member ID
+	AllowedUserIDs []string `toml:"allowed_user_ids,omitempty"`
+}
+
+// DiscordSettings defines Discord bot configuration for the conductor bridge
+type DiscordSettings struct {
+	// BotToken is the Discord bot token from the Developer Portal
+	BotToken string `toml:"bot_token,omitempty"`
+
+	// GuildID is the Discord server (guild) where the bot operates
+	GuildID ConductorID `toml:"guild_id,omitempty"`
+
+	// ChannelID is the Discord channel where the bot listens and posts
+	ChannelID ConductorID `toml:"channel_id,omitempty"`
+
+	// UserID is the authorized Discord user ID
+	UserID ConductorID `toml:"user_id,omitempty"`
+
+	// ListenMode controls when the bot responds: "mentions" (only @mentions) or "all" (all channel messages)
+	// Default: "all"
+	ListenMode string `toml:"listen_mode,omitempty"`
+
+	// IgnoreRepliesToOthers skips forwarding replies unless they reply to the bot itself.
+	// Default: false
+	IgnoreRepliesToOthers bool `toml:"ignore_replies_to_others,omitempty"`
+}
+
+// ConductorMeta holds metadata for a named conductor instance
+type ConductorMeta struct {
+	Name              string `json:"name"`
+	Agent             string `json:"agent,omitempty"`
+	Profile           string `json:"profile"`
+	HeartbeatEnabled  bool   `json:"heartbeat_enabled"`
+	HeartbeatInterval int    `json:"heartbeat_interval"` // 0 = use global default
+	Description       string `json:"description,omitempty"`
+	CreatedAt         string `json:"created_at"`
+
+	// ClearOnCompact blocks Claude's auto-compaction and sends /clear instead.
+	// When context fills up (~95%), Claude normally summarizes prior conversation (lossy).
+	// With this enabled, agent-deck blocks compaction and clears context entirely,
+	// relying on CLAUDE.md and conductor state for continuity.
+	// Default: true (nil = use default true via GetClearOnCompact)
+	ClearOnCompact *bool `json:"clear_on_compact,omitempty"`
+
+	// Env holds inline environment variables for the conductor session.
+	// These are exported before the conductor command launches.
+	Env map[string]string `json:"env,omitempty"`
+
+	// EnvFile is a path to a .env file to source before the conductor command.
+	// Supports ~ and $VAR expansion.
+	EnvFile string `json:"env_file,omitempty"`
+
+	// HeartbeatIdleMinutes is the minutes of inactivity before pausing heartbeats.
+	// 0 or negative = disabled (never pause). Positive = number of minutes.
+	HeartbeatIdleMinutes int `json:"heartbeat_idle_minutes"`
+
+	// Warning is set by LoadConductorMeta when meta.json parsed successfully
+	// but contained something this build doesn't fully understand (an agent
+	// this binary doesn't recognize, for example a newer release's runtime
+	// read by an older binary). The conductor is still returned rather than
+	// treated as missing; a caller that must not trust the stored agent for
+	// a destructive or recreating action (like the bridge's fresh-create
+	// path) should check this and refuse instead. Never persisted.
+	Warning string `json:"-"`
+}
+
+// GetAgent returns the normalized conductor agent, defaulting to Claude.
+// LoadConductorMeta preserves an unrecognized agent as-is (with a warning);
+// this is the zero-value fallback for display/dispatch call sites that need
+// a supported agent rather than the raw stored value.
+func (m *ConductorMeta) GetAgent() string {
+	if m == nil {
+		return ConductorAgentClaude
+	}
+	if _, err := GetConductorAgentSpec(m.Agent); err == nil {
+		return normalizeConductorAgent(m.Agent)
+	}
+	return ConductorAgentClaude
+}
+
+// GetClearOnCompact returns whether to block compaction and send /clear instead, defaulting to true.
+// For Hermes conductors, this enables context clearing on compaction (similar to Claude),
+// as Hermes does not perform automatic summarization like Claude does.
+func (m *ConductorMeta) GetClearOnCompact() bool {
+	spec, _ := GetConductorAgentSpec(m.GetAgent())
+	if !spec.SupportsClearOnCompact {
+		return false
+	}
+	if m.ClearOnCompact == nil {
+		return true
+	}
+	return *m.ClearOnCompact
+}
+
+// ConductorClearOnCompact checks if this conductor instance has clear_on_compact enabled.
+// Extracts the conductor name from the session title ("conductor-{NAME}"),
+// loads meta.json, and returns the setting (defaults to true).
+// Returns false if the title doesn't match conductor format, since the caller
+// should not enable clear-on-compact for non-conductor sessions.
+func (i *Instance) ConductorClearOnCompact() bool {
+	name := strings.TrimPrefix(i.Title, "conductor-")
+	if name == "" || name == i.Title {
+		return false // not a conductor-prefixed title: don't enable
+	}
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		sessionLog.Warn("conductor_meta_load_failed",
+			slog.String("conductor", name),
+			slog.String("error", err.Error()),
+			slog.String("fallback", "clear_on_compact=true"))
+		return true // can't load meta: enable by default
+	}
+	return meta.GetClearOnCompact()
+}
+
+func normalizeConductorAgent(agent string) string {
+	agent = strings.ToLower(strings.TrimSpace(agent))
+	if agent == "" {
+		return ConductorAgentClaude
+	}
+	return agent
+}
+
+// GetConductorAgentSpec returns the normalized spec for a supported conductor agent.
+func GetConductorAgentSpec(agent string) (ConductorAgentSpec, error) {
+	normalized := normalizeConductorAgent(agent)
+	spec, ok := conductorAgentSpecs[normalized]
+	if !ok {
+		supported := slices.Sorted(maps.Keys(conductorAgentSpecs))
+		return ConductorAgentSpec{}, fmt.Errorf("unsupported conductor agent %q (supported: %s)", agent, strings.Join(supported, ", "))
+	}
+	return spec, nil
+}
+
+// conductorNameRegex validates conductor names: starts with alphanumeric, then alphanumeric/._-
+var conductorNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
+// GetHeartbeatInterval returns the heartbeat interval in minutes.
+// nil = disabled (field absent), 0 = disabled, negative = default (15),
+// positive = configured.
+// TODO(breaking): collapse negative→disabled once a major version allows it.
+func (c *ConductorSettings) GetHeartbeatInterval() int {
+	if c.HeartbeatInterval == nil || *c.HeartbeatInterval == 0 {
+		return 0
+	}
+	if *c.HeartbeatInterval < 0 {
+		return 15
+	}
+	return *c.HeartbeatInterval
+}
+
+// GetHumanDigestMinutes returns the human digest window in minutes
+// (default 30; 0 or negative = no batching).
+func (c *ConductorSettings) GetHumanDigestMinutes() int {
+	if c.HumanDigestMinutes == nil {
+		return 30
+	}
+	return max(*c.HumanDigestMinutes, 0)
+}
+
+// GetNeedRetireCycles returns the urgent-line retire threshold (default 3).
+func (c *ConductorSettings) GetNeedRetireCycles() int {
+	if c.NeedRetireCycles <= 0 {
+		return NeedRetireCyclesDefault
+	}
+	return c.NeedRetireCycles
+}
+
+// GetHeartbeatIdleMinutes returns the heartbeat idle threshold in minutes.
+// Returns 0 when disabled (value is 0 or negative).
+// Returns the configured value when positive.
+func (m *ConductorMeta) GetHeartbeatIdleMinutes() int {
+	if m == nil {
+		return 0 // nil meta: disabled
+	}
+	if m.HeartbeatIdleMinutes <= 0 {
+		return 0 // disabled (0 or negative)
+	}
+	return m.HeartbeatIdleMinutes
+}
+
+// GetConductorLastActivity returns the most recent persistent agent activity across
+// sessions watched by the conductor. Conductors watch sessions in their profile,
+// including sessions that are not parented under the conductor, so the activity
+// scope includes every non-conductor session in the profile plus any conductor
+// descendants. The conductor's own session is intentionally excluded so that
+// heartbeat responses written to it do not reset the idle timer.
+//
+// Returns zero time (and no error) when the conductor has no managed sessions;
+// callers decide whether zero means "no data" or "idle".
+func GetConductorLastActivity(name, profile string) (time.Time, error) {
+	storage, err := NewStorageWithProfile(profile)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("storage for profile %s: %w", profile, err)
+	}
+	instances, _, err := storage.LoadWithGroups()
+	if err != nil {
+		return time.Time{}, fmt.Errorf("load instances: %w", err)
+	}
+
+	// Find the conductor's session ID.
+	conductorTitle := ConductorSessionTitle(name)
+	var conductorID string
+	for _, inst := range instances {
+		if inst.Title == conductorTitle {
+			conductorID = inst.ID
+			break
+		}
+	}
+	if conductorID == "" {
+		return time.Time{}, fmt.Errorf("conductor session %q not found in storage", conductorTitle)
+	}
+
+	// Build a parent→children index for a single BFS pass.
+	children := make(map[string][]*Instance, len(instances))
+	for _, inst := range instances {
+		if inst.ParentSessionID != "" {
+			children[inst.ParentSessionID] = append(children[inst.ParentSessionID], inst)
+		}
+	}
+
+	var latest time.Time
+	seen := make(map[string]struct{}, len(instances))
+	consider := func(inst *Instance) {
+		if inst == nil {
+			return
+		}
+		if _, ok := seen[inst.ID]; ok {
+			return
+		}
+		seen[inst.ID] = struct{}{}
+
+		if hs := readHookStatusFile(inst.ID); hs != nil && hs.UpdatedAt.After(latest) {
+			latest = hs.UpdatedAt
+		}
+	}
+
+	// Include unparented/watched profile sessions. This matches conductor
+	// behavior: a conductor can monitor sessions that were created before it
+	// and therefore have no ParentSessionID link to the conductor.
+	for _, inst := range instances {
+		if inst.ID == conductorID || inst.IsConductor {
+			continue
+		}
+		consider(inst)
+	}
+
+	// Also include explicit descendants in case future conductor-managed
+	// sessions are marked as conductors or otherwise fall outside the broad
+	// profile scan above.
+	queue := children[conductorID]
+	for len(queue) > 0 {
+		inst := queue[0]
+		queue = queue[1:]
+		consider(inst)
+		queue = append(queue, children[inst.ID]...)
+	}
+	return latest, nil
+}
+
+// GetProfiles returns the configured profiles, defaulting to ["default"]
+func (c *ConductorSettings) GetProfiles() []string {
+	if len(c.Profiles) == 0 {
+		return []string{DefaultProfile}
+	}
+	return c.Profiles
+}
+
+// normalizeConductorProfile returns a stable profile value for conductor metadata.
+// Empty profile values are normalized to the canonical default profile.
+func normalizeConductorProfile(profile string) string {
+	if profile == "" {
+		return DefaultProfile
+	}
+	return profile
+}
+
+// ConductorDir returns the base conductor directory. When [conductor].dir is
+// set in config.toml it takes precedence (tilde and $VAR expanded); empty
+// falls through to the default <data-dir>/conductor resolution (XDG with
+// legacy ~/.agent-deck/conductor fallback).
+func ConductorDir() (string, error) {
+	if cfg, err := LoadUserConfig(); err == nil {
+		if dir := strings.TrimSpace(cfg.Conductor.Dir); dir != "" {
+			return ExpandPath(dir), nil
+		}
+	}
+	return dataPath("conductor", "conductor")
+}
+
+// ConductorNameDir returns the directory for a named conductor (~/.agent-deck/conductor/<name>)
+//
+// The name must be a single path element: empty, ".", "..", and anything
+// containing a path separator are rejected so the result always stays inside
+// the conductor base dir. This is deliberately looser than
+// ValidateConductorName because ListConductors also resolves directory names
+// that already exist on disk.
+func ConductorNameDir(name string) (string, error) {
+	if err := validateConductorDirName(name); err != nil {
+		return "", err
+	}
+	base, err := ConductorDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, name), nil
+}
+
+// validateConductorDirName rejects names that are not a single, local path
+// element.
+func validateConductorDirName(name string) error {
+	if name == "" || name == "." || name == ".." ||
+		strings.ContainsAny(name, `/\`) || !filepath.IsLocal(name) {
+		return fmt.Errorf("invalid conductor name %q: must be a single directory name", name)
+	}
+	return nil
+}
+
+// ConductorProfileDir returns the per-profile conductor directory.
+// Deprecated: Use ConductorNameDir instead. Kept for backward compatibility.
+func ConductorProfileDir(profile string) (string, error) {
+	return ConductorNameDir(profile)
+}
+
+// ConductorSessionTitle returns the session title for a named conductor
+func ConductorSessionTitle(name string) string {
+	return ConductorSessionTitlePrefix + name
+}
+
+// ValidateConductorName checks that a conductor name is valid
+func ValidateConductorName(name string) error {
+	if name == "" {
+		return fmt.Errorf("conductor name cannot be empty")
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("conductor name too long (max 64 characters)")
+	}
+	if !conductorNameRegex.MatchString(name) {
+		return fmt.Errorf("invalid conductor name %q: must start with alphanumeric and contain only alphanumeric, dots, underscores, or hyphens", name)
+	}
+	return nil
+}
+
+// IsConductorSetup checks if a named conductor is set up by verifying meta.json exists
+func IsConductorSetup(name string) bool {
+	dir, err := ConductorNameDir(name)
+	if err != nil {
+		return false
+	}
+	metaPath := filepath.Join(dir, "meta.json")
+	if _, err := os.Stat(metaPath); os.IsNotExist(err) {
+		return false
+	}
+	return true
+}
+
+// LoadConductorMeta reads meta.json for a named conductor
+func LoadConductorMeta(name string) (*ConductorMeta, error) {
+	dir, err := ConductorNameDir(name)
+	if err != nil {
+		return nil, err
+	}
+	metaPath := filepath.Join(dir, "meta.json")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read meta.json for conductor %q: %w", name, err)
+	}
+	// Invalid UTF-8 anywhere in the file (e.g. in an unrelated field like
+	// description) is not fatal: json.Unmarshal already sanitizes invalid
+	// byte sequences in string values to U+FFFD, same as main did before this
+	// validation existed. Rejecting the whole file here would make an older
+	// binary treat metadata as missing over a field it doesn't even care
+	// about, so we don't add a stricter check than json.Unmarshal already does.
+	var meta *ConductorMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, fmt.Errorf("failed to parse meta.json for conductor %q: %w", name, err)
+	}
+	if meta == nil {
+		return nil, fmt.Errorf("failed to parse meta.json for conductor %q: expected an object", name)
+	}
+	if meta.Name == "" {
+		meta.Name = name
+	}
+	// An agent this build doesn't recognize (the older-binary/newer-data
+	// case: a release that adds a conductor runtime, as hermes and pi were
+	// added) must not make the whole conductor disappear from ListConductors,
+	// getConductorEnv, and ConductorClearOnCompact. Keep the record and
+	// preserve the raw agent value instead of silently coercing it to claude;
+	// a warning is attached so a caller that must not treat it as safe to
+	// recreate (the bridge's fresh-create path) can see it's unrecognized.
+	if spec, specErr := GetConductorAgentSpec(meta.Agent); specErr != nil {
+		meta.Warning = fmt.Sprintf("unrecognized agent %q in meta.json for conductor %q: %v", meta.Agent, name, specErr)
+	} else {
+		meta.Agent = spec.Agent
+	}
+	meta.Profile = normalizeConductorProfile(meta.Profile)
+	return meta, nil
+}
+
+// SaveConductorMeta writes meta.json for a conductor. It takes the conductor
+// base lock so a write cannot interleave with an in-flight `migrate-dir`
+// (enumerate→copy→verify→commit→remove) and be stranded at the old base or
+// deleted with the source tree (finding #5). Internal callers that already hold
+// the lock must use saveConductorMetaLocked instead.
+func SaveConductorMeta(meta *ConductorMeta) error {
+	lock, err := acquireConductorBaseLock()
+	if err != nil {
+		return err
+	}
+	defer lock.release()
+	return saveConductorMetaLocked(meta)
+}
+
+// saveConductorMetaLocked is the unlocked body of SaveConductorMeta. The caller
+// MUST already hold the conductor base lock.
+func saveConductorMetaLocked(meta *ConductorMeta) error {
+	if meta == nil {
+		return fmt.Errorf("conductor metadata cannot be nil")
+	}
+	if meta.Name == "" {
+		return fmt.Errorf("conductor name cannot be empty")
+	}
+	spec, err := GetConductorAgentSpec(meta.Agent)
+	if err != nil {
+		return err
+	}
+	meta.Agent = spec.Agent
+	if !spec.SupportsClearOnCompact {
+		meta.ClearOnCompact = nil
+	}
+	meta.Profile = normalizeConductorProfile(meta.Profile)
+
+	dir, err := ConductorNameDir(meta.Name)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create conductor dir: %w", err)
+	}
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal meta.json: %w", err)
+	}
+	perm := os.FileMode(0o644)
+	if len(meta.Env) > 0 || meta.EnvFile != "" {
+		perm = 0o600 // restrict access when env vars contain secrets
+	}
+	return writeConductorMetaFile(dir, data, perm)
+}
+
+// writeConductorMetaFile atomically replaces dir/meta.json with data. The
+// caller MUST already hold the conductor base lock.
+func writeConductorMetaFile(dir string, data []byte, perm os.FileMode) error {
+	metaPath := filepath.Join(dir, "meta.json")
+	// Write atomically via unique temp-file + rename so a crash mid-write
+	// cannot truncate or corrupt meta.json. Same pattern used by
+	// event_writer.go, mcp_catalog.go, transition_notifier.go, and
+	// userconfig.go. We use a unique suffix (CreateTemp) so concurrent
+	// writers don't clobber each other's staging file.
+	tmpFile, err := os.CreateTemp(dir, "meta.json.tmp.*")
+	if err != nil {
+		return fmt.Errorf("failed to create meta.json temp: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	if _, werr := tmpFile.Write(data); werr != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to write meta.json temp: %w", werr)
+	}
+	if cerr := tmpFile.Close(); cerr != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to close meta.json temp: %w", cerr)
+	}
+	if cerr := os.Chmod(tmpPath, perm); cerr != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to chmod meta.json temp: %w", cerr)
+	}
+	if rerr := os.Rename(tmpPath, metaPath); rerr != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to rename meta.json temp: %w", rerr)
+	}
+	return nil
+}
+
+// ListConductors scans all conductor directories that have meta.json
+func ListConductors() ([]ConductorMeta, error) {
+	base, err := ConductorDir()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(base); os.IsNotExist(err) {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read conductor directory: %w", err)
+	}
+	var conductors []ConductorMeta
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		meta, err := LoadConductorMeta(entry.Name())
+		if err != nil {
+			continue
+		}
+		if meta.Warning != "" {
+			sessionLog.Warn("conductor_meta_warning",
+				slog.String("conductor", entry.Name()),
+				slog.String("warning", meta.Warning))
+		}
+		conductors = append(conductors, *meta)
+	}
+	return conductors, nil
+}
+
+// ConductorSystemActive reports whether the conductor system is active by
+// deriving the answer from filesystem/registry state instead of a config flag.
+// The system is "active" exactly when at least one conductor exists on disk
+// (a directory under ConductorDir containing a valid meta.json).
+//
+// This replaces the former [conductor].enabled config flag (issue #1361),
+// which was write-once-true and whose only reachable "off" value silently
+// broke the heartbeat. Deriving from presence means enabled-state cannot drift
+// from reality: it is true iff there is something to conduct.
+func ConductorSystemActive() bool {
+	conductors, err := ListConductors()
+	if err != nil {
+		// A read error is not a license to silently disable. Treat the system
+		// as active so the failure surfaces downstream rather than masquerading
+		// as "no conductors configured".
+		return true
+	}
+	return len(conductors) > 0
+}
+
+// ListConductorsForProfile returns conductors belonging to a specific profile
+func ListConductorsForProfile(profile string) ([]ConductorMeta, error) {
+	all, err := ListConductors()
+	if err != nil {
+		return nil, err
+	}
+	var filtered []ConductorMeta
+	for _, c := range all {
+		if c.Profile == profile {
+			filtered = append(filtered, c)
+		}
+	}
+	return filtered, nil
+}
+
+func renderConductorInstructionsTemplate(baseTemplate, name, profile string, spec ConductorAgentSpec) string {
+	content := strings.ReplaceAll(baseTemplate, "{NAME}", name)
+	content = strings.ReplaceAll(content, "{AGENT}", spec.Agent)
+	content = strings.ReplaceAll(content, "{AGENT_DISPLAY}", spec.DisplayName)
+	content = strings.ReplaceAll(content, "{INSTRUCTIONS_FILE}", spec.InstructionsFileName)
+	if profile == DefaultProfile {
+		// For default profile, show "default" in display text and omit -p flag in commands
+		content = strings.ReplaceAll(content, "{PROFILE}", "default")
+		content = strings.ReplaceAll(content, "agent-deck -p default ", "agent-deck ")
+		content = strings.ReplaceAll(content, "Always pass `-p default` to all CLI commands.", "Use CLI commands without `-p` flag (default profile).")
+	} else {
+		content = strings.ReplaceAll(content, "{PROFILE}", profile)
+	}
+	return content
+}
+
+// renderConductorInstructionsGenerations renders every prior generated-template
+// generation of baseTemplate, newest first, exactly as the release that shipped
+// it would have written the file.
+func renderConductorInstructionsGenerations(baseTemplate, name, profile string, spec ConductorAgentSpec) []string {
+	generations := conductorInstructionsGenerations(baseTemplate)
+	rendered := make([]string, 0, len(generations))
+	for _, generation := range generations {
+		rendered = append(rendered, renderConductorInstructionsTemplate(generation, name, profile, spec))
+	}
+	return rendered
+}
+
+// conductorPerNameTemplateFor returns the per-conductor instructions template
+// for agent. Hermes gets its own template; every other agent (claude, codex,
+// pi, ...) shares the generic one, which substitutes {AGENT}/{AGENT_DISPLAY}/
+// {INSTRUCTIONS_FILE} per the caller's spec.
+func conductorPerNameTemplateFor(agent string) string {
+	if agent == ConductorAgentHermes {
+		return conductorPerNameHermesMDTemplate
+	}
+	return conductorPerNameClaudeMDTemplate
+}
+
+// previousConductorAgentSpec reports the spec of the agent a conductor is
+// being switched away from, but only when that agent writes the same
+// instructions file as the incoming spec (codex and pi both use AGENTS.md).
+// Those are the cases where the incoming setup must replace the previous
+// agent's generated content instead of leaving it stale.
+func previousConductorAgentSpec(existing *ConductorMeta, spec ConductorAgentSpec) (ConductorAgentSpec, bool) {
+	if existing == nil {
+		return ConductorAgentSpec{}, false
+	}
+	previousSpec, ok := conductorAgentSpecs[normalizeConductorAgent(existing.Agent)]
+	if !ok || previousSpec.Agent == spec.Agent || previousSpec.InstructionsFileName != spec.InstructionsFileName {
+		return ConductorAgentSpec{}, false
+	}
+	return previousSpec, true
+}
+
+func renderConductorClaudeTemplate(baseTemplate, name, profile string) string {
+	spec, _ := GetConductorAgentSpec(ConductorAgentClaude)
+	return renderConductorInstructionsTemplate(baseTemplate, name, profile, spec)
+}
+
+func matchesTemplateContent(actual, expected string) bool {
+	return strings.TrimSuffix(actual, "\n") == strings.TrimSuffix(expected, "\n")
+}
+
+// matchesAnyTemplateContent reports whether actual matches any of the given
+// generated-template generations.
+func matchesAnyTemplateContent(actual string, candidates []string) bool {
+	for _, c := range candidates {
+		if matchesTemplateContent(actual, c) {
+			return true
+		}
+	}
+	return false
+}
+
+// retireStaleConductorInstructions clears a previous agent's instructions file
+// out of a conductor directory. A symlink (a custom instructions file) is only
+// unlinked, so its target is untouched. A regular file is deleted only when its
+// content still matches a template some agent writing that filename would have
+// generated for this conductor; anything else carries the user's edits and is
+// renamed to <file>.bak-<timestamp> instead, never deleted (#2435). It returns
+// the backup path when it made one.
+func retireStaleConductorInstructions(dir, fileName, name, profile string) (string, error) {
+	path := filepath.Join(dir, fileName)
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", os.Remove(path)
+	}
+	if info.Mode().IsRegular() {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		if matchesAnyTemplateContent(string(content), generatedConductorInstructions(fileName, name, profile)) {
+			return "", os.Remove(path)
+		}
+	}
+	backupPath, err := uniqueBackupPath(path, time.Now())
+	if err != nil {
+		return "", err
+	}
+	if err := os.Rename(path, backupPath); err != nil {
+		return "", err
+	}
+	return backupPath, nil
+}
+
+// generatedConductorInstructions renders every template generation that any
+// agent writing fileName would have produced for this conductor.
+func generatedConductorInstructions(fileName, name, profile string) []string {
+	var rendered []string
+	for _, agent := range slices.Sorted(maps.Keys(conductorAgentSpecs)) {
+		spec := conductorAgentSpecs[agent]
+		if spec.InstructionsFileName != fileName {
+			continue
+		}
+		template := conductorPerNameTemplateFor(spec.Agent)
+		rendered = append(rendered, renderConductorInstructionsTemplate(template, name, profile, spec))
+		rendered = append(rendered, renderConductorInstructionsGenerations(template, name, profile, spec)...)
+	}
+	return rendered
+}
+
+// uniqueBackupPath returns <path>.bak-<timestamp>, adding a counter when that
+// name is already taken so an earlier backup is never overwritten.
+func uniqueBackupPath(path string, now time.Time) (string, error) {
+	base := path + ".bak-" + now.UTC().Format("20060102T150405Z")
+	candidate := base
+	for i := 1; ; i++ {
+		if _, err := os.Lstat(candidate); os.IsNotExist(err) {
+			return candidate, nil
+		} else if err != nil {
+			return "", err
+		}
+		candidate = fmt.Sprintf("%s-%d", base, i)
+	}
+}
+
+// SetupConductor creates a Claude conductor for backward compatibility.
+// New callers should prefer SetupConductorWithAgent.
+func SetupConductor(name, profile string, heartbeatEnabled bool, clearOnCompact bool, description string, customClaudeMD string, customPolicyMD string, customHeartbeatRulesMD string, env map[string]string, envFile string) error {
+	return SetupConductorWithAgent(name, profile, ConductorAgentClaude, heartbeatEnabled, clearOnCompact, description, customClaudeMD, customPolicyMD, customHeartbeatRulesMD, env, envFile)
+}
+
+// SetupConductorWithAgent creates the conductor directory, agent-specific instructions file, and meta.json.
+// If customInstructionsMD is provided, creates a symlink instead of writing the template.
+// If customPolicyMD is provided, creates a per-conductor POLICY.md symlink (overrides the shared POLICY.md).
+// If customHeartbeatRulesMD is provided, creates a per-conductor HEARTBEAT_RULES.md symlink
+// (overrides the shared HEARTBEAT_RULES.md and any per-profile override).
+// It does NOT register the session (that's done by the CLI handler which has access to storage).
+func SetupConductorWithAgent(name, profile, agent string, heartbeatEnabled bool, clearOnCompact bool, description string, customInstructionsMD string, customPolicyMD string, customHeartbeatRulesMD string, env map[string]string, envFile string, heartbeatIdleMinutes ...int) error {
+	if err := ValidateConductorName(name); err != nil {
+		return err
+	}
+	spec, err := GetConductorAgentSpec(agent)
+	if err != nil {
+		return err
+	}
+	profile = normalizeConductorProfile(profile)
+
+	// Hold the conductor base lock for the whole setup so a concurrent
+	// `migrate-dir` cannot relocate the base out from under a half-written home
+	// (finding #5). The meta write below uses the unlocked saveConductorMetaLocked
+	// to avoid re-acquiring the non-reentrant lock.
+	lock, err := acquireConductorBaseLock()
+	if err != nil {
+		return err
+	}
+	defer lock.release()
+
+	// Load any existing meta up front: it gates the profile-mismatch guard AND
+	// lets a re-run preserve user-state fields that aren't re-passed as flags
+	// (merge, don't clobber).
+	existing, _ := LoadConductorMeta(name)
+	if existing != nil && existing.Profile != profile {
+		return fmt.Errorf("conductor %q already exists for profile %q (requested profile: %q)", name, existing.Profile, profile)
+	}
+
+	dir, err := ConductorNameDir(name)
+	if err != nil {
+		return fmt.Errorf("failed to get conductor dir: %w", err)
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create conductor dir: %w", err)
+	}
+
+	// Pre-accept the Claude trust dialog for the conductor directory (#1359).
+	// conductor setup just created this directory, so there is nothing to
+	// vet — yet on first launch Claude Code would prompt "do you trust the
+	// files in this folder?" and the conductor would stall there, defeating
+	// autonomous/heartbeat operation. This reuses the same mechanism added
+	// for multi-repo worktree parents in #1149: seed
+	// projects[dir].hasTrustDialogAccepted = true in the user's root
+	// ~/.claude.json (where Claude keys trust, regardless of profile).
+	// Claude-only; failures are logged but non-fatal so setup still succeeds.
+	if spec.Agent == ConductorAgentClaude {
+		if err := PreAcceptClaudeTrust(GetUserMCPRootPath(), dir); err != nil {
+			sessionLog.Warn("conductor_preaccept_trust_failed",
+				slog.String("conductor", name),
+				slog.String("dir", dir),
+				slog.String("error", err.Error()))
+		}
+	}
+	// Codex conductors get the same treatment (#1359 parity): seed
+	// projects[dir].trust_level = "trusted" in ~/.codex/config.toml so
+	// first boot and heartbeat do not stall on the workspace-trust dialog.
+	if spec.Agent == ConductorAgentCodex {
+		if err := PreAcceptCodexTrust(GetCodexConfigPath(getCodexHomeDir()), dir); err != nil {
+			sessionLog.Warn("conductor_preaccept_codex_trust_failed",
+				slog.String("conductor", name),
+				slog.String("dir", dir),
+				slog.String("error", err.Error()))
+		}
+	}
+
+	targetPath := filepath.Join(dir, spec.InstructionsFileName)
+
+	if customInstructionsMD != "" {
+		// Custom path provided - create symlink
+		if err := createSymlinkWithExpansion(targetPath, customInstructionsMD); err != nil {
+			return err
+		}
+	} else {
+		// No custom path - write the default template only if absent. An existing
+		// symlink keeps the user's customization; an existing regular file may
+		// carry in-place edits, so re-running setup must not clobber it.
+		perNameTemplate := conductorPerNameTemplateFor(spec.Agent)
+		content := renderConductorInstructionsTemplate(perNameTemplate, name, profile, spec)
+		oldGenerations := renderConductorInstructionsGenerations(perNameTemplate, name, profile, spec)
+		// When the conductor is switching between two agents that share an
+		// instructions filename (codex and pi both read AGENTS.md), the sibling
+		// agent's generated content is replaceable too; otherwise it would be
+		// stranded under the new agent's name. Hand edits and symlinks stay.
+		if previousSpec, ok := previousConductorAgentSpec(existing, spec); ok {
+			siblingTemplate := conductorPerNameTemplateFor(previousSpec.Agent)
+			oldGenerations = append(oldGenerations, renderConductorInstructionsTemplate(siblingTemplate, name, profile, previousSpec))
+			oldGenerations = append(oldGenerations, renderConductorInstructionsGenerations(siblingTemplate, name, profile, previousSpec)...)
+		}
+		if err := writeGeneratedFileOrMigrate(targetPath, oldGenerations, content, 0o644); err != nil {
+			return fmt.Errorf("failed to write %s: %w", spec.InstructionsFileName, err)
+		}
+	}
+	// Drop instructions files left behind by other agents. Keying off the
+	// filename rather than the agent name matters because agents can share one
+	// (codex and pi both read AGENTS.md): removing by agent would delete the
+	// file this run just wrote. Only untouched generated content is deleted; a
+	// hand-edited file is moved aside instead (#2435).
+	staleFiles := make(map[string]bool)
+	for _, otherSpec := range conductorAgentSpecs {
+		if otherSpec.InstructionsFileName != spec.InstructionsFileName {
+			staleFiles[otherSpec.InstructionsFileName] = true
+		}
+	}
+	for _, fileName := range slices.Sorted(maps.Keys(staleFiles)) {
+		backupPath, err := retireStaleConductorInstructions(dir, fileName, name, profile)
+		if err != nil {
+			return fmt.Errorf("failed to retire stale %s: %w", fileName, err)
+		}
+		if backupPath != "" {
+			fmt.Fprintf(os.Stderr, "Moved %s aside to %s (not generated by agent-deck for conductor %q, which uses %s)\n", fileName, filepath.Base(backupPath), name, spec.InstructionsFileName)
+		}
+	}
+
+	// Write per-conductor POLICY.md symlink if custom path provided
+	if customPolicyMD != "" {
+		policyPath := filepath.Join(dir, "POLICY.md")
+		if err := createSymlinkWithExpansion(policyPath, customPolicyMD); err != nil {
+			return fmt.Errorf("failed to create POLICY.md symlink: %w", err)
+		}
+	}
+
+	// Write per-conductor HEARTBEAT_RULES.md symlink if custom path provided.
+	// Takes precedence over the per-profile and global HEARTBEAT_RULES.md
+	// (lookup order is mirrored by both conductor/bridge.py and the OS heartbeat script).
+	if customHeartbeatRulesMD != "" {
+		rulesPath := filepath.Join(dir, "HEARTBEAT_RULES.md")
+		if err := createSymlinkWithExpansion(rulesPath, customHeartbeatRulesMD); err != nil {
+			return fmt.Errorf("failed to create HEARTBEAT_RULES.md symlink: %w", err)
+		}
+	}
+
+	// Write meta.json. On a re-run, preserve user-state that setup callers don't
+	// necessarily re-pass: CreatedAt, Description, Env, EnvFile, ClearOnCompact,
+	// HeartbeatInterval and HeartbeatIdleMinutes are kept from the existing meta
+	// when the corresponding flag is unset, rather than reset to zero.
+	meta := &ConductorMeta{
+		Name:             name,
+		Agent:            spec.Agent,
+		Profile:          profile,
+		HeartbeatEnabled: heartbeatEnabled,
+		Description:      description,
+		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
+		Env:              env,
+		EnvFile:          envFile,
+	}
+	if existing != nil {
+		if existing.CreatedAt != "" {
+			meta.CreatedAt = existing.CreatedAt
+		}
+		if description == "" {
+			meta.Description = existing.Description
+		}
+		if len(env) == 0 {
+			meta.Env = existing.Env
+		}
+		if envFile == "" {
+			meta.EnvFile = existing.EnvFile
+		}
+		meta.HeartbeatInterval = existing.HeartbeatInterval
+	} else if heartbeatEnabled {
+		meta.HeartbeatInterval = 15
+	}
+	if !clearOnCompact {
+		meta.ClearOnCompact = &clearOnCompact
+	} else if existing != nil {
+		// Flag not used to disable: keep any explicit prior setting.
+		meta.ClearOnCompact = existing.ClearOnCompact
+	}
+	// Set heartbeat idle minutes if provided (non-negative value); otherwise
+	// preserve the existing value on a re-run.
+	if len(heartbeatIdleMinutes) > 0 && heartbeatIdleMinutes[0] >= 0 {
+		meta.HeartbeatIdleMinutes = heartbeatIdleMinutes[0]
+	} else if existing != nil {
+		meta.HeartbeatIdleMinutes = existing.HeartbeatIdleMinutes
+	}
+	if err := saveConductorMetaLocked(meta); err != nil {
+		return fmt.Errorf("failed to write meta.json: %w", err)
+	}
+
+	// Write per-conductor LEARNINGS.md (don't overwrite existing)
+	learningsPath := filepath.Join(dir, "LEARNINGS.md")
+	if _, err := os.Stat(learningsPath); os.IsNotExist(err) {
+		if err := os.WriteFile(learningsPath, []byte(conductorLearningsTemplate), 0o644); err != nil {
+			return fmt.Errorf("failed to write LEARNINGS.md: %w", err)
+		}
+	}
+
+	// Write the conductor's .claude/settings.json permission allowlist (#1358).
+	// Claude-only (codex/hermes don't use this file). Auto-allows read-only and
+	// safe CLI commands plus scoped data-file writes so the conductor's heartbeat
+	// read loop doesn't drown the user in permission prompts, while keeping
+	// lifecycle/mutating commands and executable/config writes behind prompts.
+	// Non-fatal: setup still succeeds if this fails.
+	if spec.Agent == ConductorAgentClaude {
+		if err := writeConductorClaudeSettingsAt(dir); err != nil {
+			sessionLog.Warn("conductor_claude_settings_failed",
+				slog.String("conductor", name),
+				slog.String("dir", dir),
+				slog.String("error", err.Error()))
+		}
+	}
+
+	return nil
+}
+
+// InstallHeartbeatScript writes the heartbeat.sh script for a conductor.
+// This is a standalone heartbeat that works without Telegram.
+//
+// The script embeds the conductor root (renderConductorHeartbeatScript's
+// {CONDUCTOR_ROOT} substitution, which honors [conductor].dir) as a literal.
+// When [conductor].dir changes, the script content does NOT go stale silently:
+// MigrateConductorHeartbeatScripts rewrites managed scripts on the next
+// conductor command (list / status / setup / teardown). The stale surface is
+// the daemon, not the script — GenerateHeartbeatPlist bakes absolute
+// script/log paths into the launchd plist (and systemd unit) at setup time and
+// is regenerated only by 'conductor setup', so re-run 'conductor setup' per
+// conductor after a dir change to reload the daemon.
+func InstallHeartbeatScript(name, profile string) error {
+	dir, err := ConductorNameDir(name)
+	if err != nil {
+		return err
+	}
+	scriptPath := filepath.Join(dir, "heartbeat.sh")
+	return os.WriteFile(scriptPath, []byte(renderConductorHeartbeatScript(name, profile)), 0o755)
+}
+
+func renderConductorHeartbeatScript(name, profile string) string {
+	profile = normalizeConductorProfile(profile)
+	script := strings.ReplaceAll(conductorHeartbeatScript, "{NAME}", name)
+	script = strings.ReplaceAll(script, "{PROFILE}", profile)
+	script = strings.ReplaceAll(script, "{HEARTBEAT_PREFIX}", ConductorBridgeHeartbeatPrefix)
+	conductorRoot := "$HOME/.agent-deck/conductor"
+	if dir, err := ConductorDir(); err == nil {
+		conductorRoot = shellDoubleQuotedValue(dir)
+	}
+	script = strings.ReplaceAll(script, "{CONDUCTOR_ROOT}", conductorRoot)
+	if profile == DefaultProfile {
+		// For default profile, omit -p flag entirely
+		script = strings.ReplaceAll(script, `-p "$PROFILE" `, "")
+	}
+	return script
+}
+
+func shellDoubleQuotedValue(value string) string {
+	replacer := strings.NewReplacer(
+		`\`, `\\`,
+		`"`, `\"`,
+		`$`, `\$`,
+		"`", "\\`",
+	)
+	return replacer.Replace(value)
+}
+
+// HeartbeatPlistLabel returns the launchd label for a conductor's heartbeat
+func HeartbeatPlistLabel(name string) string {
+	return fmt.Sprintf("com.agentdeck.conductor-heartbeat.%s", name)
+}
+
+// GenerateHeartbeatPlist returns a launchd plist for a conductor's heartbeat timer
+func GenerateHeartbeatPlist(name string, intervalMinutes int) (string, error) {
+	dir, err := ConductorNameDir(name)
+	if err != nil {
+		return "", err
+	}
+
+	agentDeckPath := FindAgentDeck()
+	if agentDeckPath == "" {
+		return "", fmt.Errorf("agent-deck not found in PATH")
+	}
+
+	scriptPath := filepath.Join(dir, "heartbeat.sh")
+	logPath := filepath.Join(dir, "heartbeat.log")
+	label := HeartbeatPlistLabel(name)
+	intervalSeconds := intervalMinutes * 60
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+
+	plist := strings.ReplaceAll(conductorHeartbeatPlistTemplate, "__LABEL__", label)
+	plist = strings.ReplaceAll(plist, "__SCRIPT_PATH__", scriptPath)
+	plist = strings.ReplaceAll(plist, "__LOG_PATH__", logPath)
+	plist = strings.ReplaceAll(plist, "__HOME__", homeDir)
+	plist = strings.ReplaceAll(plist, "__INTERVAL__", fmt.Sprintf("%d", intervalSeconds))
+	plist = strings.ReplaceAll(plist, "__PATH__", buildDaemonPath(agentDeckPath))
+
+	return plist, nil
+}
+
+// HeartbeatPlistPath returns the path where a conductor's heartbeat plist should be installed
+func HeartbeatPlistPath(name string) (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(homeDir, "Library", "LaunchAgents", HeartbeatPlistLabel(name)+".plist"), nil
+}
+
+// RemoveHeartbeatPlist removes the launchd plist for a conductor's heartbeat
+func RemoveHeartbeatPlist(name string) error {
+	path, err := HeartbeatPlistPath(name)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil
+	}
+	return os.Remove(path)
+}
+
+// HeartbeatDaemonStale reports whether an installed heartbeat daemon (launchd
+// plist on macOS, systemd service on Linux) references a script path other than
+// the conductor's currently-resolved <ConductorNameDir>/heartbeat.sh. This is
+// the surface that goes stale when [conductor].dir changes:
+// MigrateConductorHeartbeatScripts refreshes the rendered script content, but
+// the daemon still invokes the old absolute path and is only regenerated by
+// 'conductor setup'.
+//
+// Detection is side-effect-free (it reads the installed unit and makes no
+// launchctl/systemctl calls) and best-effort: a missing or unreadable daemon
+// returns false, since there is nothing installed to warn about.
+func HeartbeatDaemonStale(name string) bool {
+	dir, err := ConductorNameDir(name)
+	if err != nil {
+		return false
+	}
+	expectedScript := filepath.Join(dir, "heartbeat.sh")
+
+	refersElsewhere := func(path string) bool {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return false
+		}
+		return !strings.Contains(string(data), expectedScript)
+	}
+
+	if plistPath, err := HeartbeatPlistPath(name); err == nil {
+		if _, statErr := os.Stat(plistPath); statErr == nil {
+			return refersElsewhere(plistPath)
+		}
+	}
+	if svcPath, err := SystemdHeartbeatServicePath(name); err == nil {
+		if _, statErr := os.Stat(svcPath); statErr == nil {
+			return refersElsewhere(svcPath)
+		}
+	}
+	return false
+}
+
+// FindAgentDeck looks for agent-deck in common locations
+func FindAgentDeck() string {
+	if p := agentDeckPathFromArg0(); p != "" {
+		return p
+	}
+
+	if p, err := exec.LookPath("agent-deck"); err == nil {
+		if normalized := normalizeExecutablePath(p); isExecutablePath(normalized) {
+			return normalized
+		}
+	}
+
+	paths := []string{
+		"/opt/homebrew/bin/agent-deck",
+		"/usr/local/bin/agent-deck",
+	}
+	for _, p := range paths {
+		if isExecutablePath(p) {
+			return p
+		}
+	}
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		p := filepath.Join(dir, "agent-deck")
+		if isExecutablePath(p) {
+			return p
+		}
+	}
+	return ""
+}
+
+func agentDeckPathFromArg0() string {
+	arg0 := strings.TrimSpace(os.Args[0])
+	if arg0 == "" {
+		return ""
+	}
+
+	var candidate string
+	if strings.ContainsRune(arg0, os.PathSeparator) {
+		candidate = arg0
+	} else if p, err := exec.LookPath(arg0); err == nil {
+		candidate = p
+	}
+
+	candidate = normalizeExecutablePath(candidate)
+	if candidate == "" {
+		return ""
+	}
+	// Ignore go test binaries when running unit tests.
+	if strings.HasSuffix(strings.ToLower(filepath.Base(candidate)), ".test") {
+		return ""
+	}
+	if !isExecutablePath(candidate) {
+		return ""
+	}
+	return candidate
+}
+
+func normalizeExecutablePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if !filepath.IsAbs(path) {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return ""
+		}
+		path = abs
+	}
+	return filepath.Clean(path)
+}
+
+func isExecutablePath(path string) bool {
+	if path == "" {
+		return false
+	}
+	// #nosec G703 -- callers pass agent-deck-resolved command paths (e.g. from
+	// $PATH lookup or user config), not raw external input.
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	return true
+}
+
+// buildDaemonPath returns a PATH string suitable for daemon environments.
+// If agentDeckPath is non-empty, its parent directory is prepended so daemon
+// processes (launchd, systemd) that don't inherit the user's shell PATH can
+// still find the agent-deck binary.
+func buildDaemonPath(agentDeckPath string) string {
+	baseEntries := []string{"/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"}
+	if runtime.GOOS == "darwin" {
+		// Homebrew on Apple Silicon installs to /opt/homebrew/bin; that path
+		// does not exist on Linux, so only include it on macOS.
+		baseEntries = []string{"/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"}
+	}
+	ordered := make([]string, 0, len(baseEntries)+1)
+	seen := map[string]struct{}{}
+
+	appendUnique := func(dir string) {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			return
+		}
+		if _, ok := seen[dir]; ok {
+			return
+		}
+		seen[dir] = struct{}{}
+		ordered = append(ordered, dir)
+	}
+
+	if normalized := normalizeExecutablePath(agentDeckPath); normalized != "" {
+		appendUnique(filepath.Dir(normalized))
+	}
+	for _, dir := range baseEntries {
+		appendUnique(dir)
+	}
+
+	if len(ordered) == 0 {
+		return ""
+	}
+	return strings.Join(ordered, ":")
+}
+
+// conductorHeartbeatScript is the shell script that sends a heartbeat to a conductor session.
+// Uses grep -q and awk for JSON parsing to stay portable across GNU and BSD (macOS).
+const conductorHeartbeatScript = `#!/bin/bash
+# Heartbeat for conductor: {NAME} (profile: {PROFILE})
+# Sends a check-in message to the conductor session (non-blocking)
+
+SESSION="conductor-{NAME}"
+PROFILE="{PROFILE}"
+
+# Check this conductor's heartbeat flag, including after teardown.
+if ! agent-deck -p "$PROFILE" conductor status "{NAME}" --json 2>/dev/null | grep -q '"heartbeat"[[:space:]]*:[[:space:]]*true'; then
+    exit 0
+fi
+
+# Only send if the session is running
+STATUS=$(agent-deck -p "$PROFILE" session show "$SESSION" --json 2>/dev/null | awk -F'"' '/"status"/{print $4; exit}')
+
+# Resolve HEARTBEAT_RULES.md (per-conductor, then per-profile, then global fallback).
+# Mirrors the lookup order used by conductor/bridge.py since PR #218.
+CONDUCTOR_ROOT="{CONDUCTOR_ROOT}"
+RULES_FILE=""
+for candidate in \
+    "$CONDUCTOR_ROOT/{NAME}/HEARTBEAT_RULES.md" \
+    "$CONDUCTOR_ROOT/{PROFILE}/HEARTBEAT_RULES.md" \
+    "$CONDUCTOR_ROOT/HEARTBEAT_RULES.md" \
+    "$HOME/.agent-deck/conductor/{NAME}/HEARTBEAT_RULES.md" \
+    "$HOME/.agent-deck/conductor/{PROFILE}/HEARTBEAT_RULES.md" \
+    "$HOME/.agent-deck/conductor/HEARTBEAT_RULES.md"; do
+    if [ -f "$candidate" ]; then
+        RULES_FILE="$candidate"
+        break
+    fi
+done
+
+if [ "$STATUS" != "idle" ] && [ "$STATUS" != "waiting" ]; then
+    exit 0
+fi
+
+# Issue #2348: every send is a new turn that re-reads the conductor's whole
+# conversation. heartbeat-tick prints a delta-only {HEARTBEAT_PREFIX} message,
+# or nothing when no waiting/error session or inbox record changed since the
+# last delivered tick; nothing printed means no turn at all.
+LOG_FILE="$CONDUCTOR_ROOT/{NAME}/heartbeat.log"
+TICK_FAILURE="$CONDUCTOR_ROOT/{NAME}/heartbeat-tick-failed"
+SEND_FAILURE="$CONDUCTOR_ROOT/{NAME}/heartbeat-send-failed"
+TICK_ERROR="$CONDUCTOR_ROOT/{NAME}/heartbeat-tick.stderr"
+if ! MSG=$(agent-deck -p "$PROFILE" conductor heartbeat-tick "{NAME}" --rules="$RULES_FILE" 2>"$TICK_ERROR"); then
+    if [ ! -f "$TICK_FAILURE" ]; then
+        IFS= read -r TICK_DETAIL < "$TICK_ERROR" || true
+        printf 'heartbeat: tick failed: %s\n' "${TICK_DETAIL:-unknown error}" >> "$LOG_FILE"
+        : > "$TICK_FAILURE"
+    fi
+    unlink "$TICK_ERROR" 2>/dev/null || true
+    exit 1
+fi
+if [ -s "$TICK_ERROR" ]; then
+    if [ ! -f "$TICK_FAILURE" ]; then
+        IFS= read -r TICK_DETAIL < "$TICK_ERROR" || true
+        printf 'heartbeat: tick diagnostic: %s\n' "$TICK_DETAIL" >> "$LOG_FILE"
+        : > "$TICK_FAILURE"
+    fi
+else
+    unlink "$TICK_FAILURE" 2>/dev/null || true
+fi
+unlink "$TICK_ERROR" 2>/dev/null || true
+if [ -n "$MSG" ]; then
+    if SEND_ERROR=$(agent-deck -p "$PROFILE" session send "$SESSION" "$MSG" --no-wait -q 2>&1); then
+        unlink "$SEND_FAILURE" 2>/dev/null || true
+        agent-deck -p "$PROFILE" conductor heartbeat-tick "{NAME}" --rules="$RULES_FILE" --commit-message="$MSG" >/dev/null
+    elif [ ! -f "$SEND_FAILURE" ]; then
+        printf 'heartbeat: send failed: %s\n' "${SEND_ERROR%%$'\n'*}" >> "$LOG_FILE"
+        : > "$SEND_FAILURE"
+    fi
+fi
+`
+
+// conductorHeartbeatPlistTemplate is the launchd plist for a per-conductor heartbeat timer
+const conductorHeartbeatPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__SCRIPT_PATH__</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>__INTERVAL__</integer>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_PATH__</string>
+
+    <key>StandardErrorPath</key>
+    <string>__LOG_PATH__</string>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__PATH__</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>
+`
+
+// SetupConductorProfile creates a default Claude conductor for a profile.
+// Deprecated: Use SetupConductor instead. Kept for backward compatibility.
+func SetupConductorProfile(profile string) error {
+	return SetupConductor(profile, profile, true, true, "", "", "", "", nil, "")
+}
+
+// createSymlinkWithExpansion creates a symlink from target to source, with ~ expansion and validation.
+// target: the generated instructions path (e.g., ~/.agent-deck/conductor/CLAUDE.md)
+// source: the user's custom file path (e.g., ~/my/custom.md)
+func createSymlinkWithExpansion(target, source string) error {
+	// Expand environment variables and ~ in source path
+	source = ExpandPath(source)
+
+	// Validate source is absolute
+	if !filepath.IsAbs(source) {
+		return fmt.Errorf("custom path must be absolute or start with ~/: %s", source)
+	}
+
+	// Check if source file exists
+	if _, err := os.Stat(source); os.IsNotExist(err) {
+		return fmt.Errorf("custom file does not exist: %s\nCreate the file first, then run setup again", source)
+	}
+
+	// Remove existing file/symlink at target
+	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove existing file: %w", err)
+	}
+
+	// Create symlink
+	if err := os.Symlink(source, target); err != nil {
+		return fmt.Errorf("failed to create symlink: %w", err)
+	}
+
+	return nil
+}
+
+// writeFileIfAbsent writes content to path only when path does not already
+// exist, using O_CREATE|O_EXCL so an existing (possibly user-edited) regular
+// file is never clobbered — the TOCTOU-safe if-absent primitive mirroring
+// watcher.writeIfAbsent. A pre-existing path (regular file or symlink) is left
+// untouched and reported as success.
+func writeFileIfAbsent(path string, content []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil
+		}
+		return err
+	}
+	// Surface both the write and the close error: a buffered write only fully
+	// commits on a successful Close, so a swallowed Close() error can mask data
+	// loss. Return the write error first (more specific), else the close error.
+	_, writeErr := f.Write(content)
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
+}
+
+// exchangeGeneratedFiles atomically swaps two pathnames. After the exchange,
+// the temporary pathname holds the displaced destination, which lets the
+// caller validate and retain the exact file it replaced for recovery.
+var exchangeGeneratedFiles = exchangeGeneratedFile
+
+// writeGeneratedFileOrMigrate creates a generated file when absent and upgrades
+// it only when its contents exactly match one of the prior generated-template
+// generations (newest first; see conductorInstructionsGenerations). Edited
+// files and existing symlinks remain user-owned. Migration retains the
+// displaced inode so an editor with an open descriptor cannot lose its writes.
+func writeGeneratedFileOrMigrate(path string, previousGenerations []string, current string, perm os.FileMode) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return writeFileIfAbsent(path, []byte(current), perm)
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("refusing to replace unsafe generated-file target %q (%s)", path, info.Mode().Type())
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if !matchesAnyTemplateContent(string(content), previousGenerations) {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".previous-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	exchanged := false
+	defer func() {
+		if !exchanged {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	fail := func(op string, opErr error) error {
+		_ = tmp.Close()
+		return fmt.Errorf("%s generated replacement: %w", op, opErr)
+	}
+	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+		return fail("chmod", err)
+	}
+	if _, err := tmp.Write([]byte(current)); err != nil {
+		return fail("write", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fail("sync", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close generated replacement: %w", err)
+	}
+
+	// Avoid needless exchanges when a change is already visible. This recheck is
+	// only an optimization: correctness comes from validating the file displaced
+	// by the atomic exchange below.
+	latestInfo, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("recheck generated target: %w", err)
+	}
+	if !latestInfo.Mode().IsRegular() || !os.SameFile(info, latestInfo) {
+		return fmt.Errorf("generated target changed during migration: %s", path)
+	}
+	latest, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("recheck generated content: %w", err)
+	}
+	if !matchesAnyTemplateContent(string(latest), previousGenerations) {
+		return fmt.Errorf("generated target was edited during migration: %s", path)
+	}
+	if err := exchangeGeneratedFiles(tmpPath, path); err != nil {
+		return fmt.Errorf("replace generated target: %w", err)
+	}
+	// From this point tmpPath belongs to the displaced inode, which may still
+	// have an editor writing through an open descriptor. Never unlink it.
+	exchanged = true
+	fsyncDir(dir)
+	displacedInfo, statErr := os.Lstat(tmpPath)
+	var displaced []byte
+	var readErr error
+	if statErr == nil && displacedInfo.Mode().IsRegular() {
+		displaced, readErr = os.ReadFile(tmpPath)
+	}
+	if statErr != nil || !displacedInfo.Mode().IsRegular() || readErr != nil ||
+		!os.SameFile(info, displacedInfo) || !matchesAnyTemplateContent(string(displaced), previousGenerations) {
+		// A second exchange could overwrite a newer visible edit. Keep both
+		// paths and make the publication conflict actionable instead.
+		return fmt.Errorf("generated target %q changed during publication; publication occurred, displaced file retained at %q for reconciliation", path, tmpPath)
+	}
+	sessionLog.Info("generated_instructions_migrated", slog.String("path", path), slog.String("previous_path", tmpPath))
+	return nil
+}
+
+// InstallSharedConductorInstructions writes the shared instructions file for the given conductor agent,
+// or creates a symlink if customPath is provided.
+func InstallSharedConductorInstructions(agent, customPath string) error {
+	spec, err := GetConductorAgentSpec(agent)
+	if err != nil {
+		return err
+	}
+	dir, err := ConductorDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+	targetPath := filepath.Join(dir, spec.InstructionsFileName)
+
+	if customPath != "" {
+		// Custom path provided - create symlink
+		return createSymlinkWithExpansion(targetPath, customPath)
+	}
+
+	// No custom path: create the current generated template, or migrate an exact
+	// copy of a prior generated-template generation. Customized files and
+	// symlinks are preserved.
+	content := renderConductorInstructionsTemplate(conductorSharedClaudeMDTemplate, "", DefaultProfile, spec)
+	oldGenerations := renderConductorInstructionsGenerations(conductorSharedClaudeMDTemplate, "", DefaultProfile, spec)
+	if err := writeGeneratedFileOrMigrate(targetPath, oldGenerations, content, 0o644); err != nil {
+		return fmt.Errorf("failed to write shared %s: %w", spec.InstructionsFileName, err)
+	}
+	return nil
+}
+
+// InstallSharedClaudeMD writes the shared CLAUDE.md to the conductor base directory.
+// Deprecated: use InstallSharedConductorInstructions with the Claude agent.
+func InstallSharedClaudeMD(customPath string) error {
+	return InstallSharedConductorInstructions(ConductorAgentClaude, customPath)
+}
+
+// InstallLearningsMD writes the default LEARNINGS.md to the conductor base directory.
+// This is the shared (Tier 1) learnings file for generic patterns across all conductors.
+func InstallLearningsMD() error {
+	dir, err := ConductorDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+	targetPath := filepath.Join(dir, "LEARNINGS.md")
+	// Don't overwrite if already exists (preserves user entries)
+	if _, err := os.Stat(targetPath); err == nil {
+		return nil
+	}
+	return os.WriteFile(targetPath, []byte(conductorLearningsTemplate), 0o644)
+}
+
+// InstallPolicyMD writes the default POLICY.md to the conductor base directory,
+// or creates a symlink if customPath is provided.
+// This contains agent behavior rules (auto-response policy, escalation guidelines).
+func InstallPolicyMD(customPath string) error {
+	dir, err := ConductorDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+	targetPath := filepath.Join(dir, "POLICY.md")
+
+	if customPath != "" {
+		// Custom path provided - create symlink
+		return createSymlinkWithExpansion(targetPath, customPath)
+	}
+
+	// No custom path - write the default template only if nothing is there yet.
+	// Preserve an existing symlink (user customization) or regular file (possible
+	// in-place edits) so re-running setup is non-destructive.
+	if err := writeFileIfAbsent(targetPath, []byte(conductorPolicyTemplate), 0o644); err != nil {
+		return fmt.Errorf("failed to write POLICY.md: %w", err)
+	}
+	return nil
+}
+
+// TeardownConductor removes the conductor directory for a named conductor.
+// It does NOT remove the session from storage (that's done by the CLI handler).
+func TeardownConductor(name string) error {
+	dir, err := ConductorNameDir(name)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return nil // Already removed
+	}
+	return os.RemoveAll(dir)
+}
+
+// TeardownConductorProfile removes the conductor directory for a profile.
+// Deprecated: Use TeardownConductor instead. Kept for backward compatibility.
+func TeardownConductorProfile(profile string) error {
+	return TeardownConductor(profile)
+}
+
+// MigrateLegacyConductors scans for conductor dirs that have CLAUDE.md but no meta.json,
+// and creates meta.json for them. Returns the names of migrated conductors.
+func MigrateLegacyConductors() ([]string, error) {
+	base, err := ConductorDir()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(base); os.IsNotExist(err) {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read conductor directory: %w", err)
+	}
+	var migrated []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		dirPath := filepath.Join(base, name)
+		metaPath := filepath.Join(dirPath, "meta.json")
+		claudePath := filepath.Join(dirPath, "CLAUDE.md")
+
+		// Skip if meta.json already exists (already migrated)
+		if _, err := os.Stat(metaPath); err == nil {
+			continue
+		}
+		// Skip if no CLAUDE.md (not a conductor dir)
+		if _, err := os.Stat(claudePath); os.IsNotExist(err) {
+			continue
+		}
+
+		// Legacy conductor: name=dirName, profile=dirName
+		meta := &ConductorMeta{
+			Name:             name,
+			Profile:          name,
+			HeartbeatEnabled: true,
+			CreatedAt:        time.Now().UTC().Format(time.RFC3339),
+		}
+		if err := SaveConductorMeta(meta); err != nil {
+			continue
+		}
+		migrated = append(migrated, name)
+	}
+	return migrated, nil
+}
+
+// MigrateConductorPolicySplit updates legacy generated per-conductor CLAUDE.md
+// templates to include POLICY.md instructions.
+// It only rewrites non-symlink CLAUDE.md files that exactly match the legacy generated template.
+func MigrateConductorPolicySplit() ([]string, error) {
+	base, err := ConductorDir()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(base); os.IsNotExist(err) {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read conductor directory: %w", err)
+	}
+
+	var migrated []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		claudePath := filepath.Join(base, name, "CLAUDE.md")
+
+		info, err := os.Lstat(claudePath)
+		if err != nil {
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+
+		meta, err := LoadConductorMeta(name)
+		if err != nil {
+			continue
+		}
+
+		contentBytes, err := os.ReadFile(claudePath)
+		if err != nil {
+			continue
+		}
+		content := string(contentBytes)
+
+		// Already on the new template format (or custom file with policy instructions).
+		if strings.Contains(content, "## Policy") && strings.Contains(content, "POLICY.md") {
+			continue
+		}
+
+		legacyTemplate := renderConductorClaudeTemplate(conductorPerNameClaudeMDLegacyTemplate, name, meta.Profile)
+		if !matchesTemplateContent(content, legacyTemplate) {
+			continue
+		}
+
+		updatedTemplate := renderConductorClaudeTemplate(conductorPerNameClaudeMDTemplate, name, meta.Profile)
+		if err := os.WriteFile(claudePath, []byte(updatedTemplate), 0o644); err != nil {
+			return migrated, fmt.Errorf("failed to migrate %s CLAUDE.md: %w", name, err)
+		}
+		migrated = append(migrated, name)
+	}
+
+	return migrated, nil
+}
+
+// MigrateConductorLearnings backfills LEARNINGS.md files for existing conductors and
+// updates per-conductor CLAUDE.md startup checklists to include the LEARNINGS.md reading step.
+// It only rewrites non-symlink CLAUDE.md files that exactly match the pre-learnings generated template.
+// Returns the names of conductors that were updated.
+func MigrateConductorLearnings() ([]string, error) {
+	base, err := ConductorDir()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(base); os.IsNotExist(err) {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read conductor directory: %w", err)
+	}
+
+	var migrated []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		dir := filepath.Join(base, name)
+
+		// Must have meta.json (is a conductor)
+		meta, err := LoadConductorMeta(name)
+		if err != nil {
+			continue
+		}
+
+		changed := false
+
+		// 1. Create LEARNINGS.md if missing
+		learningsPath := filepath.Join(dir, "LEARNINGS.md")
+		if _, err := os.Stat(learningsPath); os.IsNotExist(err) {
+			if err := os.WriteFile(learningsPath, []byte(conductorLearningsTemplate), 0o644); err == nil {
+				changed = true
+			}
+		}
+
+		// 2. Update CLAUDE.md startup checklist (only for non-symlink, exact template matches)
+		claudePath := filepath.Join(dir, "CLAUDE.md")
+		info, err := os.Lstat(claudePath)
+		if err != nil {
+			if changed {
+				migrated = append(migrated, name)
+			}
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			if changed {
+				migrated = append(migrated, name)
+			}
+			continue
+		}
+
+		contentBytes, err := os.ReadFile(claudePath)
+		if err != nil {
+			if changed {
+				migrated = append(migrated, name)
+			}
+			continue
+		}
+		content := string(contentBytes)
+
+		// Already has learnings step
+		if strings.Contains(content, "LEARNINGS.md") {
+			if changed {
+				migrated = append(migrated, name)
+			}
+			continue
+		}
+
+		preLearnings := renderConductorClaudeTemplate(conductorPerNameClaudeMDPreLearningsTemplate, name, meta.Profile)
+		if !matchesTemplateContent(content, preLearnings) {
+			if changed {
+				migrated = append(migrated, name)
+			}
+			continue
+		}
+
+		updated := renderConductorClaudeTemplate(conductorPerNameClaudeMDTemplate, name, meta.Profile)
+		if err := os.WriteFile(claudePath, []byte(updated), 0o644); err != nil {
+			return migrated, fmt.Errorf("failed to migrate %s CLAUDE.md: %w", name, err)
+		}
+		changed = true
+
+		if changed {
+			migrated = append(migrated, name)
+		}
+	}
+
+	// Also create shared LEARNINGS.md if missing
+	sharedPath := filepath.Join(base, "LEARNINGS.md")
+	if _, err := os.Stat(sharedPath); os.IsNotExist(err) {
+		_ = os.WriteFile(sharedPath, []byte(conductorLearningsTemplate), 0o644)
+	}
+
+	return migrated, nil
+}
+
+// MigrateConductorHeartbeatScripts refreshes managed heartbeat scripts to the
+// current template without touching custom user-authored scripts.
+func MigrateConductorHeartbeatScripts() ([]string, error) {
+	conductors, err := ListConductors()
+	if err != nil {
+		return nil, err
+	}
+
+	var migrated []string
+	for _, meta := range conductors {
+		dir, err := ConductorNameDir(meta.Name)
+		if err != nil {
+			continue
+		}
+
+		scriptPath := filepath.Join(dir, "heartbeat.sh")
+		expected := renderConductorHeartbeatScript(meta.Name, meta.Profile)
+
+		existing, err := os.ReadFile(scriptPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				if writeErr := os.WriteFile(scriptPath, []byte(expected), 0o755); writeErr == nil {
+					migrated = append(migrated, meta.Name)
+				}
+			}
+			continue
+		}
+
+		existingStr := string(existing)
+		managedScript := strings.Contains(existingStr, "# Heartbeat for conductor:") &&
+			strings.Contains(existingStr, `SESSION="conductor-`)
+		if !managedScript {
+			continue
+		}
+
+		if strings.TrimSpace(existingStr) == strings.TrimSpace(expected) {
+			continue
+		}
+
+		if err := os.WriteFile(scriptPath, []byte(expected), 0o755); err != nil {
+			return migrated, fmt.Errorf("failed to refresh heartbeat script for %s: %w", meta.Name, err)
+		}
+		migrated = append(migrated, meta.Name)
+	}
+
+	return migrated, nil
+}
+
+// InstallBridgeScript copies bridge.py to the conductor base directory.
+// It writes from the embedded const.
+func InstallBridgeScript() error {
+	dir, err := ConductorDir()
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create conductor dir: %w", err)
+	}
+
+	bridgePath := filepath.Join(dir, "bridge.py")
+	if err := os.WriteFile(bridgePath, []byte(conductorBridgePy), 0o755); err != nil {
+		return fmt.Errorf("failed to write bridge.py: %w", err)
+	}
+
+	return nil
+}
+
+// GetConductorSettings loads and returns conductor settings from config
+func GetConductorSettings() ConductorSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return ConductorSettings{}
+	}
+	return config.Conductor
+}
+
+// bridgeXDGBaseDirs returns the effective XDG base directories (the parents of
+// the agent-deck subdir) that agentpaths resolves against. Injecting these into
+// the bridge daemon env (issue #1350) makes the bridge's XDG branch land in the
+// same place the Go side wrote the conductors/config, instead of relying on the
+// legacy fallback. Mirrors agentpaths.xdgDir base selection: an absolute
+// $XDG_*_HOME wins, else ~/.local/share or ~/.config.
+func bridgeXDGBaseDirs() (dataBase, configBase string, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", err
+	}
+	base := func(envName string, fallbackParts ...string) string {
+		if v := strings.TrimSpace(os.Getenv(envName)); v != "" && filepath.IsAbs(v) {
+			return v
+		}
+		return filepath.Join(append([]string{home}, fallbackParts...)...)
+	}
+	dataBase = base("XDG_DATA_HOME", ".local", "share")
+	configBase = base("XDG_CONFIG_HOME", ".config")
+	return dataBase, configBase, nil
+}
+
+// LaunchdPlistName is the launchd label for the conductor bridge daemon
+const LaunchdPlistName = "com.agentdeck.conductor-bridge"
+
+// TransitionNotifierLaunchdPlistName is the launchd label for the transition notifier daemon.
+const TransitionNotifierLaunchdPlistName = "com.agentdeck.transition-notifier"
+
+// GenerateLaunchdPlist returns a launchd plist with paths substituted
+func GenerateLaunchdPlist() (string, error) {
+	condDir, err := ConductorDir()
+	if err != nil {
+		return "", err
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+
+	// Find python3
+	python3Path := findPython3()
+	if python3Path == "" {
+		return "", fmt.Errorf("python3 not found in PATH")
+	}
+
+	bridgePath := filepath.Join(condDir, "bridge.py")
+	logPath := filepath.Join(condDir, "bridge.log")
+
+	dataBase, configBase, err := bridgeXDGBaseDirs()
+	if err != nil {
+		return "", err
+	}
+
+	plist := strings.ReplaceAll(conductorPlistTemplate, "__PYTHON3__", python3Path)
+	plist = strings.ReplaceAll(plist, "__BRIDGE_PATH__", bridgePath)
+	plist = strings.ReplaceAll(plist, "__LOG_PATH__", logPath)
+	plist = strings.ReplaceAll(plist, "__HOME__", homeDir)
+	plist = strings.ReplaceAll(plist, "__XDG_DATA_HOME__", dataBase)
+	plist = strings.ReplaceAll(plist, "__XDG_CONFIG_HOME__", configBase)
+	plist = strings.ReplaceAll(plist, "__CONDUCTOR_DIR__", condDir)
+	agentDeckPath := FindAgentDeck()
+	plist = strings.ReplaceAll(plist, "__PATH__", buildDaemonPath(agentDeckPath))
+
+	return plist, nil
+}
+
+// LaunchdPlistPath returns the path where the plist should be installed
+func LaunchdPlistPath() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(homeDir, "Library", "LaunchAgents", LaunchdPlistName+".plist"), nil
+}
+
+// ConductorVenvDir returns the directory of the conductor-owned virtualenv that
+// findPython3 prefers. It does not create or check the directory — callers use
+// it to tell the user where to build the venv, so the instructions and the
+// lookup can never drift apart (they did: the PEP 668 remediation printed
+// ".venv" while findPython3 only ever looked for "venv").
+func ConductorVenvDir() string {
+	conductorDir, err := ConductorDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(conductorDir, "venv")
+}
+
+// FindPython3 is the exported form of findPython3, for the CLI layer: the
+// dependency installer must use the same interpreter the generated launchd /
+// systemd unit will run, or it installs the bridge's dependencies somewhere the
+// daemon cannot see them.
+func FindPython3() string {
+	return findPython3()
+}
+
+// findPython3 resolves python3 for daemon configs.
+// Prefer the conductor venv (has required deps like toml), then the current
+// PATH (so pyenv/asdf-selected interpreters win), then common absolute paths.
+func findPython3() string {
+	// Prefer the conductor venv python which has bridge dependencies installed.
+	if conductorDir, err := ConductorDir(); err == nil {
+		venvPython := filepath.Join(conductorDir, "venv", "bin", "python3")
+		if _, err := os.Stat(venvPython); err == nil {
+			return venvPython
+		}
+	}
+
+	// Respect the user's current shell environment.
+	if p, err := exec.LookPath("python3"); err == nil {
+		if abs, absErr := filepath.Abs(p); absErr == nil {
+			return abs
+		}
+		return p
+	}
+
+	paths := []string{
+		"/opt/homebrew/bin/python3",
+		"/usr/local/bin/python3",
+		"/usr/bin/python3",
+	}
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// conductorPlistTemplate is the launchd plist for the bridge daemon
+const conductorPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentdeck.conductor-bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON3__</string>
+        <string>__BRIDGE_PATH__</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_PATH__</string>
+
+    <key>StandardErrorPath</key>
+    <string>__LOG_PATH__</string>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__PATH__</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>XDG_DATA_HOME</key>
+        <string>__XDG_DATA_HOME__</string>
+        <key>XDG_CONFIG_HOME</key>
+        <string>__XDG_CONFIG_HOME__</string>
+        <key>AGENT_DECK_CONDUCTOR_DIR</key>
+        <string>__CONDUCTOR_DIR__</string>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>
+`
+
+const transitionNotifierPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentdeck.transition-notifier</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__AGENT_DECK__</string>
+        <string>notify-daemon</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_PATH__</string>
+
+    <key>StandardErrorPath</key>
+    <string>__LOG_PATH__</string>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__PATH__</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+</dict>
+</plist>
+`
+
+// --- Systemd unit templates ---
+
+const systemdBridgeServiceTemplate = `[Unit]
+Description=Agent Deck Conductor Bridge
+After=network.target
+
+[Service]
+Type=simple
+ExecStartPre=-/bin/mkdir -p "__LOG_DIR__"
+ExecStart="__PYTHON3__" "__BRIDGE_PATH__"
+Restart=always
+RestartSec=10
+WorkingDirectory=__HOME__
+StandardOutput=append:__LOG_PATH__
+StandardError=append:__LOG_PATH__
+Environment="PATH=__PATH__"
+Environment="HOME=__HOME__"
+__XDG_ENV__
+[Install]
+WantedBy=default.target
+`
+
+// systemdTransitionNotifierServiceTemplate runs the always-on completion
+// notifier. RuntimeMaxSec (issue #1214 STEP 1) bounds how long any single
+// daemon process can live: combined with Restart=always it forces a periodic
+// recycle onto the current binary, so the daemon can never run stale code even
+// if the in-process version watcher is somehow bypassed. The watcher recycles
+// promptly on upgrade; this is the backstop.
+//
+// The recycle is kept rather than dropped because it is what makes the stale-
+// binary guarantee unconditional. It used to be noisy (issue #2240): every
+// start replayed a transition for every parked child and woke every conductor
+// with an empty drain. The daemon now restarts statefully and silently instead
+// — it seeds its turn baseline from the registry against the persisted
+// last-notified state (TransitionDaemon.seedTurnBaseline) and withholds the
+// wake-nudge for a turn the parent has already consumed — so a daily recycle
+// costs nothing.
+const systemdTransitionNotifierServiceTemplate = `[Unit]
+Description=Agent Deck Transition Notifier
+After=network.target
+
+[Service]
+Type=simple
+ExecStartPre=-/bin/mkdir -p "__LOG_DIR__"
+ExecStart="__AGENT_DECK__" notify-daemon
+Restart=always
+RestartSec=5
+RuntimeMaxSec=86400
+WorkingDirectory=__HOME__
+StandardOutput=append:__LOG_PATH__
+StandardError=append:__LOG_PATH__
+Environment="PATH=__PATH__"
+Environment="HOME=__HOME__"
+
+[Install]
+WantedBy=default.target
+`
+
+const systemdHeartbeatTimerTemplate = `[Unit]
+Description=Agent Deck Conductor Heartbeat Timer (__NAME__)
+
+[Timer]
+OnBootSec=__INTERVAL__s
+OnUnitActiveSec=__INTERVAL__s
+
+[Install]
+WantedBy=timers.target
+`
+
+const systemdHeartbeatServiceTemplate = `[Unit]
+Description=Agent Deck Conductor Heartbeat (__NAME__)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash "__SCRIPT_PATH__"
+WorkingDirectory=__HOME__
+Environment="PATH=__PATH__"
+Environment="HOME=__HOME__"
+`
+
+// --- Systemd path helpers ---
+
+const systemdBridgeServiceName = "agent-deck-conductor-bridge.service"
+const systemdTransitionNotifierServiceName = "agent-deck-transition-notifier.service"
+
+// SystemdUserDir returns the systemd user unit directory (~/.config/systemd/user/)
+func SystemdUserDir() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(homeDir, ".config", "systemd", "user"), nil
+}
+
+// SystemdBridgeServicePath returns the full path to the bridge systemd service file
+func SystemdBridgeServicePath() (string, error) {
+	dir, err := SystemdUserDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, systemdBridgeServiceName), nil
+}
+
+// SystemdTransitionNotifierServicePath returns the full path to the transition notifier service file.
+func SystemdTransitionNotifierServicePath() (string, error) {
+	dir, err := SystemdUserDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, systemdTransitionNotifierServiceName), nil
+}
+
+// SystemdHeartbeatServiceName returns the systemd service name for a conductor heartbeat
+func SystemdHeartbeatServiceName(name string) string {
+	return fmt.Sprintf("agent-deck-conductor-heartbeat-%s.service", name)
+}
+
+// SystemdHeartbeatTimerName returns the systemd timer name for a conductor heartbeat
+func SystemdHeartbeatTimerName(name string) string {
+	return fmt.Sprintf("agent-deck-conductor-heartbeat-%s.timer", name)
+}
+
+// SystemdHeartbeatServicePath returns the full path to a heartbeat systemd service
+func SystemdHeartbeatServicePath(name string) (string, error) {
+	dir, err := SystemdUserDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, SystemdHeartbeatServiceName(name)), nil
+}
+
+// SystemdHeartbeatTimerPath returns the full path to a heartbeat systemd timer
+func SystemdHeartbeatTimerPath(name string) (string, error) {
+	dir, err := SystemdUserDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, SystemdHeartbeatTimerName(name)), nil
+}
+
+// --- Systemd unit generators ---
+
+// GenerateSystemdBridgeService returns a systemd unit for the bridge daemon
+func GenerateSystemdBridgeService() (string, error) {
+	condDir, err := ConductorDir()
+	if err != nil {
+		return "", err
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	python3Path := findPython3()
+	if python3Path == "" {
+		return "", fmt.Errorf("python3 not found in PATH")
+	}
+	bridgePath := filepath.Join(condDir, "bridge.py")
+	logPath := filepath.Join(condDir, "bridge.log")
+
+	dataBase, configBase, err := bridgeXDGBaseDirs()
+	if err != nil {
+		return "", err
+	}
+	// Quote each value: systemd splits Environment= on unquoted whitespace, so a
+	// conductor/XDG path containing spaces would otherwise corrupt the unit.
+	xdgEnv := `Environment="XDG_DATA_HOME=` + dataBase + `"` +
+		"\n" + `Environment="XDG_CONFIG_HOME=` + configBase + `"` +
+		"\n" + `Environment="AGENT_DECK_CONDUCTOR_DIR=` + condDir + `"`
+
+	unit := strings.ReplaceAll(systemdBridgeServiceTemplate, "__PYTHON3__", python3Path)
+	unit = strings.ReplaceAll(unit, "__BRIDGE_PATH__", bridgePath)
+	unit = strings.ReplaceAll(unit, "__LOG_PATH__", logPath)
+	unit = strings.ReplaceAll(unit, "__LOG_DIR__", filepath.Dir(logPath))
+	unit = strings.ReplaceAll(unit, "__HOME__", homeDir)
+	unit = strings.ReplaceAll(unit, "__XDG_ENV__", xdgEnv)
+	agentDeckPath := FindAgentDeck()
+	unit = strings.ReplaceAll(unit, "__PATH__", buildDaemonPath(agentDeckPath))
+	return unit, nil
+}
+
+// GenerateTransitionNotifierLaunchdPlist returns a launchd plist for the transition notifier daemon.
+func GenerateTransitionNotifierLaunchdPlist() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	agentDeckPath := FindAgentDeck()
+	execPath := "agent-deck"
+	if agentDeckPath != "" {
+		execPath = agentDeckPath
+	}
+	logPath, err := logDataPath("transition-notifier.log")
+	if err != nil {
+		return "", fmt.Errorf("transition notifier log path: %w", err)
+	}
+
+	plist := strings.ReplaceAll(transitionNotifierPlistTemplate, "__AGENT_DECK__", execPath)
+	plist = strings.ReplaceAll(plist, "__LOG_PATH__", logPath)
+	plist = strings.ReplaceAll(plist, "__HOME__", homeDir)
+	plist = strings.ReplaceAll(plist, "__PATH__", buildDaemonPath(agentDeckPath))
+	return plist, nil
+}
+
+// TransitionNotifierLaunchdPlistPath returns the launchd plist path for transition notifier.
+func TransitionNotifierLaunchdPlistPath() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(homeDir, "Library", "LaunchAgents", TransitionNotifierLaunchdPlistName+".plist"), nil
+}
+
+// GenerateSystemdTransitionNotifierService returns the systemd unit content for transition notifier.
+func GenerateSystemdTransitionNotifierService() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	agentDeckPath := FindAgentDeck()
+	execPath := "agent-deck"
+	if agentDeckPath != "" {
+		execPath = agentDeckPath
+	}
+	logPath, err := logDataPath("transition-notifier.log")
+	if err != nil {
+		return "", fmt.Errorf("transition notifier log path: %w", err)
+	}
+
+	unit := strings.ReplaceAll(systemdTransitionNotifierServiceTemplate, "__AGENT_DECK__", execPath)
+	unit = strings.ReplaceAll(unit, "__LOG_PATH__", logPath)
+	unit = strings.ReplaceAll(unit, "__LOG_DIR__", filepath.Dir(logPath))
+	unit = strings.ReplaceAll(unit, "__HOME__", homeDir)
+	unit = strings.ReplaceAll(unit, "__PATH__", buildDaemonPath(agentDeckPath))
+	return unit, nil
+}
+
+// GenerateSystemdHeartbeatTimer returns a systemd timer unit for a conductor heartbeat
+func GenerateSystemdHeartbeatTimer(name string, intervalMinutes int) string {
+	intervalSeconds := intervalMinutes * 60
+	unit := strings.ReplaceAll(systemdHeartbeatTimerTemplate, "__NAME__", name)
+	unit = strings.ReplaceAll(unit, "__INTERVAL__", fmt.Sprintf("%d", intervalSeconds))
+	return unit
+}
+
+// GenerateSystemdHeartbeatService returns a systemd service unit for a conductor heartbeat
+func GenerateSystemdHeartbeatService(name string) (string, error) {
+	dir, err := ConductorNameDir(name)
+	if err != nil {
+		return "", err
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	scriptPath := filepath.Join(dir, "heartbeat.sh")
+	unit := strings.ReplaceAll(systemdHeartbeatServiceTemplate, "__NAME__", name)
+	unit = strings.ReplaceAll(unit, "__SCRIPT_PATH__", scriptPath)
+	unit = strings.ReplaceAll(unit, "__HOME__", homeDir)
+	agentDeckPath := FindAgentDeck()
+	unit = strings.ReplaceAll(unit, "__PATH__", buildDaemonPath(agentDeckPath))
+	return unit, nil
+}
+
+// --- Platform-aware daemon management ---
+
+// systemdUserAvailable checks if systemd user session is functional.
+// Returns false on containers/VMs without a running user manager (common with SSH-only access).
+// Verifies XDG_RUNTIME_DIR exists and loginctl can show the current user session,
+// which is more reliable than just checking daemon-reload success.
+func systemdUserAvailable() bool {
+	// Check 1: XDG_RUNTIME_DIR must be set (indicates a proper login session)
+	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
+	if runtimeDir == "" {
+		return false
+	}
+	if _, err := os.Stat(runtimeDir); err != nil {
+		return false
+	}
+
+	// Check 2: loginctl show-user verifies systemd-logind manages this user
+	if err := exec.Command("loginctl", "show-user", "--no-pager").Run(); err != nil {
+		// Fallback: try daemon-reload (loginctl may not be available)
+		return exec.Command("systemctl", "--user", "daemon-reload").Run() == nil
+	}
+
+	return true
+}
+
+// InstallBridgeDaemon installs and starts the bridge daemon.
+// macOS: launchd plist; Linux: systemd user service.
+// Returns the unit/plist file path on success.
+func InstallBridgeDaemon() (string, error) {
+	plat := platform.Detect()
+	switch plat {
+	case platform.PlatformMacOS:
+		return installBridgeDaemonLaunchd()
+	case platform.PlatformLinux, platform.PlatformWSL2:
+		return installBridgeDaemonSystemd()
+	default:
+		condDir, _ := ConductorDir()
+		return "", fmt.Errorf("unsupported platform %s for daemon management; run manually: python3 %s/bridge.py", plat, condDir)
+	}
+}
+
+func installBridgeDaemonLaunchd() (string, error) {
+	plistContent, err := GenerateLaunchdPlist()
+	if err != nil {
+		return "", fmt.Errorf("failed to generate plist: %w", err)
+	}
+	plistPath, err := LaunchdPlistPath()
+	if err != nil {
+		return "", fmt.Errorf("failed to get plist path: %w", err)
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Join(homeDir, "Library", "LaunchAgents"), 0o755); err != nil {
+		return "", fmt.Errorf("failed to create LaunchAgents dir: %w", err)
+	}
+	_ = exec.Command("launchctl", "unload", plistPath).Run()
+	if err := os.WriteFile(plistPath, []byte(plistContent), 0o644); err != nil {
+		return "", fmt.Errorf("failed to write plist: %w", err)
+	}
+	if err := exec.Command("launchctl", "load", plistPath).Run(); err != nil {
+		return plistPath, fmt.Errorf("plist written but failed to load daemon: %w", err)
+	}
+	return plistPath, nil
+}
+
+func installBridgeDaemonSystemd() (string, error) {
+	unitContent, err := GenerateSystemdBridgeService()
+	if err != nil {
+		return "", fmt.Errorf("failed to generate systemd unit: %w", err)
+	}
+	unitPath, err := SystemdBridgeServicePath()
+	if err != nil {
+		return "", fmt.Errorf("failed to get systemd unit path: %w", err)
+	}
+	dir, err := SystemdUserDir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("failed to create systemd user dir: %w", err)
+	}
+	if err := os.WriteFile(unitPath, []byte(unitContent), 0o644); err != nil {
+		return "", fmt.Errorf("failed to write systemd unit: %w", err)
+	}
+	if !systemdUserAvailable() {
+		condDir, _ := ConductorDir()
+		return "", fmt.Errorf("systemd user session not available (common in containers/VMs without lingering); run manually: python3 %s/bridge.py", condDir)
+	}
+	if err := exec.Command("systemctl", "--user", "enable", "--now", systemdBridgeServiceName).Run(); err != nil {
+		return unitPath, fmt.Errorf("unit written but enable failed: %w", err)
+	}
+	return unitPath, nil
+}
+
+// InstallTransitionNotifierDaemon installs and starts the transition notifier daemon.
+func InstallTransitionNotifierDaemon() (string, error) {
+	plat := platform.Detect()
+	switch plat {
+	case platform.PlatformMacOS:
+		return installTransitionNotifierLaunchd()
+	case platform.PlatformLinux, platform.PlatformWSL2:
+		return installTransitionNotifierSystemd()
+	default:
+		return "", fmt.Errorf("unsupported platform %s for daemon management", plat)
+	}
+}
+
+// Seams for the Background-domain eviction guard (testable without touching the
+// real launchd registration). Production points them at the real impls.
+var (
+	transitionNotifierManagerName = launchctlManagerName
+	transitionNotifierIsRunning   = IsTransitionNotifierDaemonRunning
+	runLaunchctl                  = func(args ...string) error { return exec.Command("launchctl", args...).Run() }
+)
+
+// launchctlManagerName returns the current launchd domain's manager name —
+// "Aqua" for a login GUI session, "Background" for a process running under a
+// launchd-managed daemon (e.g. a tmux pane spawned by the agent-deck web
+// daemon, which is where a conductor session runs). Empty if launchctl is
+// unavailable or errors.
+func launchctlManagerName() string {
+	out, err := exec.Command("launchctl", "managername").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// inBackgroundLaunchdDomain reports whether we are in the launchd "Background"
+// domain — i.e. inside a daemon-spawned process tree (a conductor pane), not a
+// login shell. A user/GUI-domain `launchctl unload` issued from here reaches the
+// live notify-daemon CROSS-DOMAIN and evicts it, and the paired `load` registers
+// into the wrong (Background) domain — killing completion delivery fleet-wide.
+func inBackgroundLaunchdDomain() bool {
+	return transitionNotifierManagerName() == "Background"
+}
+
+func installTransitionNotifierLaunchd() (string, error) {
+	plistPath, err := TransitionNotifierLaunchdPlistPath()
+	if err != nil {
+		return "", fmt.Errorf("failed to get notifier plist path: %w", err)
+	}
+
+	// Background-domain eviction guard. `conductor setup` run from inside a
+	// conductor pane executes in the launchd "Background" domain. The unload
+	// below would reach the live notify-daemon cross-domain and evict it, and the
+	// load would re-register it into the wrong domain — completion delivery dies
+	// fleet-wide. When the daemon already runs and we're in Background, leave its
+	// registration completely untouched (conductor setup proceeds otherwise).
+	if inBackgroundLaunchdDomain() && transitionNotifierIsRunning() {
+		fmt.Fprintln(os.Stderr, "notify-daemon install skipped — Background launchd domain, "+
+			"existing daemon left intact (an unload here would evict it cross-domain). "+
+			"Re-run `agent-deck conductor setup` from a login shell to (re)install.")
+		return plistPath, nil
+	}
+
+	plistContent, err := GenerateTransitionNotifierLaunchdPlist()
+	if err != nil {
+		return "", fmt.Errorf("failed to generate notifier plist: %w", err)
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Join(homeDir, "Library", "LaunchAgents"), 0o755); err != nil {
+		return "", fmt.Errorf("failed to create LaunchAgents dir: %w", err)
+	}
+	_ = runLaunchctl("unload", plistPath)
+	if err := os.WriteFile(plistPath, []byte(plistContent), 0o644); err != nil {
+		return "", fmt.Errorf("failed to write notifier plist: %w", err)
+	}
+	if err := runLaunchctl("load", plistPath); err != nil {
+		return plistPath, fmt.Errorf("plist written but failed to load notifier daemon: %w", err)
+	}
+	return plistPath, nil
+}
+
+func installTransitionNotifierSystemd() (string, error) {
+	unitContent, err := GenerateSystemdTransitionNotifierService()
+	if err != nil {
+		return "", fmt.Errorf("failed to generate notifier unit: %w", err)
+	}
+	unitPath, err := SystemdTransitionNotifierServicePath()
+	if err != nil {
+		return "", fmt.Errorf("failed to get notifier unit path: %w", err)
+	}
+	dir, err := SystemdUserDir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("failed to create systemd user dir: %w", err)
+	}
+	if err := os.WriteFile(unitPath, []byte(unitContent), 0o644); err != nil {
+		return "", fmt.Errorf("failed to write notifier unit: %w", err)
+	}
+	if !systemdUserAvailable() {
+		return "", fmt.Errorf("systemd user session not available; run manually: agent-deck notify-daemon")
+	}
+	if err := exec.Command("systemctl", "--user", "enable", "--now", systemdTransitionNotifierServiceName).Run(); err != nil {
+		return unitPath, fmt.Errorf("unit written but enable failed: %w", err)
+	}
+	return unitPath, nil
+}
+
+// UninstallBridgeDaemon stops and removes the bridge daemon.
+func UninstallBridgeDaemon() error {
+	plat := platform.Detect()
+	switch plat {
+	case platform.PlatformMacOS:
+		return uninstallBridgeDaemonLaunchd()
+	case platform.PlatformLinux, platform.PlatformWSL2:
+		return uninstallBridgeDaemonSystemd()
+	default:
+		return nil
+	}
+}
+
+func uninstallBridgeDaemonLaunchd() error {
+	plistPath, err := LaunchdPlistPath()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(plistPath); os.IsNotExist(err) {
+		return nil
+	}
+	_ = exec.Command("launchctl", "unload", plistPath).Run()
+	return os.Remove(plistPath)
+}
+
+func uninstallBridgeDaemonSystemd() error {
+	_ = exec.Command("systemctl", "--user", "disable", "--now", systemdBridgeServiceName).Run()
+	unitPath, err := SystemdBridgeServicePath()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(unitPath); os.IsNotExist(err) {
+		return nil
+	}
+	if err := os.Remove(unitPath); err != nil {
+		return err
+	}
+	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
+	return nil
+}
+
+// UninstallTransitionNotifierDaemon stops and removes the transition notifier daemon.
+func UninstallTransitionNotifierDaemon() error {
+	plat := platform.Detect()
+	switch plat {
+	case platform.PlatformMacOS:
+		return uninstallTransitionNotifierLaunchd()
+	case platform.PlatformLinux, platform.PlatformWSL2:
+		return uninstallTransitionNotifierSystemd()
+	default:
+		return nil
+	}
+}
+
+func uninstallTransitionNotifierLaunchd() error {
+	plistPath, err := TransitionNotifierLaunchdPlistPath()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(plistPath); os.IsNotExist(err) {
+		return nil
+	}
+	_ = exec.Command("launchctl", "unload", plistPath).Run()
+	return os.Remove(plistPath)
+}
+
+func uninstallTransitionNotifierSystemd() error {
+	_ = exec.Command("systemctl", "--user", "disable", "--now", systemdTransitionNotifierServiceName).Run()
+	unitPath, err := SystemdTransitionNotifierServicePath()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(unitPath); os.IsNotExist(err) {
+		return nil
+	}
+	if err := os.Remove(unitPath); err != nil {
+		return err
+	}
+	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
+	return nil
+}
+
+// IsBridgeDaemonRunning checks if the bridge daemon is currently running.
+func IsBridgeDaemonRunning() bool {
+	plat := platform.Detect()
+	switch plat {
+	case platform.PlatformMacOS:
+		out, err := exec.Command("launchctl", "list", LaunchdPlistName).Output()
+		return err == nil && len(out) > 0
+	case platform.PlatformLinux, platform.PlatformWSL2:
+		err := exec.Command("systemctl", "--user", "is-active", "--quiet", systemdBridgeServiceName).Run()
+		return err == nil
+	default:
+		return false
+	}
+}
+
+// IsTransitionNotifierDaemonRunning checks if transition notifier daemon is running.
+func IsTransitionNotifierDaemonRunning() bool {
+	plat := platform.Detect()
+	switch plat {
+	case platform.PlatformMacOS:
+		out, err := exec.Command("launchctl", "list", TransitionNotifierLaunchdPlistName).Output()
+		return err == nil && len(out) > 0
+	case platform.PlatformLinux, platform.PlatformWSL2:
+		err := exec.Command("systemctl", "--user", "is-active", "--quiet", systemdTransitionNotifierServiceName).Run()
+		return err == nil
+	default:
+		return false
+	}
+}
+
+// BridgeDaemonHint returns a platform-appropriate hint for starting the bridge daemon.
+func BridgeDaemonHint() string {
+	plat := platform.Detect()
+	switch plat {
+	case platform.PlatformMacOS:
+		plistPath, err := LaunchdPlistPath()
+		if err == nil {
+			if _, err := os.Stat(plistPath); err == nil {
+				return fmt.Sprintf("Start daemon with: launchctl load %s", plistPath)
+			}
+		}
+		return "Run 'agent-deck conductor setup <name>' to install the daemon"
+	case platform.PlatformLinux, platform.PlatformWSL2:
+		condDir, _ := ConductorDir()
+		if !systemdUserAvailable() {
+			return fmt.Sprintf("Run manually: python3 %s/bridge.py", condDir)
+		}
+		unitPath, err := SystemdBridgeServicePath()
+		if err == nil {
+			if _, err := os.Stat(unitPath); err == nil {
+				return "Start daemon with: systemctl --user start agent-deck-conductor-bridge"
+			}
+		}
+		return "Run 'agent-deck conductor setup <name>' to install the daemon"
+	default:
+		condDir, _ := ConductorDir()
+		return fmt.Sprintf("Run manually: python3 %s/bridge.py", condDir)
+	}
+}
+
+// TransitionNotifierDaemonHint returns how to start transition notifier daemon.
+func TransitionNotifierDaemonHint() string {
+	plat := platform.Detect()
+	switch plat {
+	case platform.PlatformMacOS:
+		plistPath, err := TransitionNotifierLaunchdPlistPath()
+		if err == nil {
+			if _, err := os.Stat(plistPath); err == nil {
+				return fmt.Sprintf("Start notifier daemon with: launchctl load %s", plistPath)
+			}
+		}
+		return "Run 'agent-deck conductor setup <name>' to install notifier daemon"
+	case platform.PlatformLinux, platform.PlatformWSL2:
+		if !systemdUserAvailable() {
+			return "Run notifier manually: agent-deck notify-daemon"
+		}
+		unitPath, err := SystemdTransitionNotifierServicePath()
+		if err == nil {
+			if _, err := os.Stat(unitPath); err == nil {
+				return "Start notifier daemon with: systemctl --user start agent-deck-transition-notifier"
+			}
+		}
+		return "Run 'agent-deck conductor setup <name>' to install notifier daemon"
+	default:
+		return "Run notifier manually: agent-deck notify-daemon"
+	}
+}
+
+// InstallHeartbeatDaemon installs and starts the heartbeat timer for a conductor.
+// macOS: launchd plist; Linux: systemd timer/service pair.
+func InstallHeartbeatDaemon(name, profile string, intervalMinutes int) error {
+	plat := platform.Detect()
+	switch plat {
+	case platform.PlatformMacOS:
+		return installHeartbeatDaemonLaunchd(name, intervalMinutes)
+	case platform.PlatformLinux, platform.PlatformWSL2:
+		return installHeartbeatDaemonSystemd(name, intervalMinutes)
+	default:
+		return fmt.Errorf("unsupported platform %s for heartbeat daemon; run heartbeat.sh manually via cron", plat)
+	}
+}
+
+func installHeartbeatDaemonLaunchd(name string, intervalMinutes int) error {
+	plistContent, err := GenerateHeartbeatPlist(name, intervalMinutes)
+	if err != nil {
+		return fmt.Errorf("failed to generate heartbeat plist: %w", err)
+	}
+	hbPlistPath, err := HeartbeatPlistPath(name)
+	if err != nil {
+		return err
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	_ = os.MkdirAll(filepath.Join(homeDir, "Library", "LaunchAgents"), 0o755)
+	_ = exec.Command("launchctl", "unload", hbPlistPath).Run()
+	if err := os.WriteFile(hbPlistPath, []byte(plistContent), 0o644); err != nil {
+		return fmt.Errorf("failed to write heartbeat plist: %w", err)
+	}
+	if err := exec.Command("launchctl", "load", hbPlistPath).Run(); err != nil {
+		return fmt.Errorf("plist written but failed to load: %w", err)
+	}
+	return nil
+}
+
+func installHeartbeatDaemonSystemd(name string, intervalMinutes int) error {
+	dir, err := SystemdUserDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create systemd user dir: %w", err)
+	}
+
+	svcContent, err := GenerateSystemdHeartbeatService(name)
+	if err != nil {
+		return fmt.Errorf("failed to generate heartbeat service: %w", err)
+	}
+	svcPath, err := SystemdHeartbeatServicePath(name)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(svcPath, []byte(svcContent), 0o644); err != nil {
+		return fmt.Errorf("failed to write heartbeat service: %w", err)
+	}
+
+	timerContent := GenerateSystemdHeartbeatTimer(name, intervalMinutes)
+	timerPath, err := SystemdHeartbeatTimerPath(name)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(timerPath, []byte(timerContent), 0o644); err != nil {
+		return fmt.Errorf("failed to write heartbeat timer: %w", err)
+	}
+
+	if !systemdUserAvailable() {
+		condDir, _ := ConductorNameDir(name)
+		return fmt.Errorf("systemd user session not available; run heartbeat manually via cron or: bash %s/heartbeat.sh", condDir)
+	}
+	timerName := SystemdHeartbeatTimerName(name)
+	if err := exec.Command("systemctl", "--user", "enable", "--now", timerName).Run(); err != nil {
+		return fmt.Errorf("failed to enable heartbeat timer: %w", err)
+	}
+	return nil
+}
+
+// UninstallHeartbeatDaemon stops and removes the heartbeat timer for a conductor.
+func UninstallHeartbeatDaemon(name string) error {
+	plat := platform.Detect()
+	var err error
+	switch plat {
+	case platform.PlatformMacOS:
+		err = uninstallHeartbeatDaemonLaunchd(name)
+	case platform.PlatformLinux, platform.PlatformWSL2:
+		err = uninstallHeartbeatDaemonSystemd(name)
+	}
+	if err != nil {
+		return err
+	}
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		return err
+	}
+	if meta.Warning != "" {
+		// Older binary, newer data (#2354): SaveConductorMeta would reject
+		// the unrecognized agent and drop fields this build doesn't know.
+		// Turning the heartbeat off must never be blocked by that.
+		return disableConductorHeartbeatRaw(name)
+	}
+	meta.HeartbeatEnabled = false
+	return SaveConductorMeta(meta)
+}
+
+// disableConductorHeartbeatRaw sets heartbeat_enabled=false in meta.json
+// without decoding it into ConductorMeta, so the stored agent and any fields
+// this build doesn't know are kept as they are.
+func disableConductorHeartbeatRaw(name string) error {
+	lock, err := acquireConductorBaseLock()
+	if err != nil {
+		return err
+	}
+	defer lock.release()
+	dir, err := ConductorNameDir(name)
+	if err != nil {
+		return err
+	}
+	metaPath := filepath.Join(dir, "meta.json")
+	info, err := os.Stat(metaPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat meta.json for conductor %q: %w", name, err)
+	}
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return fmt.Errorf("failed to read meta.json for conductor %q: %w", name, err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return fmt.Errorf("failed to parse meta.json for conductor %q: %w", name, err)
+	}
+	if fields == nil {
+		return fmt.Errorf("failed to parse meta.json for conductor %q: expected an object", name)
+	}
+	fields["heartbeat_enabled"] = json.RawMessage("false")
+	data, err = json.MarshalIndent(fields, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal meta.json: %w", err)
+	}
+	return writeConductorMetaFile(dir, data, info.Mode().Perm())
+}
+
+func uninstallHeartbeatDaemonLaunchd(name string) error {
+	hbPlistPath, err := HeartbeatPlistPath(name)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(hbPlistPath); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if err := exec.Command("launchctl", "unload", hbPlistPath).Run(); err != nil {
+		return fmt.Errorf("stop launchd heartbeat: %w", err)
+	}
+	return RemoveHeartbeatPlist(name)
+}
+
+func uninstallHeartbeatDaemonSystemd(name string) error {
+	timerPath, err := SystemdHeartbeatTimerPath(name)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(timerPath); err == nil {
+		if err := exec.Command("systemctl", "--user", "disable", "--now", SystemdHeartbeatTimerName(name)).Run(); err != nil { //nolint:gosec // G204: fixed binary and argv, no shell; name only selects a --user unit
+			return fmt.Errorf("stop systemd heartbeat: %w", err)
+		}
+		if err := os.Remove(timerPath); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	svcPath, err := SystemdHeartbeatServicePath(name)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(svcPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
+	return nil
+}

@@ -1,0 +1,130 @@
+     xxx -xx
+     … +xx xxxxx (xxxx+x xx xxxxxx)
+  ⎿  Shell xxx xxx xxxxx xx /xxxxxxx/xxx/xxxx-xxxxxx-codex
+
+⏺ xxx xx xxxxxxxxx xxx xxxxxxxxx xxxxxxx xxxxxxxx.
+
+⏺ xxxx(xx ~/.xxxxx/xxxxxxx/xxxxx/xxxxxx-xxxxxxx/xxxxxxxx-xxxxxxx/x.x.xxxxxxx && xxxxxx '%x\x' '{"xxxxxxx":"x.x","xx":x,"xxxxxx":"xxxxxxxxxx","xxxxxx":{"xxxxxxxxxxxxxxx…)
+  ⎿  {
+       "xx": x,
+       "xxxxxxx": "x.x",
+     … +xx xxxxx (xxxx+x xx xxxxxx)
+  ⎿  Shell xxx xxx xxxxx xx /xxxxxxx/xxx/xxxx-xxxxxx-codex
+
+❯ xxxxxxx xxxxx xx xx xx xxxxxxxx xx xxxxxxx xx xxxxx xxxx xx x xxxxxxxxxxx
+
+⏺ xxxx(xx ~/.xxxxx/xxxxxxx/xxxxx/xxxxxx-xxxxxxx/xxxxxxxx-xxxxxxx/x.x.xxxxxxx && (xxxxxx '%x\x' '{"xxxxxxx":"x.x","xx":x,"xxxxxx":"xxxxxxxxxx","xxxxxx":{"xxxxxxxxxxxxxx…)
+  ⎿  {
+       "xx": x,
+       "xxxxxxx": "x.x",
+     … +xxx xxxxx (xxxx+x xx xxxxxx)
+  ⎿  Shell xxx xxx xxxxx xx /xxxxxxx/xxx/xxxx-xxxxxx-codex
+
+⏺ xxxx(xx ~/.xxxxx/xxxxxxx/xxxxx/xxxxxx-xxxxxxx/xxxxxxxx-xxxxxxx/x.x.xxxxxxx && (xxxxxx '%x\x' '{"xxxxxxx":"x.x","xx":x,"xxxxxx":"xxxxxxxxxx","xxxxxx":{"xxxxxxxxxxxxxx…)
+  ⎿  xxx: xxxxxxx: No xxxx xxxx xx xxxxxxxxx
+     (xxxx):x: xx xxxxxxx xxxxx: /xxxxx/x/.xxxxx/xxx/*
+  ⎿  Shell xxx xxx xxxxx xx /xxxxxxx/xxx/xxxx-xxxxxx-codex
+
+⏺ xxxx(xx ~/.xxxxx/xxxxxxx/xxxxx/xxxxxx-xxxxxxx/xxxxxxxx-xxxxxxx/x.x.xxxxxxx && x=$(xxxxx xxxxxxx); (xxxxxx '%x\x' '{"xxxxxxx":"x.x","xx":x,"xxxxxx":"xxxxxxxxxx","xxxx…)
+  ⎿  {
+       "xx": x,
+       "xxxxxxx": "x.x",
+     … +xx xxxxx (xxxx+x xx xxxxxx)
+  ⎿  Shell xxx xxx xxxxx xx /xxxxxxx/xxx/xxxx-xxxxxx-codex
+
+⏺ xxxx(xxxxxxx ~/.xxxxx/xxxxxx.xxxxxx "xxxxxx xxxxxxxxxx(xxxx);" ; xxxxxxx ~/.xxxxx/xxxxxx.xxxxxx "xxxxxx xx, xxxxxx(xxxxxxx,x,xxx) xxxx xxxx xxxxx xxxxxxx xxxx '%xxxx…)
+  ⎿  0|xx|XXXXXXX|0||0
+     x|xx|xxxxxxx|x||x
+     x|xx_xxxxx|xxxxxxx|x||x
+     … +xx xxxxx (xxxx+x xx xxxxxx)
+
+⏺ xxxx(xxxxxxx ~/.xxxxx/xxxxxx.xxxxxx "xxxxxx xxxxxxxx(xx,'xxxxxxxxx'), xxxxx, xxxxxx, xxxxxx(xxxxxxxxxxxxxxxxx,x,xxx) xxxx xxxx xxxxx xxxxxxxxxxxxxxxxx xxxx '%xxxxxxx…)
+  ⎿  0000-00-00 00:00:00|XXXXX|xxxxx_xxx::xxxxxxxxxx_xxxxxxx::xxxx_xxxxxxx|xxxxxxx_xxxx{xxxxxx_xx=00x0x000-xx0x-0x00-0000-0000x000xx00}:xxxxxxxxxx_xxxxxxxx{xxxx.xxxx="xx.xxxxxxxx.xx
+     xx_xxxxx" xxxxxxxxxx.xx="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" xxxxx.xx="xxxx_xxxxx"}:xxxx{xxxx.xxxx="xxxxxxx_xxxx.xxxx" xxxxxx.xx=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx xxxx.xx=
+     xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx xxxxx=xxx-x.x-xxx xxxxx.xxxx.xxxxxxxxx_xxxxxx=xxxx}:xxxxxxx_xxxx.xxx:xxx_xxxx:xxxx_xxxxxxx.xxxxxxx:xxx.xxxxxxx.xxxxxxx_xxx_xxxx: xxxxxxxx x
+     … +xx xxxxx (xxxx+x xx xxxxxx)
+
+⏺ xxxxx xxxxxxx. xxx xxxxxx xxxxx xxxx x xxxxx xx xx xxxx, xx x'x xxxxxxxx xxxxxxx xxx xxxxxx xxxxx xxxxxx xx xxxxx'x xxxxxxx xxxxxxxxxxx.
+
+  xxxxxx x xxxxxxxxx (xxxx+x xx xxxxxx)
+
+⏺ xxxx(xxxxxxx ~/.xxxxx/xxxxxx.xxxxxx "xxxxxx xxxxxxxxxxxxxxxxx xxxx xxxx xxxxx xxxxx='xxxx' xxx xxxxxxxxxxxxxxxxx xxxx '%xxxxxxxx-xxxxxxx%xxxxxxx xxxxxx%' xxxxx xx xx…)
+  ⎿  XXXXXX xxxxxx_xxxx="xxxxxxxx-xxxxxxx" error=xxxxxxxxxxx xxxx MCP server xxxxxx: XXXX-XXX error: -00000: Xxxxxxxx error: Xxx xxxx xxxxxx’x xx read xxxxxxx xx xxx’x in xxx xxxxxx
+     x xxxxxx.({"xxxxxx":"xxx xxxx xxxxxx’x xx xxxx xxxxxxx xx xxx’x xx xxx xxxxxxx xxxxxx."}): xxxx-xxx xxxxx: -xxxxx: xxxxxxxx xxxxx: xxx xxxx xxxxxx’x xx xxxx xxxxxxx xx xxx’x xx
+      xxx xxxxxxx xxxxxx.({"xxxxxx":"xxx xxxx xxxxxx’x xx xxxx xxxxxxx xx xxx’x xx xxx xxxxxxx xxxxxx."})
+     xxxx
+
+⏺ xxxx(x=/xxxxxxx/xxx/xxxxxx-xxx/-xxxxxxx-xxx-xxxx-xxxxxx-xxxxx/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx/xxxxxxxxxx; xxxxx -x $x; xxx > $x/xxxx.xx <<xxx
+      #!/xxx/xx…)
+  ⎿  IN:
+     xxx: /xxxxxxx/xxx/xxxxxx-xxx/-xxxxxxx-xxx-xxxx-xxxxxx-xxxxx/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx/xxxxxxxxxx/xx.xxx: xx xxxx xxxx xx xxxxxxxxx
+     … +x xxxxx (xxxx+x xx xxxxxx)
+  ⎿  (xxxxxxx 1m 30s)
+
+⏺ xxxx(x=/xxxxxxx/xxx/xxxxxx-xxx/-xxxxxxx-xxx-xxxx-xxxxxx-xxxxx/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx/xxxxxxxxxx; xxxx -xx $x/xxx.xxx)
+  ⎿  Xxxxxxx xxxxxxxxxx xxxxx xxxx xxxxx...
+
+⏺ xxxx(x=/xxxxxxx/xxx/xxxxxx-xxx/-xxxxxxx-xxx-xxxx-xxxxxx-xxxxx/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx/xxxxxxxxxx; xx $x && xxxxxxx xx xxxxx xxxx --xxxx-xxx-xxxx-xxxxx -…)
+  ⎿  IN:
+     {
+       "xxxxxxx": "x.x",
+     … +xx xxxxx (xxxx+x xx xxxxxx)
+  ⎿  Shell xxx xxx xxxxx xx /xxxxxxx/xxx/xxxx-xxxxxx-codex
+  ⎿  (xxxxxxx 2m)
+
+⏺ xxxxxxxxxx. xxx xxxxxxxxx xxxx xxxxx xxxxx xx xxxxx'x xxxxxxxxxx xxxxxxx xxxxxx xxx xxxxxx.
+
+⏺ xxxx(x="$xxxx/.xxxxx/xxxxxxxx-xxx/xxxxx xxxxxxxx xxx.xxx/xxxxxxxx/xxxxxxxxxxxxx/xxxxxxxxxxxxxxxxxxxx.xxx/xxxxxxxx/xxxxx/xxxxxxxxxxxxxxxxxxxx"
+      xxx xxxx xx '{"xxxxxxxx…)
+  ⎿  == {"xxxxxxxxxxxx":{"codex/xxxx-xxxxxx":{}}}
+     {"xxxxx":{"xxxx":-xxxxx,"xxxx":{"xxxxxx":"xxx xxxx xxxxxx’x xx xxxx xxxxxxx xx xxx’x xx xxx xxxxxxx xxxxxx."},"xxxxxxx":
+     == {"xxxxxxxxxxx":{"xxxx":{},"xxx":{}}}
+     … +x xxxxx (xxxx+x xx xxxxxx)
+
+⏺ xxxx(x=/xxxxxxx/xxx/xxxxxx-xxx/-xxxxxxx-xxx-xxxx-xxxxxx-xxxxx/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx/xxxxxxxxxx; xxxxx $x/xx.xxx $x/xxx.xxx; xx $x && xxxxxxx xx /xxxxx…)
+  ⎿  {
+       "xxxxxxx": "x.x",
+       "xx": x,
+     … +xx xxxxx (xxxx+x xx xxxxxx)
+  ⎿  Shell xxx xxx xxxxx xx /xxxxxxx/xxx/xxxx-xxxxxx-codex
+  ⎿  (xxxxxxx 2m)
+
+⏺ xxxx(xxxxx xxxxxxxx xxxx x>/xxx/xxxx)
+  ⎿  xxxxx_xxxxx_xxxxxxxx                     xxxxxxx            xxxxx
+     xxxxx_xxxxx_xxxxxxxx_xxxx_xxxxxxx        xxxxx xxxxxxxxxxx  xxxxx
+     xxxxx_xxxxx_xxxxxxxxx_xxxxxx             xxxxx xxxxxxxxxxx  xxxxx
+     … +xxx xxxxx (xxxx+x xx xxxxxx)
+
+⏺ xxxx(x=/xxxxxxx/xxx/xxxxxx-xxx/-xxxxxxx-xxx-xxxx-xxxxxx-xxxxx/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx/xxxxxxxxxx; xxxxx $x/xx.xxx $x/xxx.xxx; xx $x && xxxxxxx xx xxxxx…)
+  ⎿  {
+       "xxxxxxx": "x.x",
+       "xx": x,
+     … +xx xxxxx (xxxx+x xx xxxxxx)
+  ⎿  Shell xxx xxx xxxxx xx /xxxxxxx/xxx/xxxx-xxxxxx-codex
+  ⎿  (xxxxxxx 2m)
+
+⏺ xxxx xxxxx xxxxx. xxx xxxxxxxx xxx xxxx xxx xxx xxx xxxxxxxxx xxxxxxx (xxxxxx xxxxx).
+
+⏺ xxxx(xx ~/.xxxxx/xxxxxx.xxxx ~/.xxxxx/xxxxxx.xxxx.xxx-xxxxxxxx-xxxx-$(xxxx +%x) && /xxx/xxx/xxx -x '' 'x/^xxxxxxxxxxxx = "xxxxxxx"$/xxxxxxxxxxxx = "xxxxxxx"\xxxxxxxx…)
+  ⎿  xxxxxxxxx_xxxxxxxx = "xxxx"
+     xxxxx = "xxx-x-xxxxx"
+     xxxxx_xxxxxxxxx_xxxxxx = "xxxxxx"
+     … +x xxxxx (xxxx+x xx xxxxxx)
+  ⎿  Shell xxx xxx xxxxx xx /xxxxxxx/xxx/xxxx-xxxxxx-codex
+  ⎿  (xxxxxxx 2m)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Xxxx-xxxxxxx
+
+│ Xxx xxxxxxxx-xxxxxxx error xx x xxx in OpenAI'x Xxxxxxxx Xxx xxxxxx, xxx in xxxx xxxxx: xxxx Codex XXX (0.000.0) xxxxx x xxx xxxxxxxxx xxxxx xxx xxxxxx xxx'x read xxx. Xxxx xxxxxxx xxx
+│ (0.000.0) xxxxx'x xxxx xxxx xxxxx, xx xx xxxxx fine xxxxx. Xxx do you want xx xxxxxx xx?
+
+❯ 0. xxxxx xx (xxxxxxxxxxx)
+     xxx xxxxxxx xxxx xx xxxx. xxxxxxxx xxxxxxx xxxx xxxxx xx xxx xxxxxxxx xxx xxx xxxxx xxxxx xx xxx xxxxxxx xxx. xx xxxx xx xxxx xxxx xxxxxx xxxxxxx xxx xxxxxx.
+  0. xxxxxxx xxxxxx
+     xxx xxxxxxxx-xxxxxxx xxxxxxx = xxxxx xx ~/.xxxxx/xxxxxx.xxxx. xxx xxxxxxx xxxx xxxx, xxx xxxxxxxx xxxxxxx xxxx xxxxx xxx xx xxx xxxxxxx xxx xxxxxxx xxxx xxx xxx xxxx xxxxxx.
+  0. xxxx xxxxxxxxx.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  0. xxxx xxxxx xxxx
+
+Enter to select · ↑/↓ xx xxxxxxxx · Esc to cancel
+

@@ -1,0 +1,20 @@
+
+
+
+         ╭────────────────────────────────────────────────────────────╮
+         │                                                            │
+         │  🔍 Local Search (Agent Deck sessions)                     │
+         │                                                            │
+         │  ╭──────────────────────────────────────────────────╮      │
+         │  │ > Fuzzy: title, group, project, tool             │      │
+         │  ╰──────────────────────────────────────────────────╯      │
+         │  ⚠ Recall is off ([recall] enabled = false in              │
+         │  config.toml); showing the local title search instead      │
+         │    Tip: waiting / running / idle to filter by status       │
+         │                                                            │
+         │                                                            │
+         │    全部本机会话 · No results                               │
+         │    [Enter] Select  [↑↓] Navigate                           │
+         │    [Tab] Recall  [Esc] Cancel                              │
+         │                                                            │
+         ╰────────────────────────────────────────────────────────────╯

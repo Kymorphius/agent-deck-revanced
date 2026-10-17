@@ -1,0 +1,428 @@
+package ui
+
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+)
+
+var (
+	searchBoxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(ColorAccent).
+			Padding(0, 1)
+
+	resultItemStyle = lipgloss.NewStyle().
+			Padding(0, 2)
+
+	selectedResultStyle = lipgloss.NewStyle().
+				Padding(0, 2).
+				Background(ColorAccent).
+				Foreground(ColorBg)
+
+	overlayStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(ColorAccent).
+			Padding(1, 2)
+)
+
+// Search represents the search overlay component
+type Search struct {
+	input          textinput.Model
+	results        []*session.Instance
+	cursor         int
+	width          int
+	height         int
+	visible        bool
+	allItems       []*session.Instance
+	switchToGlobal bool   // Flag to signal switch to global search
+	scopedGroup    string // Non-empty => filter items to this exact GroupPath (v1.7.60)
+	viewFilter     func(*session.Instance) bool
+	scopeLabel     string // Display name of the current view; empty outside view scope.
+	notice         string // why G landed here instead of Recall; drawn under the input until Hide
+}
+
+// NewSearch creates a new search overlay
+func NewSearch() *Search {
+	ti := textinput.New()
+	// matrix/hardened: expose the fields accepted by local fuzzy search.
+	ti.Placeholder = "Fuzzy: title, group, project, tool"
+	ti.Focus()
+	ti.CharLimit = 100
+	ti.Width = 50
+
+	return &Search{
+		input:   ti,
+		results: []*session.Instance{},
+		cursor:  0,
+		visible: false,
+	}
+}
+
+// SetItems sets the full list of items to search through. The active scope is
+// applied before storage so background reloads cannot leak hidden sessions
+// into a view-scoped or exact-group search. The current query stays intact.
+func (s *Search) SetItems(items []*session.Instance) {
+	filtered := make([]*session.Instance, 0, len(items))
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		group := it.GroupPath
+		if group == "" {
+			group = session.DefaultGroupPath
+		}
+		if s.scopedGroup != "" && group != s.scopedGroup {
+			continue
+		}
+		if s.viewFilter != nil && !s.viewFilter(it) {
+			continue
+		}
+		filtered = append(filtered, it)
+	}
+	s.allItems = filtered
+	s.updateResults()
+}
+
+// SetNotice sets a warning line drawn under the input for as long as the
+// overlay is open (G with the Recall index closed). Hide clears it, so a
+// later `/` opens the plain filter.
+func (s *Search) SetNotice(notice string) {
+	s.notice = notice
+}
+
+// SetScopedGroup restricts SetItems to a single group path. Pass "" to clear.
+func (s *Search) SetScopedGroup(groupPath string) {
+	s.scopedGroup = groupPath
+	s.viewFilter = nil
+	s.scopeLabel = ""
+}
+
+// SetViewScope restricts subsequent SetItems calls to the current view.
+// The caller supplies the complete list again after changing scope.
+func (s *Search) SetViewScope(label string, filter func(*session.Instance) bool) {
+	s.scopedGroup = ""
+	s.viewFilter = filter
+	s.scopeLabel = strings.TrimSpace(label)
+}
+
+// SetSize sets the dimensions of the search overlay
+func (s *Search) SetSize(width, height int) {
+	s.width = width
+	s.height = height
+}
+
+// Show makes the search overlay visible
+func (s *Search) Show() {
+	// matrix/hardened: each local search starts empty unless the user opts
+	// to keep the previous query. Read on open so settings apply immediately.
+	config, _ := session.LoadUserConfig()
+	if config == nil || config.UI.GetClearSearchOnOpen() {
+		s.input.SetValue("")
+		s.updateResults()
+	}
+	s.visible = true
+	s.input.Focus()
+	s.switchToGlobal = false
+}
+
+// WantsSwitchToGlobal returns true if user pressed Tab to switch to global search
+func (s *Search) WantsSwitchToGlobal() bool {
+	if s.switchToGlobal {
+		s.switchToGlobal = false
+		return true
+	}
+	return false
+}
+
+// Hide hides the search overlay and clears its scope. Keep results intact so
+// the parent can read Selected after Enter closes the overlay.
+func (s *Search) Hide() {
+	s.visible = false
+	s.input.Blur()
+	s.scopedGroup = ""
+	s.viewFilter = nil
+	s.scopeLabel = ""
+	s.notice = ""
+}
+
+// IsVisible returns whether the search overlay is visible
+func (s *Search) IsVisible() bool {
+	return s.visible
+}
+
+// Selected returns the currently selected item
+func (s *Search) Selected() *session.Instance {
+	if len(s.results) == 0 {
+		return nil
+	}
+	if s.cursor >= len(s.results) {
+		s.cursor = len(s.results) - 1
+	}
+	return s.results[s.cursor]
+}
+
+// Update handles messages for the search overlay
+// Returns the updated Search and any command to execute
+func (s *Search) Update(msg tea.Msg) (*Search, tea.Cmd) {
+	if !s.visible {
+		return s, nil
+	}
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "esc":
+			s.Hide()
+			return s, nil
+
+		case "enter":
+			if len(s.results) > 0 {
+				s.Hide()
+				// Parent should handle the selection
+			}
+			return s, nil
+
+		case "up", "ctrl+k":
+			if s.cursor > 0 {
+				s.cursor--
+			}
+			return s, nil
+
+		case "down", "ctrl+j":
+			if s.cursor < len(s.results)-1 {
+				s.cursor++
+			}
+			return s, nil
+
+		case "tab":
+			// Signal to switch to global search
+			s.switchToGlobal = true
+			s.Hide()
+			return s, nil
+
+		default:
+			// Update text input
+			var cmd tea.Cmd
+			s.input, cmd = s.input.Update(msg)
+			s.updateResults()
+			return s, cmd
+		}
+	}
+
+	return s, nil
+}
+
+// updateResults filters the items based on the current input
+func (s *Search) updateResults() {
+	query := s.input.Value()
+	s.results = session.FilterByQuery(s.allItems, query)
+	s.cursor = 0
+}
+
+// View renders the search overlay
+func (s *Search) View() string {
+	if !s.visible {
+		return ""
+	}
+
+	// Header
+	header := lipgloss.NewStyle().
+		Foreground(ColorAccent).
+		Bold(true).
+		Render("🔍 Local Search (Agent Deck sessions)")
+
+	// Build search input box at a fixed width. If the box's total width
+	// (border + padding) exceeds the overlay's content budget, lipgloss
+	// hard-wraps the border line and splits a corner glyph onto its own row.
+	overlayWidth := searchOverlayWidth(s.width)
+	innerWidth := overlayWidth - overlayStyle.GetHorizontalFrameSize() - searchBoxStyle.GetHorizontalFrameSize()
+	innerWidth = max(innerWidth, 10)
+	s.input.Width = innerWidth - lipgloss.Width(s.input.Prompt)
+	searchBox := searchBoxStyle.Width(innerWidth).Render(s.input.View())
+
+	// Build results list, one row per result: the ten-row window follows the
+	// cursor, and on a short terminal renderFittedDialog scrolls these rows
+	// around it.
+	const maxResults = 10
+	start := 0
+	if s.cursor >= maxResults {
+		start = s.cursor - maxResults + 1
+	}
+	end := min(start+maxResults, len(s.results))
+	resultRows := make([]string, 0, end-start)
+	for i := start; i < end; i++ {
+		resultRows = append(resultRows, renderSearchResult(s.results[i], i == s.cursor, overlayWidth-overlayStyle.GetHorizontalFrameSize()-resultItemStyle.GetHorizontalFrameSize()))
+	}
+	if len(resultRows) == 0 {
+		resultRows = []string{""}
+	}
+
+	// Keep the scope beside the count, pinned above the key hints. Long view
+	// and group labels are cell-truncated rather than wrapping over results.
+	scope := "全部本机会话"
+	if s.scopedGroup != "" {
+		scope = "当前分组 · " + s.scopedGroup
+	} else if s.viewFilter != nil {
+		scope = "当前视图"
+		if s.scopeLabel != "" {
+			scope += " · " + s.scopeLabel
+		}
+	}
+	countWidth := overlayWidth - overlayStyle.GetHorizontalFrameSize()
+	count := renderDialogFooterRows(countWidth, 2, " · ", []string{
+		"  " + cellTruncate(scope, max(countWidth-2, 1), "…"),
+		formatCount(len(s.results)),
+	})
+	countStr := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("241")).
+		Render(count)
+
+	// Show filter hint when search is empty
+	hintStr := ""
+	if s.input.Value() == "" {
+		hintStr = lipgloss.NewStyle().
+			Foreground(ColorComment).
+			Italic(true).
+			Render("  Tip: waiting / running / idle to filter by status")
+	}
+	// The notice (why G opened this overlay) stays for as long as it is
+	// open; the footer would be hidden behind the overlay.
+	if s.notice != "" {
+		notice := lipgloss.NewStyle().
+			Foreground(ColorWarning).
+			Width(innerWidth + searchBoxStyle.GetHorizontalFrameSize()).
+			Render("⚠ " + s.notice)
+		if hintStr != "" {
+			hintStr = notice + "\n" + hintStr
+		} else {
+			hintStr = notice
+		}
+	}
+
+	// Keyboard shortcuts hint, on at most two rows broken between hints so
+	// "[Esc] Cancel" never wraps onto a line of its own; [↑↓] Navigate drops
+	// out only when even two rows are too narrow.
+	keys := renderDialogFooterRows(overlayWidth-overlayStyle.GetHorizontalPadding(), 2, "  ",
+		[]string{"  [Enter] Select", "[↑↓] Navigate", "[Tab] Recall", "[Esc] Cancel"}, 1)
+	keysHint := lipgloss.NewStyle().
+		Foreground(ColorComment).
+		Render(glueBracketHintGroups(keys))
+
+	// Combine everything
+	head := []string{header, "", searchBox}
+	if hintStr != "" {
+		head = append(head, hintStr)
+	}
+	sections := dialogSections{
+		head:  append(head, ""),
+		body:  resultRows,
+		focus: s.cursor - start,
+		foot:  []string{countStr, keysHint},
+	}
+
+	// Wrap in overlay box - responsive width, never taller than the screen
+	overlay := renderFittedDialog(overlayStyle.Width(overlayWidth), centeredDialogHeight(s.height), sections)
+
+	// Center in the screen
+	return centerInScreen(overlay, s.width, s.height)
+}
+
+func renderSearchResult(item *session.Instance, selected bool, width int) string {
+	name := item.Title + " (" + item.Tool + ")"
+	group := item.GroupPath
+	if group == "" {
+		group = session.DefaultGroupPath
+	}
+	pathTail := filepath.Base(strings.TrimRight(item.ProjectPath, string(filepath.Separator)))
+	if item.ProjectPath == "" {
+		pathTail = "?"
+	}
+	// Give the title the row first. Metadata uses the remaining space and
+	// disappears only when even its shortest useful form cannot fit.
+	available := max(1, width-4)
+	if cellWidth(name) > available {
+		keep := available - 1
+		head := keep / 2
+		name = ansi.Cut(name, 0, head) + "…" + ansi.Cut(name, cellWidth(name)-(keep-head), cellWidth(name))
+	}
+	meta := ""
+	if budget := available - cellWidth(name); budget >= 5 {
+		meta = "  " + cellTruncate(group+" · "+pathTail, budget-2, "…")
+	}
+	prefix := "  "
+	if selected {
+		prefix = "› "
+		meta = lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent).Faint(true).Render(meta)
+		return selectedResultStyle.Render(prefix + name + meta)
+	}
+	meta = lipgloss.NewStyle().Foreground(ColorComment).Render(meta)
+	return resultItemStyle.Render(prefix + name + meta)
+}
+
+// searchOverlayWidth returns the responsive overlay width for a screen width.
+func searchOverlayWidth(screenWidth int) int {
+	const preferred = 60
+	if screenWidth > 0 && screenWidth < preferred+10 {
+		// matrix/hardened: include the outer border in a 30-column terminal.
+		return min(max(screenWidth-10, 30), max(20, screenWidth-2))
+	}
+	return preferred
+}
+
+// formatCount formats the result count
+func formatCount(count int) string {
+	if count == 0 {
+		return "No results"
+	}
+	if count == 1 {
+		return "1 result"
+	}
+	return lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf("%d", count)) + " results"
+}
+
+// centerInScreen centers content in the terminal
+func centerInScreen(content string, screenWidth, screenHeight int) string {
+	lines := strings.Split(content, "\n")
+	contentHeight := len(lines)
+	contentWidth := 0
+	for _, line := range lines {
+		// cellWidth (not len): the box lines carry ANSI styling, so byte length
+		// over-counts and the dialog ends up shifted left of true center.
+		if w := cellWidth(line); w > contentWidth {
+			contentWidth = w
+		}
+	}
+
+	// Calculate vertical padding
+	verticalPad := (screenHeight - contentHeight) / 2
+	if verticalPad < 0 {
+		verticalPad = 0
+	}
+
+	// Calculate horizontal padding
+	horizontalPad := (screenWidth - contentWidth) / 2
+	if horizontalPad < 0 {
+		horizontalPad = 0
+	}
+
+	// Add vertical padding
+	var result strings.Builder
+	for i := 0; i < verticalPad; i++ {
+		result.WriteString("\n")
+	}
+
+	// Add horizontal padding and content
+	padding := strings.Repeat(" ", horizontalPad)
+	for _, line := range lines {
+		result.WriteString(padding + line + "\n")
+	}
+
+	return result.String()
+}

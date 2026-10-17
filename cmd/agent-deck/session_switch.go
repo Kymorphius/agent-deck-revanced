@@ -1,0 +1,325 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/watcher"
+)
+
+// handleSessionSwitch is the mutating CLI surface for the same backend used by
+// the TUI. It never infers an account or harness: both are explicit (an empty
+// value means the target default only where the preview says that is valid).
+func handleSessionSwitch(profile string, args []string) {
+	fs := flag.NewFlagSet("session switch", flag.ExitOnError)
+	toHarness := fs.String("to-harness", "", "Target harness (claude, codex, pi, …); empty keeps the source harness")
+	toAccount := fs.String("to-account", "", "Target configured account slot; empty means the target default")
+	maxBytes := fs.Int("max-bytes", session.DefaultHandoffMaxChars, "Maximum transferred context bytes for cross-harness handoff")
+	noStart := fs.Bool("no-start", false, "Create the distinct target without starting it")
+	confirmContextLoss := fs.Bool("confirm-context-loss", false, "Required for lossy cross-harness transfer after reviewing switch-preview")
+	archiveDestination := fs.Bool("archive-destination", false, "Install the source conversation even when the destination holds a newer or undated copy; the destination copy is archived next to it, never deleted")
+	jsonOutput := fs.Bool("json", false, "Output the switch result as JSON")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck session switch <id|title> --to-harness <harness> [--to-account <account>]")
+		fmt.Println()
+		fmt.Println("Switch a session through the common source-preserving backend.")
+		fmt.Println("Same-harness native switches are supported where verified; cross-harness directions create fresh targets and wait for native readiness evidence.")
+		fmt.Println("Configured account presence is reported; OAuth authentication is never verified here.")
+		fmt.Println("Pi cross-harness plans use the default account only; named Pi accounts fail explicitly.")
+		fmt.Println()
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		os.Exit(1)
+	}
+	if fs.NArg() < 1 {
+		fs.Usage()
+		os.Exit(1)
+	}
+	out := NewCLIOutput(*jsonOutput, false)
+	storage, instances, _, err := loadSessionData(profile)
+	if err != nil {
+		out.Error(err.Error(), ErrCodeNotFound)
+		os.Exit(1)
+	}
+	inst, errMsg, errCode := ResolveSession(fs.Arg(0), instances)
+	if inst == nil {
+		out.Error(errMsg, errCode)
+		os.Exit(1)
+	}
+	cfg, cfgErr := session.LoadUserConfig()
+	if cfgErr != nil {
+		out.Error(fmt.Sprintf("load config: %v", cfgErr), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	target := session.SwitchPreviewTarget{Harness: strings.TrimSpace(*toHarness), Account: strings.TrimSpace(*toAccount)}
+	sourceSnapshot := switchSourceSnapshot(inst, instances)
+	preview := session.PreviewSwitchWithMaxBytesAndSnapshot(cfg, inst, target, *maxBytes, &sourceSnapshot)
+	var result *session.HarnessSwitchResult
+	var crossResult *session.CrossHarnessSwitchResult
+	var switchErr error
+	if preview.Execution == session.ExecutionPlanned && preview.Refusal == nil {
+		if !*confirmContextLoss {
+			out.Error("cross-harness transfer is lossy; review `session switch-preview` and repeat with --confirm-context-loss", ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		crossResult, switchErr = session.ExecuteCrossHarnessSwitch(context.Background(), cfg, inst, session.CrossHarnessSwitchOptions{
+			Target: target, MaxBytes: *maxBytes, NoStart: *noStart, SourceSnapshot: &sourceSnapshot,
+		}, session.CrossHarnessSwitchDependencies{
+			Store:           session.StorageCrossHarnessTargetStore{Storage: storage},
+			Lifecycle:       session.InstanceCrossHarnessLifecycle{},
+			Observer:        session.NewNativeCrossHarnessTargetObserver(),
+			SourceOwnership: switchSourceOwnershipValidator(storage),
+		})
+	} else {
+		result, switchErr = session.ExecuteHarnessSwitch(cfg, inst, session.HarnessSwitchOptions{
+			Target: target, MaxBytes: *maxBytes, NoStart: *noStart,
+			Storage: storage, ArchiveDestination: *archiveDestination,
+		})
+	}
+	if result == nil && crossResult == nil {
+		if switchErr == nil {
+			switchErr = fmt.Errorf("switch failed without a result")
+		}
+		out.Error(switchErr.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	if switchErr != nil {
+		// A normal lack of readiness remains pending. A journal failure after a
+		// committed target/account write is instead failed and recovery-required;
+		// never present either as a successful switch.
+		if crossResult != nil && crossResult.Pending && !errors.Is(switchErr, session.ErrCrossHarnessRecoveryRequired) {
+			payload := crossHarnessPendingPayload(inst, crossResult)
+			if *jsonOutput {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetEscapeHTML(false)
+				_ = enc.Encode(payload)
+			} else {
+				fmt.Printf("Created distinct %s target %s; status=pending; readiness=%s (%s)\\n", crossHarnessTargetTool(crossResult, preview.TargetHarness), crossHarnessTargetID(crossResult), readinessPresentation(crossResult.TargetReady), crossResult.MissingContract)
+			}
+			return
+		}
+		if crossResult != nil {
+			data := crossHarnessFailurePayload(inst, crossResult, switchErr)
+			recoveryRequired := data["recovery_required"].(bool)
+			if *jsonOutput {
+				out.ErrorWithData(switchErr.Error(), ErrCodeInvalidOperation, data)
+			} else {
+				fmt.Fprintf(os.Stderr, "Switch failed; status=failed; recovery-required=%t; target_id=%s; target_created=%t; target_ready=%t; source_archived=%t: %v\n", recoveryRequired, crossHarnessTargetID(crossResult), crossResult.TargetCreated, crossResult.TargetReady, crossResult.TargetReady, switchErr)
+			}
+		} else if *jsonOutput {
+			out.ErrorWithData(switchErr.Error(), ErrCodeInvalidOperation, map[string]interface{}{"status": switchPresentationStatus(false, false), "pending": false, "committed": result != nil && result.Committed, "recovery_required": result != nil && result.Committed, "archive_destination_available": errors.Is(switchErr, session.ErrSwitchDestinationDivergent)})
+		} else {
+			message := switchErr.Error()
+			if errors.Is(switchErr, session.ErrSwitchDestinationDivergent) {
+				message += "; re-run with --archive-destination to archive it and switch anyway"
+			}
+			fmt.Fprintf(os.Stderr, "Switch failed; status=failed; recovery-required=%t: %v\n", result != nil && result.Committed, message)
+		}
+		// Native lifecycle work may have completed before a later journal/error
+		// boundary. Persist that exact bounded mutation without replaying the
+		// stale registry snapshot or the lifecycle operation.
+		if result != nil && result.Committed {
+			if saveErr := storage.CommitNativeHarnessSwitch(inst, result); saveErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: persist native switch recovery failed: %v\n", saveErr)
+			}
+		}
+		os.Exit(1)
+	}
+	if crossResult != nil {
+		payload := crossHarnessSuccessPayload(inst, crossResult)
+		if *jsonOutput {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetEscapeHTML(false)
+			_ = enc.Encode(payload)
+			return
+		}
+		fmt.Printf("Created distinct %s target %s; status=%s; readiness=%s; source_archived=%t\n", crossHarnessTargetTool(crossResult, preview.TargetHarness), crossHarnessTargetID(crossResult), crossHarnessPresentationStatus(crossResult), readinessPresentation(crossResult.TargetReady), crossResult.TargetReady)
+		return
+	}
+	if err := storage.CommitNativeHarnessSwitch(inst, result); err != nil {
+		out.Error(fmt.Sprintf("save switched session: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	payload := map[string]any{
+		"success": result.Committed && result.DestinationReady, "status": switchPresentationStatus(result.Committed, result.DestinationReady), "pending": result.Committed && !result.DestinationReady,
+		"id": inst.ID, "title": inst.Title,
+		"old_tool": result.OldTool, "new_tool": result.NewTool,
+		"old_account": result.OldAccount, "new_account": result.NewAccount,
+		"continuity": result.Continuity, "source_sha256": result.SourceArtifactSHA256,
+		"destination_path": result.DestinationPath, "destination_ready": result.DestinationReady,
+		"source_archived":      false,
+		"destination_archived": result.DestinationArchived,
+		"transcript":           result.Transcript,
+		"restarted":            result.Restarted, "loss_disclosure": result.LossDisclosure,
+	}
+	if *jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetEscapeHTML(false)
+		_ = enc.Encode(payload)
+		return
+	}
+	status := switchPresentationStatus(result.Committed, result.DestinationReady)
+	fmt.Printf("Switch %s: %s/%q -> %s/%q (%s); status=%s; readiness=%s\n", inst.Title, result.OldTool, result.OldAccount, result.NewTool, result.NewAccount, result.Continuity, status, readinessPresentation(result.DestinationReady))
+	if len(result.LossDisclosure) > 0 {
+		fmt.Printf("Not preserved: %s\n", strings.Join(result.LossDisclosure, "; "))
+	}
+}
+
+// switchPresentationStatus is shared by the native and cross-harness command
+// surfaces. A durable account assignment without native readiness evidence is
+// pending, not a successful ready switch.
+// switchSourceSnapshot reads only public watcher route metadata. A missing
+// clients.json means no routes are configured; an unreadable or malformed file
+// is fail-closed for cross-harness replacement because routing ownership cannot
+// be safely inferred or copied.
+// switchSourceOwnershipValidator obtains a fresh registry graph and watcher
+// routing state for each executor validation. The executor calls it before
+// staging and final commit; watcher files remain external to the DB transaction
+// and therefore cannot be proven atomic with that final CAS.
+func switchSourceOwnershipValidator(storage *session.Storage) session.CrossHarnessSourceOwnershipValidator {
+	return session.CrossHarnessSourceOwnershipValidatorFunc(func(source *session.Instance) (session.SwitchSourceSnapshot, error) {
+		if storage == nil {
+			return session.SwitchSourceSnapshot{ManagementUnknown: true}, fmt.Errorf("session storage is unavailable")
+		}
+		instances, err := storage.Load()
+		if err != nil {
+			return session.SwitchSourceSnapshot{ManagementUnknown: true}, fmt.Errorf("load current session graph: %w", err)
+		}
+		var current *session.Instance
+		for _, candidate := range instances {
+			if candidate != nil && source != nil && candidate.ID == source.ID {
+				current = candidate
+				break
+			}
+		}
+		if current == nil {
+			return session.AuthoritativeSwitchSourceSnapshot(source, instances, false, true)
+		}
+		snapshot := switchSourceSnapshot(current, instances)
+		return session.AuthoritativeSwitchSourceSnapshot(source, instances, snapshot.WatcherBridgeTarget, snapshot.ManagementUnknown)
+	})
+}
+
+func switchSourceSnapshot(inst *session.Instance, instances []*session.Instance) session.SwitchSourceSnapshot {
+	watcherTarget, managementUnknown := false, false
+	watcherDir, err := session.WatcherDir()
+	if err != nil {
+		managementUnknown = true
+	} else {
+		clientsPath := filepath.Join(watcherDir, "clients.json")
+		if _, statErr := os.Stat(clientsPath); statErr == nil {
+			clients, loadErr := watcher.LoadClientsJSON(clientsPath)
+			if loadErr != nil {
+				managementUnknown = true
+			} else {
+				for _, client := range clients {
+					if client.Conductor == inst.ID || client.Conductor == inst.Title || session.ConductorSessionTitle(client.Conductor) == inst.Title {
+						watcherTarget = true
+						break
+					}
+				}
+			}
+		} else if !os.IsNotExist(statErr) {
+			managementUnknown = true
+		}
+	}
+	return session.SnapshotSwitchSource(inst, instances, watcherTarget, managementUnknown)
+}
+
+func switchPresentationStatus(committed, destinationReady bool) string {
+	if !committed {
+		return "failed"
+	}
+	if !destinationReady {
+		return "pending"
+	}
+	return "success"
+}
+
+func crossHarnessTargetID(result *session.CrossHarnessSwitchResult) string {
+	if result == nil || result.Target == nil {
+		return ""
+	}
+	return result.Target.ID
+}
+
+// crossHarnessResultFields are the receipt fields every cross-harness JSON
+// shape carries. source_archived / source_superseded_by describe what the
+// engine has already committed: the source is superseded the moment the
+// target is verified ready, which happens BEFORE the final journal write, so
+// a recovery-required failure after that point still reports the archive.
+func crossHarnessResultFields(inst *session.Instance, r *session.CrossHarnessSwitchResult) map[string]any {
+	return map[string]any{
+		"operation_id": r.OperationID, "target_id": crossHarnessTargetID(r),
+		"target_created": r.TargetCreated, "target_ready": r.TargetReady,
+		"missing_contract": r.MissingContract, "configured_account": r.ConfiguredAccount,
+		"authentication": r.Authentication, "context_delivery": r.ContextDelivery,
+		"semantic_acceptance": r.SemanticAcceptance, "source_sha256": r.SourceSHA256,
+		"loss_disclosure": r.LossDisclosure,
+		"source_archived": r.TargetReady, "source_superseded_by": crossHarnessSupersededBy(inst, r),
+	}
+}
+
+func crossHarnessPendingPayload(inst *session.Instance, r *session.CrossHarnessSwitchResult) map[string]any {
+	payload := crossHarnessResultFields(inst, r)
+	payload["success"], payload["status"], payload["pending"] = false, "pending", true
+	return payload
+}
+
+func crossHarnessSuccessPayload(inst *session.Instance, r *session.CrossHarnessSwitchResult) map[string]any {
+	payload := crossHarnessResultFields(inst, r)
+	payload["success"], payload["status"], payload["pending"] = r.TargetReady, crossHarnessPresentationStatus(r), r.Pending
+	return payload
+}
+
+func crossHarnessFailurePayload(inst *session.Instance, r *session.CrossHarnessSwitchResult, switchErr error) map[string]any {
+	payload := crossHarnessResultFields(inst, r)
+	payload["status"], payload["pending"] = "failed", r.Pending
+	payload["recovery_required"] = r.TargetCreated || errors.Is(switchErr, session.ErrCrossHarnessRecoveryRequired)
+	return payload
+}
+
+func crossHarnessSupersededBy(inst *session.Instance, result *session.CrossHarnessSwitchResult) string {
+	if inst == nil || result == nil || !result.TargetReady {
+		return ""
+	}
+	if inst.SupersededBy != "" {
+		return inst.SupersededBy
+	}
+	return crossHarnessTargetID(result)
+}
+
+func crossHarnessTargetTool(result *session.CrossHarnessSwitchResult, fallback string) string {
+	if result == nil || result.Target == nil {
+		return fallback
+	}
+	return result.Target.Tool
+}
+
+func crossHarnessPresentationStatus(result *session.CrossHarnessSwitchResult) string {
+	if result == nil {
+		return "failed"
+	}
+	if result.Pending {
+		return "pending"
+	}
+	// matrix/hardened: recovery loads the existing durable target instead of
+	// creating it again; positive readiness must still be reported as success.
+	return switchPresentationStatus(result.TargetCreated || result.Target != nil, result.TargetReady)
+}
+
+func readinessPresentation(ready bool) string {
+	if ready {
+		return "ready"
+	}
+	return "pending"
+}

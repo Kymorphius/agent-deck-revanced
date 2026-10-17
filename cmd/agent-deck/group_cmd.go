@@ -1,0 +1,1526 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/asheshgoplani/agent-deck/internal/session"
+)
+
+// groupVerbCanonical maps a user-supplied group subcommand verb to its
+// canonical form, accepting common aliases. Returns ok=false if unknown.
+//
+// Issue #974: users coming from filesystem/`rm` vocabulary expect
+// `group remove` to work alongside `group delete` / `group rm`. We accept
+// all three so the user doesn't burn a round-trip guessing the verb.
+func groupVerbCanonical(verb string) (canonical string, ok bool) {
+	switch verb {
+	case "list", "ls":
+		return "list", true
+	case "show", "info":
+		return "show", true
+	case "create", "new":
+		return "create", true
+	case "update", "set":
+		return "update", true
+	case "delete", "rm", "remove":
+		return "delete", true
+	case "move", "mv":
+		return "move", true
+	case "change", "reparent":
+		return "change", true
+	case "reorder", "sort":
+		return "reorder", true
+	case "help", "--help", "-h":
+		return "help", true
+	}
+	return "", false
+}
+
+// handleGroup dispatches group subcommands
+func handleGroup(profile string, args []string) {
+	if len(args) == 0 {
+		// Default to list
+		if coreRegistryEnabled() {
+			cliGroupList(profile, nil)
+		} else {
+			handleGroupList(profile, nil)
+		}
+		return
+	}
+
+	canonical, ok := groupVerbCanonical(args[0])
+	if !ok {
+		fmt.Printf("Unknown group command: %s\n", args[0])
+		fmt.Println()
+		printGroupHelp()
+		os.Exit(1)
+	}
+
+	switch canonical {
+	case "list":
+		if coreRegistryEnabled() {
+			cliGroupList(profile, args[1:])
+		} else {
+			handleGroupList(profile, args[1:])
+		}
+	case "show":
+		handleGroupShow(profile, args[1:])
+	case "create":
+		handleGroupCreate(profile, args[1:])
+	case "update":
+		handleGroupUpdate(profile, args[1:])
+	case "delete":
+		handleGroupDelete(profile, args[1:])
+	case "move":
+		handleGroupMove(profile, args[1:])
+	case "change":
+		handleGroupChange(profile, args[1:])
+	case "reorder":
+		handleGroupReorder(profile, args[1:])
+	case "help":
+		printGroupHelp()
+	}
+}
+
+// printGroupHelp prints usage for group commands
+func printGroupHelp() {
+	fmt.Println("Usage: agent-deck group <command> [options]")
+	fmt.Println()
+	fmt.Println("Commands:")
+	fmt.Println("  list              List all groups with session counts")
+	fmt.Println("  show <name>       Show one group; --resolved adds the effective claude config (alias: info)")
+	fmt.Println("  create <name>     Create a new group")
+	fmt.Println("  update <name>     Update group settings")
+	fmt.Println("  delete <name>     Delete a group (aliases: rm, remove)")
+	fmt.Println("  move <id> <group> Move session to a different group")
+	fmt.Println("  change <group> [<dest>] Reparent a group (empty dest = move to root)")
+	fmt.Println("  reorder <name>    Reorder a group (--up, --down, --position N)")
+	fmt.Println()
+	fmt.Println("Examples:")
+	fmt.Println("  agent-deck group list")
+	fmt.Println("  agent-deck group show work --resolved        # Verify the effective [groups.\"work\".claude] config")
+	fmt.Println("  agent-deck group create mobile")
+	fmt.Println("  agent-deck group create ios --parent mobile")
+	fmt.Println("  agent-deck group update mobile --default-path /path/to/repo")
+	fmt.Println("  agent-deck group delete experiments")
+	fmt.Println("  agent-deck group delete work --force")
+	fmt.Println("  agent-deck group move my-project work/frontend")
+	fmt.Println("  agent-deck group move my-project \"\"          # Move to root")
+	fmt.Println("  agent-deck group change project1 work         # Move group 'project1' under 'work'")
+	fmt.Println("  agent-deck group change work/project1          # Move 'work/project1' to root")
+	fmt.Println("  agent-deck group reorder mobile --up")
+	fmt.Println("  agent-deck group reorder mobile --down")
+	fmt.Println("  agent-deck group reorder mobile --position 0")
+}
+
+// buildGroupListJSON is the body of `group list --json`: the group tree with
+// recursive session and status counts, as the indented object the CLI
+// prints, trailing newline included. handleGroupList prints it and the
+// remote agent's change probe (#2177) pushes it, so both sides of the
+// channel see the same bytes. Callers warm the status caches first
+// (session.RefreshInstancesForCLIStatus).
+func buildGroupListJSON(groupTree *session.GroupTree) ([]byte, error) {
+	// Build JSON output structure
+	type groupStatusJSON struct {
+		Running int `json:"running"`
+		Waiting int `json:"waiting"`
+		Idle    int `json:"idle"`
+		Error   int `json:"error"`
+		Stopped int `json:"stopped"`
+	}
+
+	type groupJSON struct {
+		Name         string           `json:"name"`
+		Path         string           `json:"path"`
+		SessionCount int              `json:"session_count"`
+		Status       *groupStatusJSON `json:"status,omitempty"`
+		Children     []groupJSON      `json:"children,omitempty"`
+	}
+
+	// Build hierarchical structure (with recursive session counts - Issue #48)
+	buildGroupJSON := func(g *session.Group) groupJSON {
+		// Count status recursively for this group and all subgroups
+		status := groupStatusJSON{}
+		for path, subGroup := range groupTree.Groups {
+			if path == g.Path || strings.HasPrefix(path, g.Path+"/") {
+				for _, sess := range subGroup.Sessions {
+					_ = sess.UpdateStatus() // Refresh status
+					switch sess.Status {
+					case session.StatusRunning:
+						status.Running++
+					case session.StatusWaiting:
+						status.Waiting++
+					case session.StatusIdle:
+						status.Idle++
+					case session.StatusError:
+						status.Error++
+					case session.StatusStopped:
+						status.Stopped++
+					}
+				}
+			}
+		}
+
+		// Use recursive session count
+		sessCount := groupTree.SessionCountForGroup(g.Path)
+		gj := groupJSON{
+			Name:         g.Name,
+			Path:         g.Path,
+			SessionCount: sessCount,
+		}
+		if sessCount > 0 {
+			gj.Status = &status
+		}
+		return gj
+	}
+
+	// Build the tree recursively: each group carries its direct children
+	// (one level deeper, same prefix), which carry theirs, so a group at
+	// any depth appears, including empty ones the session list cannot
+	// reveal. GroupList is already ordered (a parent before its children,
+	// siblings by their persisted Order), so sibling order is preserved.
+	var buildSubtree func(g *session.Group) groupJSON
+	buildSubtree = func(g *session.Group) groupJSON {
+		gj := buildGroupJSON(g)
+		childLevel := session.GetGroupLevel(g.Path) + 1
+		for _, child := range groupTree.GroupList {
+			if strings.HasPrefix(child.Path, g.Path+"/") && session.GetGroupLevel(child.Path) == childLevel {
+				gj.Children = append(gj.Children, buildSubtree(child))
+			}
+		}
+		return gj
+	}
+
+	groupsJSON := []groupJSON{}
+	for _, g := range groupTree.GroupList {
+		if session.GetGroupLevel(g.Path) == 0 {
+			groupsJSON = append(groupsJSON, buildSubtree(g))
+		}
+	}
+
+	// Count totals
+	totalGroups := len(groupTree.Groups)
+	totalSessions := groupTree.SessionCount()
+
+	output, err := json.MarshalIndent(map[string]interface{}{
+		"groups":         groupsJSON,
+		"total_groups":   totalGroups,
+		"total_sessions": totalSessions,
+	}, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(output, '\n'), nil
+}
+
+// handleGroupList lists all groups with session counts and status
+func handleGroupList(profile string, args []string) {
+	fs := flag.NewFlagSet("group list", flag.ExitOnError)
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	quiet := fs.Bool("quiet", false, "Minimal output")
+	quietShort := fs.Bool("q", false, "Minimal output (short)")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck group list [options]")
+		fmt.Println()
+		fmt.Println("List all groups with session counts.")
+		fmt.Println()
+		fmt.Println("Options:")
+		fs.PrintDefaults()
+	}
+
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		os.Exit(1)
+	}
+
+	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
+
+	// Load sessions and groups
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	instances, groups, err := storage.LoadWithGroups()
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	// Warm tmux pane-title cache + load hook statuses once up-front so
+	// the per-status counts below match the TUI and /api/menu view
+	// (issue #610). Without this the nested UpdateStatus calls each run
+	// with a cold cache and miss the Claude "working" spinner.
+	session.RefreshInstancesForCLIStatus(instances)
+
+	// Build group tree
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+
+	if *jsonOutput {
+		output, err := buildGroupListJSON(groupTree)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to format JSON: %v\n", err)
+			os.Exit(1)
+		}
+		if !*quiet && !*quietShort {
+			fmt.Print(string(output))
+		}
+		return
+	}
+
+	// Human-readable output
+	if len(groupTree.Groups) == 0 {
+		out.Print("No groups found.\n", nil)
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Groups:\n\n")
+	sb.WriteString(fmt.Sprintf("%-20s %-10s %s\n", "NAME", "SESSIONS", "STATUS"))
+	sb.WriteString(strings.Repeat("-", 50) + "\n")
+
+	// Track which groups we've printed to handle hierarchy
+	printedPaths := make(map[string]bool)
+
+	// Print groups in tree order
+	for _, g := range groupTree.GroupList {
+		if printedPaths[g.Path] {
+			continue
+		}
+
+		// Calculate indent based on level
+		level := session.GetGroupLevel(g.Path)
+		indent := strings.Repeat("  ", level)
+		prefix := ""
+		if level > 0 {
+			// Find if this is last sibling at its level
+			parentPath := getParentGroupPath(g.Path)
+			isLast := true
+			foundCurrent := false
+			for _, other := range groupTree.GroupList {
+				otherParent := getParentGroupPath(other.Path)
+				if otherParent == parentPath && session.GetGroupLevel(other.Path) == level {
+					if foundCurrent && other.Path != g.Path {
+						isLast = false
+						break
+					}
+					if other.Path == g.Path {
+						foundCurrent = true
+					}
+				}
+			}
+			if isLast {
+				prefix = "└── "
+			} else {
+				prefix = "├── "
+			}
+		}
+
+		// Count sessions and status for this group (including subgroups - Issue #48)
+		sessCount := groupTree.SessionCountForGroup(g.Path)
+		statusStr := ""
+		if sessCount > 0 {
+			running, waiting, idle := 0, 0, 0
+			// Count status recursively for all sessions in this group and subgroups
+			for path, subGroup := range groupTree.Groups {
+				if path == g.Path || strings.HasPrefix(path, g.Path+"/") {
+					for _, sess := range subGroup.Sessions {
+						_ = sess.UpdateStatus()
+						switch sess.Status {
+						case session.StatusRunning:
+							running++
+						case session.StatusWaiting:
+							waiting++
+						case session.StatusIdle:
+							idle++
+						}
+					}
+				}
+			}
+			var parts []string
+			if running > 0 {
+				parts = append(parts, fmt.Sprintf("● %d", running))
+			}
+			if waiting > 0 {
+				parts = append(parts, fmt.Sprintf("◐ %d", waiting))
+			}
+			if idle > 0 {
+				parts = append(parts, fmt.Sprintf("○ %d", idle))
+			}
+			statusStr = strings.Join(parts, " ")
+		}
+
+		name := indent + prefix + g.Name
+		sb.WriteString(fmt.Sprintf("%-20s %-10d %s\n", truncateGroupName(name, 20), sessCount, statusStr))
+		printedPaths[g.Path] = true
+	}
+
+	totalGroups := len(groupTree.Groups)
+	totalSessions := groupTree.SessionCount()
+	sb.WriteString(fmt.Sprintf("\nTotal: %d groups, %d sessions\n", totalGroups, totalSessions))
+
+	out.Print(sb.String(), nil)
+}
+
+// handleGroupShow shows one group's DB-resident settings and, with
+// --resolved, the effective Claude configuration the spawn builders would
+// use for a session in this group (config_dir, env_file, command, model,
+// env, skills, mcps — each with its source level). The verification
+// counterpart to hand-editing a [groups.X.claude] stanza: a key typo, a
+// TOML parse error, or a missing env_file are all visible here instead of
+// silently degrading at launch.
+func handleGroupShow(profile string, args []string) {
+	fs := flag.NewFlagSet("group show", flag.ExitOnError)
+	resolved := fs.Bool("resolved", false, "Resolve the effective claude config for this group (sources included)")
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	quiet := fs.Bool("quiet", false, "Minimal output")
+	quietShort := fs.Bool("q", false, "Minimal output (short)")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck group show <name> [--resolved] [--json]")
+		fmt.Println()
+		fmt.Println("Show a group's settings.")
+		fmt.Println()
+		fmt.Println("Options:")
+		fs.PrintDefaults()
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  agent-deck group show work")
+		fmt.Println("  agent-deck group show work --resolved")
+		fmt.Println("  agent-deck group show work --resolved --json")
+	}
+
+	args = reorderGroupArgs(args)
+
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		os.Exit(1)
+	}
+
+	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
+
+	name := fs.Arg(0)
+	if name == "" {
+		out.Error("group name is required", ErrCodeNotFound)
+		fmt.Println("Usage: agent-deck group show <name> [--resolved] [--json]")
+		os.Exit(1)
+	}
+
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	instances, groups, err := storage.LoadWithGroups()
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+
+	// Resolve the group path: exact path first, then case-insensitive name
+	// match — same lookup the update verb uses.
+	groupPath := normalizeGroupPath(name)
+	_, exists := groupTree.Groups[groupPath]
+	if !exists {
+		for path, g := range groupTree.Groups {
+			if strings.EqualFold(g.Name, name) {
+				groupPath = path
+				exists = true
+				break
+			}
+		}
+	}
+	if !exists {
+		out.Error(fmt.Sprintf("group '%s' not found", name), ErrCodeNotFound)
+		os.Exit(2)
+	}
+
+	g := groupTree.Groups[groupPath]
+	sessionCount := 0
+	for _, inst := range instances {
+		if inst.GroupPath == groupPath {
+			sessionCount++
+		}
+	}
+
+	defaultPathReport := describeGroupDefaultPath(groupTree, groupPath)
+	jsonData := map[string]interface{}{
+		"success":        true,
+		"name":           g.Name,
+		"path":           groupPath,
+		"max_concurrent": g.MaxConcurrent,
+		"sessions":       sessionCount,
+	}
+	defaultPathReport.addTo(jsonData)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Group: %s\n", groupPath)
+	fmt.Fprintf(&b, "  Name:           %s\n", g.Name)
+	fmt.Fprintf(&b, "  Default path:   %s\n", defaultPathReport.Display())
+	fmt.Fprintf(&b, "  Max concurrent: %d\n", g.MaxConcurrent)
+	fmt.Fprintf(&b, "  Sessions:       %d\n", sessionCount)
+
+	if *resolved {
+		// Force a fresh config.toml parse — `group show --resolved` is a
+		// diagnostic command and must always show current on-disk state,
+		// not a stale cache entry from an earlier call in this process
+		// (e.g. the log-config bootstrap in main()).
+		session.ClearUserConfigCache()
+		res := session.ResolveGroupClaude(groupPath)
+		jsonData["claude"] = res
+
+		b.WriteString("\nClaude config (resolved for a session in this group):\n")
+		if res.ConfigError != "" {
+			fmt.Fprintf(&b, "  !! config.toml ERROR — every value below is a DEFAULT; the file is being ignored:\n  !! %s\n", res.ConfigError)
+		}
+		fmt.Fprintf(&b, "  config_dir: %s  [%s]\n", orNone(res.ConfigDir), res.ConfigDirSource)
+		if res.EnvFile != "" {
+			existsNote := "MISSING"
+			if res.EnvFileExists {
+				existsNote = "exists"
+			} else if !filepath.IsAbs(res.EnvFileResolved) {
+				existsNote = "relative — resolved against each session's working dir"
+			}
+			fmt.Fprintf(&b, "  env_file:   %s  [%s]  (%s)\n", res.EnvFile, res.EnvFileSource, existsNote)
+		} else {
+			b.WriteString("  env_file:   (none)\n")
+		}
+		fmt.Fprintf(&b, "  command:    %s  [%s]\n", res.Command, res.CommandSource)
+		if res.Model != "" {
+			fmt.Fprintf(&b, "  model:      %s  [%s]\n", res.Model, res.ModelSource)
+		} else {
+			b.WriteString("  model:      (none — per-session model or Claude's own default)\n")
+		}
+		if len(res.Env) > 0 {
+			keys := make([]string, 0, len(res.Env))
+			for k := range res.Env {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			b.WriteString("  env:\n")
+			for _, k := range keys {
+				fmt.Fprintf(&b, "    %s=%s\n", k, res.Env[k])
+			}
+		} else {
+			b.WriteString("  env:        (none)\n")
+		}
+		fmt.Fprintf(&b, "  plugins:    %s\n", orNone(strings.Join(res.Plugins, ", ")))
+		fmt.Fprintf(&b, "  mcps:       %s\n", orNone(strings.Join(res.MCPs, ", ")))
+	}
+
+	out.Print(b.String(), jsonData)
+}
+
+// orNone renders an empty string as "(none)" for human-readable output.
+func orNone(s string) string {
+	if s == "" {
+		return "(none)"
+	}
+	return s
+}
+
+// Sources reported in the `default_path_source` JSON field.
+const (
+	defaultPathSourceExplicit      = "explicit"
+	defaultPathSourceRecentSession = "recent_session"
+	defaultPathSourceNone          = "none"
+)
+
+// groupDefaultPathReport describes a group's effective default path together
+// with where it came from.
+//
+// Issue #1879: `group show`/`create`/`update` printed
+// GroupTree.DefaultPathForGroup, which silently substitutes the group's
+// most-recently-accessed session path when no default_path is configured. The
+// output was then indistinguishable from a real per-group override — including
+// right after `group update --clear-default-path`, which reported the derived
+// path as the group's "default path". Explicit is empty unless Source is
+// "explicit".
+type groupDefaultPathReport struct {
+	Effective string
+	Explicit  string
+	Source    string
+}
+
+// describeGroupDefaultPath splits the effective default path into its
+// authoritative and derived cases.
+func describeGroupDefaultPath(tree *session.GroupTree, groupPath string) groupDefaultPathReport {
+	if explicit, ok := tree.ExplicitDefaultPathForGroup(groupPath); ok {
+		return groupDefaultPathReport{Effective: explicit, Explicit: explicit, Source: defaultPathSourceExplicit}
+	}
+	if recent := tree.RecentSessionPathForGroup(groupPath); recent != "" {
+		return groupDefaultPathReport{Effective: recent, Source: defaultPathSourceRecentSession}
+	}
+	return groupDefaultPathReport{Source: defaultPathSourceNone}
+}
+
+// Display renders the effective path for human-readable output, annotating the
+// derived case so it can't be mistaken for a configured default_path.
+func (r groupDefaultPathReport) Display() string {
+	if r.Source == defaultPathSourceRecentSession {
+		return r.Effective + "  (derived from most recent session; no default_path set)"
+	}
+	return orNone(r.Effective)
+}
+
+// addTo writes the report's fields into a CLI JSON payload. default_path keeps
+// its established meaning (the effective path) for compatibility; the new
+// fields let a caller tell the two sources apart.
+func (r groupDefaultPathReport) addTo(jsonData map[string]interface{}) {
+	jsonData["default_path"] = r.Effective
+	jsonData["default_path_source"] = r.Source
+	jsonData["explicit_default_path"] = r.Explicit
+}
+
+// handleGroupCreate creates a new group
+func handleGroupCreate(profile string, args []string) {
+	fs := flag.NewFlagSet("group create", flag.ExitOnError)
+	parent := fs.String("parent", "", "Create as subgroup under this parent")
+	defaultPath := fs.String("default-path", "", "Default working directory for new sessions in this group")
+	// v1.9.1: -1 sentinel means "flag not set; use the GroupTree default of 1 (serial)".
+	// 0 = unlimited, 1 = serial, N>=2 = bounded.
+	maxConcurrent := fs.Int("max-concurrent", -1, "Cap on simultaneous running sessions in this group (0=unlimited, 1=serial, N=cap; default: [group_defaults].max_concurrent, else 1)")
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	quiet := fs.Bool("quiet", false, "Minimal output")
+	quietShort := fs.Bool("q", false, "Minimal output (short)")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck group create <name> [options]")
+		fmt.Println()
+		fmt.Println("Create a new group.")
+		fmt.Println()
+		fmt.Println("Options:")
+		fs.PrintDefaults()
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  agent-deck group create mobile")
+		fmt.Println("  agent-deck group create ios --parent mobile")
+		fmt.Println("  agent-deck group create backend --default-path ~/src/backend")
+		fmt.Println("  agent-deck group create wide --max-concurrent 4")
+	}
+
+	// Reorder args: move name to end so flags are parsed correctly
+	// Go's flag package stops parsing at first non-flag argument
+	// This allows: "group create ios --parent mobile" to work correctly
+	args = reorderGroupArgs(args)
+
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		os.Exit(1)
+	}
+
+	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
+
+	name := fs.Arg(0)
+	if name == "" {
+		out.Error("group name is required", ErrCodeNotFound)
+		fmt.Println("Usage: agent-deck group create <name> [--parent <group>]")
+		os.Exit(1)
+	}
+
+	// Load sessions and groups
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	instances, groups, err := storage.LoadWithGroups()
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	// Build group tree
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+
+	// Seed the new-group default from [group_defaults].max_concurrent. An
+	// explicit --max-concurrent flag still wins (applied post-create below).
+	cfg, _ := session.LoadUserConfig()
+	groupTree.DefaultMaxConcurrent = cfg.GroupDefaults.MaxConcurrent
+
+	var newGroup *session.Group
+	var fullPath string
+
+	if *parent != "" {
+		// Verify parent exists
+		parentPath := normalizeGroupPath(*parent)
+		if _, exists := groupTree.Groups[parentPath]; !exists {
+			out.Error(fmt.Sprintf("parent group '%s' not found", *parent), ErrCodeNotFound)
+			os.Exit(2)
+		}
+		newGroup = groupTree.CreateSubgroup(parentPath, name)
+		fullPath = newGroup.Path
+	} else {
+		newGroup = groupTree.CreateGroup(name)
+		fullPath = newGroup.Path
+	}
+
+	if *defaultPath != "" {
+		groupTree.SetDefaultPathForGroup(fullPath, *defaultPath)
+	}
+
+	// v1.9.1: only override the GroupTree default (1) when the user passed
+	// --max-concurrent explicitly. Sentinel -1 means "flag not set".
+	if *maxConcurrent >= 0 {
+		newGroup.MaxConcurrent = *maxConcurrent
+	}
+
+	// Check if group already existed
+	existingGroup := false
+	for _, g := range groups {
+		if g.Path == fullPath {
+			existingGroup = true
+			break
+		}
+	}
+
+	// Save
+	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
+		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	defaultPathReport := describeGroupDefaultPath(groupTree, fullPath)
+	createJSON := map[string]interface{}{
+		"success":        true,
+		"name":           newGroup.Name,
+		"path":           fullPath,
+		"max_concurrent": newGroup.MaxConcurrent,
+	}
+	defaultPathReport.addTo(createJSON)
+
+	if existingGroup {
+		createJSON["existed"] = true
+		out.Success(fmt.Sprintf("Group already exists: %s", fullPath), createJSON)
+	} else {
+		out.Success(fmt.Sprintf("Created group: %s (max_concurrent=%d)", fullPath, newGroup.MaxConcurrent), createJSON)
+	}
+}
+
+// handleGroupUpdate updates group metadata/settings
+func handleGroupUpdate(profile string, args []string) {
+	fs := flag.NewFlagSet("group update", flag.ExitOnError)
+	defaultPath := fs.String("default-path", "", "Default working directory for new sessions in this group")
+	clearDefaultPath := fs.Bool("clear-default-path", false, "Clear group default working directory")
+	// v1.9.1: -1 sentinel means "flag not set; leave existing value alone".
+	// 0 = unlimited, 1 = serial, N>=2 = bounded cap.
+	maxConcurrent := fs.Int("max-concurrent", -1, "Cap simultaneous running sessions in this group (0=unlimited, 1=serial, N=cap)")
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	quiet := fs.Bool("quiet", false, "Minimal output")
+	quietShort := fs.Bool("q", false, "Minimal output (short)")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck group update <name> [options]")
+		fmt.Println()
+		fmt.Println("Update group settings.")
+		fmt.Println()
+		fmt.Println("Options:")
+		fs.PrintDefaults()
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  agent-deck group update mobile --default-path /path/to/repo")
+		fmt.Println("  agent-deck group update mobile --clear-default-path")
+		fmt.Println("  agent-deck group update mobile --max-concurrent 2")
+	}
+
+	args = reorderGroupArgs(args)
+
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		os.Exit(1)
+	}
+
+	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
+
+	name := fs.Arg(0)
+	if name == "" {
+		out.Error("group name is required", ErrCodeNotFound)
+		fmt.Println("Usage: agent-deck group update <name> [--default-path <path>|--clear-default-path|--max-concurrent N]")
+		os.Exit(1)
+	}
+
+	// At least one mutation must be requested.
+	pathFlagSet := *defaultPath != "" || *clearDefaultPath
+	maxFlagSet := *maxConcurrent >= 0
+	if !pathFlagSet && !maxFlagSet {
+		out.Error("specify at least one of --default-path, --clear-default-path, or --max-concurrent", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	if *defaultPath != "" && *clearDefaultPath {
+		out.Error("--default-path and --clear-default-path are mutually exclusive", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	instances, groups, err := storage.LoadWithGroups()
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+
+	groupPath := normalizeGroupPath(name)
+	_, exists := groupTree.Groups[groupPath]
+	if !exists {
+		for path, g := range groupTree.Groups {
+			if strings.EqualFold(g.Name, name) {
+				groupPath = path
+				exists = true
+				break
+			}
+		}
+	}
+	if !exists {
+		out.Error(fmt.Sprintf("group '%s' not found", name), ErrCodeNotFound)
+		os.Exit(2)
+	}
+
+	if *clearDefaultPath {
+		groupTree.SetDefaultPathForGroup(groupPath, "")
+	} else if *defaultPath != "" {
+		groupTree.SetDefaultPathForGroup(groupPath, *defaultPath)
+	}
+
+	if maxFlagSet {
+		if g := groupTree.Groups[groupPath]; g != nil {
+			g.MaxConcurrent = *maxConcurrent
+		}
+	}
+
+	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
+		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	defaultPathReport := describeGroupDefaultPath(groupTree, groupPath)
+	currentMax := 0
+	if g := groupTree.Groups[groupPath]; g != nil {
+		currentMax = g.MaxConcurrent
+	}
+	updateJSON := map[string]interface{}{
+		"success":        true,
+		"path":           groupPath,
+		"max_concurrent": currentMax,
+	}
+	defaultPathReport.addTo(updateJSON)
+
+	if *clearDefaultPath && !maxFlagSet {
+		updateJSON["cleared"] = true
+		out.Success(fmt.Sprintf("Cleared default path for group: %s", groupPath), updateJSON)
+		return
+	}
+
+	out.Success(fmt.Sprintf("Updated group: %s", groupPath), updateJSON)
+}
+
+// handleGroupDelete deletes a group
+func handleGroupDelete(profile string, args []string) {
+	fs := flag.NewFlagSet("group delete", flag.ExitOnError)
+	force := fs.Bool("force", false, "Move sessions to parent and delete")
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	quiet := fs.Bool("quiet", false, "Minimal output")
+	quietShort := fs.Bool("q", false, "Minimal output (short)")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck group delete <name> [options]")
+		fmt.Println()
+		fmt.Println("Delete a group.")
+		fmt.Println()
+		fmt.Println("Options:")
+		fs.PrintDefaults()
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  agent-deck group delete experiments")
+		fmt.Println("  agent-deck group delete work --force   # Move sessions to parent")
+	}
+
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		os.Exit(1)
+	}
+
+	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
+
+	name := fs.Arg(0)
+	if name == "" {
+		out.Error("group name is required", ErrCodeNotFound)
+		fmt.Println("Usage: agent-deck group delete <name> [--force]")
+		os.Exit(1)
+	}
+
+	// Load sessions and groups
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	instances, groups, err := storage.LoadWithGroups()
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	// Build group tree
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+
+	// Find the group
+	groupPath := normalizeGroupPath(name)
+	group, exists := groupTree.Groups[groupPath]
+	if !exists {
+		// Direct lookup missed: collect all case-insensitive name matches.
+		// Using a collect-all approach prevents silently deleting a random
+		// duplicate when the same leaf name exists under multiple parents.
+		type match struct {
+			path  string
+			group *session.Group
+		}
+		var matches []match
+		for path, g := range groupTree.Groups {
+			if strings.EqualFold(g.Name, name) {
+				matches = append(matches, match{path: path, group: g})
+			}
+		}
+		switch len(matches) {
+		case 0:
+			// not found — handled below
+		case 1:
+			groupPath = matches[0].path
+			group = matches[0].group
+			exists = true
+		default:
+			// Ambiguous: multiple groups share this leaf name.
+			paths := make([]string, len(matches))
+			for i, m := range matches {
+				paths[i] = m.path
+			}
+			sort.Strings(paths)
+			out.Error(fmt.Sprintf("group '%s' is ambiguous: %s - use the full path", name, strings.Join(paths, ", ")), ErrCodeInvalidOperation)
+			os.Exit(2)
+		}
+	}
+
+	if !exists {
+		out.Error(fmt.Sprintf("group '%s' not found", name), ErrCodeNotFound)
+		os.Exit(2)
+	}
+
+	// Check if group is protected (default group)
+	if groupPath == session.DefaultGroupPath {
+		out.Error("cannot delete the default group", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	// Count sessions in group and subgroups
+	sessionCount := len(group.Sessions)
+	for path, g := range groupTree.Groups {
+		if strings.HasPrefix(path, groupPath+"/") {
+			sessionCount += len(g.Sessions)
+		}
+	}
+
+	// Check if group has sessions and --force not specified
+	if sessionCount > 0 && !*force {
+		out.Error(fmt.Sprintf("group '%s' has %d sessions. Use --force to move them to parent.", name, sessionCount), ErrCodeGroupNotEmpty)
+		os.Exit(1)
+	}
+
+	// Determine where sessions will be moved
+	parentPath := getParentGroupPath(groupPath)
+	movedTo := parentPath
+	if movedTo == "" {
+		movedTo = session.DefaultGroupPath
+	}
+
+	// Delete the group (this also moves sessions to default group)
+	movedSessions := groupTree.DeleteGroup(groupPath)
+
+	// If we want to move to parent instead of default, do it manually
+	if parentPath != "" && len(movedSessions) > 0 {
+		// Move sessions from default to parent
+		for _, sess := range movedSessions {
+			sess.GroupPath = parentPath
+		}
+		// Re-sync the tree
+		groupTree.SyncWithInstances(groupTree.GetAllInstances())
+	}
+
+	// Save
+	if err := storage.SaveWithGroups(groupTree.GetAllInstances(), groupTree); err != nil {
+		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	out.Success(fmt.Sprintf("Deleted group: %s", name), map[string]interface{}{
+		"success":        true,
+		"name":           name,
+		"sessions_moved": len(movedSessions),
+		"moved_to":       movedTo,
+	})
+}
+
+// handleGroupMove moves a session to a different group, or (with --to-profile)
+// migrates every session in a group to another profile's DB (issue #928).
+func handleGroupMove(profile string, args []string) {
+	fs := flag.NewFlagSet("group move", flag.ExitOnError)
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	quiet := fs.Bool("quiet", false, "Minimal output")
+	quietShort := fs.Bool("q", false, "Minimal output (short)")
+	toProfile := fs.String("to-profile", "", "Migrate every session in <group> to another profile's DB (issue #928)")
+	force := fs.Bool("force", false, "With --to-profile: migrate even if a session is running")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck group move <session-id> <group>")
+		fmt.Println("       agent-deck group move <group> --to-profile <name> [--force]")
+		fmt.Println()
+		fmt.Println("Move a session to a different group (default form), or migrate every")
+		fmt.Println("session in <group> to another profile's DB (with --to-profile).")
+		fmt.Println()
+		fmt.Println("Arguments:")
+		fmt.Println("  <session-id>   Session title, ID prefix, or path")
+		fmt.Println("  <group>        Target group path (or, with --to-profile, the source group)")
+		fmt.Println()
+		fmt.Println("Options:")
+		fs.PrintDefaults()
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  agent-deck group move my-project work/frontend")
+		fmt.Println("  agent-deck group move my-project \"\"              # Move to root")
+		fmt.Println("  agent-deck group move my-project root            # Move to root")
+		fmt.Println("  agent-deck group move work/api --to-profile march")
+	}
+
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		os.Exit(1)
+	}
+
+	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
+
+	// Cross-profile group migration (issue #928): different argument shape.
+	if *toProfile != "" {
+		if fs.NArg() < 1 {
+			out.Error("group move --to-profile requires <group>", ErrCodeInvalidOperation)
+			fs.Usage()
+			os.Exit(1)
+		}
+		if fs.NArg() > 1 {
+			out.Error("--to-profile takes a single <group> argument", ErrCodeInvalidOperation)
+			fs.Usage()
+			os.Exit(1)
+		}
+		handleGroupMoveToProfile(profile, *toProfile, fs.Arg(0), *force, out)
+		return
+	}
+
+	sessionID := fs.Arg(0)
+	targetGroup := fs.Arg(1)
+
+	if sessionID == "" {
+		out.Error("session identifier is required", ErrCodeNotFound)
+		fmt.Println("Usage: agent-deck group move <session-id> <group>")
+		os.Exit(1)
+	}
+
+	if fs.NArg() < 2 {
+		out.Error("target group is required", ErrCodeNotFound)
+		fmt.Println("Usage: agent-deck group move <session-id> <group>")
+		os.Exit(1)
+	}
+
+	// Load sessions and groups
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	instances, groups, err := storage.LoadWithGroups()
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	// Find the session
+	inst, errMsg, errCode := ResolveSession(sessionID, instances)
+	if inst == nil {
+		out.Error(errMsg, errCode)
+		if errCode == ErrCodeNotFound {
+			os.Exit(2)
+		}
+		os.Exit(1)
+		return // unreachable, satisfies staticcheck SA5011
+	}
+
+	// Store original group for output
+	fromGroup := inst.GroupPath
+	if fromGroup == "" {
+		fromGroup = session.DefaultGroupPath
+	}
+
+	// Build group tree
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+
+	// Seed the new-group default in case the move target must be auto-created.
+	cfg, _ := session.LoadUserConfig()
+	groupTree.DefaultMaxConcurrent = cfg.GroupDefaults.MaxConcurrent
+
+	targetGroupPath := groupTree.ResolveMoveTargetGroup(targetGroup)
+
+	// Move the session
+	groupTree.MoveSessionToGroup(inst, targetGroupPath)
+
+	// Save
+	if err := storage.SaveWithGroups(groupTree.GetAllInstances(), groupTree); err != nil {
+		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	toGroup := targetGroupPath
+	if toGroup == "" {
+		toGroup = session.DefaultGroupPath
+	}
+
+	out.Success(fmt.Sprintf("Moved %s to %s", inst.Title, toGroup), map[string]interface{}{
+		"success": true,
+		"session": inst.Title,
+		"from":    fromGroup,
+		"to":      toGroup,
+	})
+}
+
+// handleGroupReorder changes a group's position among its siblings
+func handleGroupReorder(profile string, args []string) {
+	fs := flag.NewFlagSet("group reorder", flag.ExitOnError)
+	up := fs.Bool("up", false, "Move group up one position")
+	upShort := fs.Bool("u", false, "Move group up one position (short)")
+	down := fs.Bool("down", false, "Move group down one position")
+	downShort := fs.Bool("d", false, "Move group down one position (short)")
+	position := fs.Int("position", -1, "Move group to specific position (0-indexed)")
+	positionShort := fs.Int("p", -1, "Move group to specific position (short)")
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	quiet := fs.Bool("quiet", false, "Minimal output")
+	quietShort := fs.Bool("q", false, "Minimal output (short)")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck group reorder <name> [options]")
+		fmt.Println()
+		fmt.Println("Reorder a group among its siblings.")
+		fmt.Println()
+		fmt.Println("Options:")
+		fs.PrintDefaults()
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  agent-deck group reorder mobile --up")
+		fmt.Println("  agent-deck group reorder mobile --down")
+		fmt.Println("  agent-deck group reorder mobile --position 0")
+	}
+
+	args = reorderGroupArgs(args)
+
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		os.Exit(1)
+	}
+
+	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
+
+	name := fs.Arg(0)
+	if name == "" {
+		out.Error("group name is required", ErrCodeNotFound)
+		fmt.Println("Usage: agent-deck group reorder <name> [--up|--down|--position N]")
+		os.Exit(1)
+	}
+
+	moveUp := *up || *upShort
+	moveDown := *down || *downShort
+	posSet := *position >= 0
+	posShortSet := *positionShort >= 0
+	if posSet && posShortSet {
+		out.Error("specify only one of --position or -p", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	pos := *position
+	if posShortSet {
+		pos = *positionShort
+	}
+
+	// Validate: exactly one direction
+	dirCount := 0
+	if moveUp {
+		dirCount++
+	}
+	if moveDown {
+		dirCount++
+	}
+	if pos >= 0 {
+		dirCount++
+	}
+	if dirCount == 0 {
+		out.Error("specify one of --up, --down, or --position", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	if dirCount > 1 {
+		out.Error("specify only one of --up, --down, or --position", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	// Load storage
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	instances, groups, err := storage.LoadWithGroups()
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+
+	// Find group by path or name
+	groupPath := normalizeGroupPath(name)
+	_, exists := groupTree.Groups[groupPath]
+	if !exists {
+		for path, g := range groupTree.Groups {
+			if strings.EqualFold(g.Name, name) {
+				groupPath = path
+				exists = true
+				break
+			}
+		}
+	}
+	if !exists {
+		out.Error(fmt.Sprintf("group '%s' not found", name), ErrCodeNotFound)
+		os.Exit(2)
+	}
+
+	// Compute current sibling position
+	siblingIndex, siblings := groupSiblingPosition(groupTree, groupPath)
+
+	fromPos := siblingIndex
+
+	if moveUp {
+		groupTree.MoveGroupUp(groupPath)
+	} else if moveDown {
+		groupTree.MoveGroupDown(groupPath)
+	} else {
+		// --position: move to target position among siblings
+		targetPos := pos
+		if targetPos >= len(siblings) {
+			targetPos = len(siblings) - 1
+		}
+		if targetPos < 0 {
+			targetPos = 0
+		}
+		// Re-check position after each move to handle interleaved children
+		for {
+			cur, _ := groupSiblingPosition(groupTree, groupPath)
+			if cur == targetPos {
+				break
+			}
+			if cur > targetPos {
+				groupTree.MoveGroupUp(groupPath)
+			} else {
+				groupTree.MoveGroupDown(groupPath)
+			}
+			// Detect no-op to avoid infinite loop (e.g., blocked by non-sibling)
+			newCur, _ := groupSiblingPosition(groupTree, groupPath)
+			if newCur == cur {
+				break
+			}
+		}
+	}
+
+	// Compute new position
+	toPos, _ := groupSiblingPosition(groupTree, groupPath)
+
+	// Save
+	if err := storage.SaveWithGroups(groupTree.GetAllInstances(), groupTree); err != nil {
+		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	out.Success(fmt.Sprintf("Reordered group '%s': position %d → %d", name, fromPos, toPos), map[string]interface{}{
+		"success":       true,
+		"name":          name,
+		"path":          groupPath,
+		"from_position": fromPos,
+		"to_position":   toPos,
+	})
+}
+
+// groupSiblingPosition returns the 0-indexed position of a group among its siblings and the sibling paths
+func groupSiblingPosition(groupTree *session.GroupTree, groupPath string) (int, []string) {
+	parentPath := getParentGroupPath(groupPath)
+	level := session.GetGroupLevel(groupPath)
+
+	var siblings []string
+	for _, g := range groupTree.GroupList {
+		gParent := getParentGroupPath(g.Path)
+		if gParent == parentPath && session.GetGroupLevel(g.Path) == level {
+			siblings = append(siblings, g.Path)
+		}
+	}
+
+	for i, s := range siblings {
+		if s == groupPath {
+			return i, siblings
+		}
+	}
+	return -1, siblings
+}
+
+// getParentGroupPath returns the parent path of a group path
+func getParentGroupPath(path string) string {
+	if idx := strings.LastIndex(path, "/"); idx != -1 {
+		return path[:idx]
+	}
+	return "" // root level
+}
+
+// normalizeGroupPath converts a group name/path to its normalized path form.
+// It replaces spaces with hyphens but preserves case, because GroupTree.Groups
+// is keyed by the raw stored path (case-preserving). Lowercasing here would make
+// any group whose path contains uppercase letters unreachable by direct lookup.
+func normalizeGroupPath(name string) string {
+	return strings.ReplaceAll(name, " ", "-")
+}
+
+// truncateGroupName shortens a group name for display
+func truncateGroupName(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	if max <= 3 {
+		return s[:max]
+	}
+	return s[:max-3] + "..."
+}
+
+// reorderGroupArgs reorders arguments so flags come before positional args
+// This fixes Go's flag package limitation where flags after positional args are ignored
+// e.g., "ios --parent mobile" becomes "--parent mobile ios"
+func reorderGroupArgs(args []string) []string {
+	if len(args) == 0 {
+		return args
+	}
+
+	// Known flags that take a value
+	valueFlags := map[string]bool{
+		"--parent":       true,
+		"--default-path": true,
+		"--position":     true,
+		"-p":             true,
+	}
+
+	var flags []string
+	var positional []string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+
+		// Check if it's a flag
+		if strings.HasPrefix(arg, "-") {
+			flags = append(flags, arg)
+
+			// Check if this flag takes a value (and value is separate)
+			if !strings.Contains(arg, "=") && valueFlags[arg] && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+		} else {
+			positional = append(positional, arg)
+		}
+	}
+
+	// Return flags first, then positional args
+	return append(flags, positional...)
+}
+
+// handleGroupChange implements issue #447: reparent an entire group (and its
+// subgroups + sessions) under a new parent, or promote it to root when dest
+// is omitted/empty. Reuses GroupTree.MoveGroupTo for the in-memory mutation
+// and persists via storage.SaveAll.
+func handleGroupChange(profile string, args []string) {
+	fs := flag.NewFlagSet("group change", flag.ExitOnError)
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	quiet := fs.Bool("quiet", false, "Minimal output")
+	quietShort := fs.Bool("q", false, "Minimal output (short)")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck group change <source> [<dest>]")
+		fmt.Println()
+		fmt.Println("Reparent a group (and its subgroups/sessions) under <dest>.")
+		fmt.Println("Omit <dest> or pass \"\" / root to promote the group to root.")
+		fmt.Println()
+		fmt.Println("Arguments:")
+		fmt.Println("  <source>   Full path of the group to move (e.g. personal/project1)")
+		fmt.Println("  <dest>     Target parent path (empty = root)")
+		fmt.Println()
+		fmt.Println("Options:")
+		fs.PrintDefaults()
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  agent-deck group change project1 work")
+		fmt.Println("  agent-deck group change personal/project1 work")
+		fmt.Println("  agent-deck group change work/project1              # Move to root")
+		fmt.Println("  agent-deck group change work/project1 \"\"          # Move to root")
+	}
+
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		os.Exit(1)
+	}
+
+	out := NewCLIOutput(*jsonOutput, *quiet || *quietShort)
+
+	source := fs.Arg(0)
+	if source == "" {
+		out.Error("source group path is required", ErrCodeNotFound)
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	dest := ""
+	if fs.NArg() >= 2 {
+		dest = fs.Arg(1)
+	}
+	// Normalize "root" / "/" to empty string (root level).
+	if dest == "root" || dest == "/" {
+		dest = ""
+	}
+
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to initialize storage: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	instances, groups, err := storage.LoadWithGroups()
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to load sessions: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+
+	// Resolve source path (exact or case-insensitive).
+	sourcePath := source
+	if _, ok := groupTree.Groups[sourcePath]; !ok {
+		low := strings.ToLower(sourcePath)
+		matched := false
+		for path := range groupTree.Groups {
+			if strings.ToLower(path) == low {
+				sourcePath = path
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			out.Error(fmt.Sprintf("source group %q not found", source), ErrCodeNotFound)
+			os.Exit(2)
+		}
+	}
+
+	// Resolve dest path if non-empty (exact or case-insensitive).
+	destPath := dest
+	if destPath != "" {
+		if _, ok := groupTree.Groups[destPath]; !ok {
+			low := strings.ToLower(destPath)
+			matched := false
+			for path := range groupTree.Groups {
+				if strings.ToLower(path) == low {
+					destPath = path
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				out.Error(fmt.Sprintf("destination group %q not found", dest), ErrCodeNotFound)
+				os.Exit(2)
+			}
+		}
+	}
+
+	if err := groupTree.MoveGroupTo(sourcePath, destPath); err != nil {
+		// Distinguish circular errors for a friendlier exit message.
+		out.Error(err.Error(), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	// Compute the new path for output.
+	baseName := sourcePath
+	if idx := strings.LastIndex(sourcePath, "/"); idx >= 0 {
+		baseName = sourcePath[idx+1:]
+	}
+	newPath := baseName
+	if destPath != "" {
+		newPath = destPath + "/" + baseName
+	}
+
+	// Persist.
+	if err := storage.SaveWithGroups(groupTree.GetAllInstances(), groupTree); err != nil {
+		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	out.Success(fmt.Sprintf("Moved group %q to %q", sourcePath, newPath), map[string]interface{}{
+		"from": sourcePath,
+		"to":   newPath,
+	})
+}
+
+// handleGroupMoveToProfile implements `group move <group> --to-profile <name>`
+// (issue #928). Every session in <group> at the source profile is migrated to
+// the target profile. The group row itself is also created in the target.
+func handleGroupMoveToProfile(sourceProfile, targetProfile, groupPath string, force bool, out *CLIOutput) {
+	if groupPath == "root" || groupPath == "" {
+		groupPath = session.DefaultGroupPath
+	}
+
+	result, err := session.MigrateGroupToProfile(
+		groupPath, sourceProfile, targetProfile,
+		session.ProfileMigrateOptions{Force: force},
+	)
+	if err != nil {
+		exitCode := ErrCodeInvalidOperation
+		hint := ""
+		switch {
+		case errors.Is(err, session.ErrProfileMissing):
+			exitCode = ErrCodeNotFound
+		case errors.Is(err, session.ErrSessionRunning):
+			hint = " (stop the running session(s) first, or re-run with --force)"
+		}
+		out.Error(fmt.Sprintf("%v%s", err, hint), exitCode)
+		os.Exit(1)
+	}
+
+	out.Success(
+		fmt.Sprintf("Migrated group %q: profile %s → %s (%d sessions)",
+			groupPath, sourceProfile, targetProfile, len(result.MovedSessionIDs)),
+		map[string]interface{}{
+			"success":        true,
+			"group":          groupPath,
+			"from_profile":   sourceProfile,
+			"to_profile":     targetProfile,
+			"sessions_moved": result.MovedSessionIDs,
+			"cost_events":    result.MovedCostEvents,
+			"watcher_events": result.MovedWatcherEvents,
+			"groups_created": result.CreatedGroups,
+		},
+	)
+}

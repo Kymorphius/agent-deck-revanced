@@ -1,0 +1,261 @@
+package session
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// rm-time cleanup of transition-notifier state for a removed child session.
+//
+// Two artifacts must be swept on `agent-deck rm <child>` to stop the
+// conductor from replaying events for a session that no longer exists
+// (issue #910):
+//
+//   1. Every per-conductor inbox at <agent-deck-dir>/inboxes/*.jsonl —
+//      drop lines whose child_session_id matches the removed id.
+//   2. The dedup ledger at runtime/transition-notify-state.json —
+//      delete the records[<child>] entry.
+//
+// Both ops are idempotent and best-effort: failures must not block the
+// rm itself. Callers can log the swept counts but the caller's exit
+// status is decided by the SQLite delete, not by this sweep.
+
+// SweepInboxesForChildSession rewrites every inbox JSONL file under the
+// agent-deck inboxes directory, dropping lines whose child_session_id
+// equals the given id. Returns the total number of lines dropped across
+// all inbox files.
+//
+// Each rewrite is atomic (temp file + rename). A no-op for absent files,
+// empty inboxes, or inboxes that contain no matching lines.
+//
+// Issue #910 — without this sweep, the conductor replays persisted inbox
+// events for children that have been removed.
+func SweepInboxesForChildSession(childSessionID string) (int, error) {
+	if strings.TrimSpace(childSessionID) == "" {
+		return 0, errors.New("inbox sweep: empty child session id")
+	}
+
+	dir := InboxDir()
+	totalDropped := 0
+	entries, err := os.ReadDir(dir)
+	switch {
+	case err == nil:
+		totalDropped, err = sweepInboxFilesForChild(dir, entries, childSessionID)
+	case errors.Is(err, fs.ErrNotExist):
+		err = nil // no inbox on this host; the rest of the footprint may still exist
+	}
+
+	// Issue #1225: sweep the rest of the child's outbox footprint so a reused id
+	// can't inherit stale state and per-parent ledgers don't leak. Best-effort —
+	// these never fail the rm, and they run even when the inbox sweep did not
+	// (a host with no inbox directory still keeps a turn journal, which the
+	// remote talkback cursor would otherwise name for the whole horizon).
+	_ = os.Remove(DeadLetterPathFor(childSessionID)) // dead-lettered records
+	RemoveTurnJournal(childSessionID)                // issue #2469 per-child turn journal
+	ForgetConsumedTurnsForChild(childSessionID)      // consumed-turn ledgers (this id as a CHILD)
+	ResetStopBlockBudget(childSessionID)             // Stop-hook block budget (if it was a parent)
+	sweepParentSideArtifacts(childSessionID)         // audit B5: this id's OWN parent-side files
+
+	return totalDropped, err
+}
+
+// sweepParentSideArtifacts removes the per-PARENT files keyed by this id, for
+// the case where the removed session was itself a conductor/parent (audit B5):
+// its own inbox, in-flight drain WAL, and consumed-turns ledger. Without this
+// the line-level child sweep above never reaches them (they are keyed by the
+// parent id, not by a child_session_id), so they leaked on every parent removal.
+// Best-effort: missing files are not an error.
+func sweepParentSideArtifacts(parentID string) {
+	inboxWriteMu.Lock()
+	_ = os.Remove(InboxPathFor(parentID))
+	delete(inboxFingerprintCache, InboxPathFor(parentID))
+	_ = os.Remove(inboxInflightPathFor(parentID))
+	inboxWriteMu.Unlock()
+
+	consumedTurnsMu.Lock()
+	_ = os.Remove(consumedTurnsPathFor(parentID))
+	// Issue #2469 per-parent artifacts: counters, digest marker, fleet fingerprint.
+	_ = ResetInboxStats(parentID)
+	_ = os.Remove(inboxDigestPath(parentID))
+	_ = os.Remove(fleetBlockPath(parentID))
+	consumedTurnsMu.Unlock()
+	_ = os.Remove(commsEnrollmentPath(parentID)) // a removed parent is no ledger consumer
+}
+
+// sweepInboxFilesForChild rewrites every inbox file dropping the child's lines,
+// taking each file's flock and inboxWriteMu in turn. Split out so the broader
+// outbox-artifact cleanup in SweepInboxesForChildSession runs without the
+// inbox lock held.
+func sweepInboxFilesForChild(dir string, entries []os.DirEntry, childSessionID string) (int, error) {
+	totalDropped := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		dropped, err := sweepOneInboxFileForChild(filepath.Join(dir, e.Name()), childSessionID)
+		if err != nil {
+			return totalDropped, err
+		}
+		totalDropped += dropped
+	}
+	return totalDropped, nil
+}
+
+// sweepOneInboxFileForChild rewrites one inbox file under its flock (messaging
+// audit P1-3: every inbox rewrite takes the producers' lock).
+func sweepOneInboxFileForChild(path, childSessionID string) (int, error) {
+	return withInboxFileLocked(path, func() (int, error) {
+		return sweepOneInboxLocked(path, childSessionID)
+	})
+}
+
+// sweepOneInboxLocked rewrites one inbox file without lines whose
+// child_session_id matches. Caller holds inboxWriteMu.
+//
+// Strategy: stream-read, write surviving lines to a sibling .tmp file,
+// rename atomically. The process-local fingerprint cache for the path
+// is invalidated so any subsequent WriteInboxEvent rebuilds it from disk.
+func sweepOneInboxLocked(path, childSessionID string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	defer f.Close()
+
+	var kept [][]byte
+	var dropped int
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxInboxLineBytes)
+	for scanner.Scan() {
+		raw := scanner.Bytes()
+		if len(strings.TrimSpace(string(raw))) == 0 {
+			continue
+		}
+		var probe struct {
+			ChildSessionID string `json:"child_session_id"`
+		}
+		if err := json.Unmarshal(raw, &probe); err != nil {
+			// Preserve unparseable lines verbatim — we'd rather replay a
+			// corrupt event than silently drop it during cleanup.
+			kept = append(kept, append([]byte(nil), raw...))
+			continue
+		}
+		if probe.ChildSessionID == childSessionID {
+			dropped++
+			continue
+		}
+		kept = append(kept, append([]byte(nil), raw...))
+	}
+	if err := scanner.Err(); err != nil {
+		return dropped, err
+	}
+	_ = f.Close()
+
+	if dropped == 0 {
+		return 0, nil
+	}
+
+	if len(kept) == 0 {
+		// Entire file was matching events — remove it outright.
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return dropped, err
+		}
+		delete(inboxFingerprintCache, path)
+		return dropped, nil
+	}
+
+	tmp := path + ".sweep.tmp"
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return dropped, err
+	}
+	w := bufio.NewWriter(out)
+	for _, line := range kept {
+		if _, err := w.Write(line); err != nil {
+			_ = w.Flush()
+			_ = out.Close()
+			_ = os.Remove(tmp)
+			return dropped, err
+		}
+		if _, err := w.Write([]byte{'\n'}); err != nil {
+			_ = w.Flush()
+			_ = out.Close()
+			_ = os.Remove(tmp)
+			return dropped, err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmp)
+		return dropped, err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return dropped, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return dropped, err
+	}
+	delete(inboxFingerprintCache, path)
+	return dropped, nil
+}
+
+// RemoveNotifyStateRecord drops records[childSessionID] from
+// runtime/transition-notify-state.json. Returns whether a record was
+// actually present.
+//
+// Idempotent: a second call on the same id returns (false, nil). A
+// missing state file is treated as "no record present".
+//
+// Issue #910 — the dedup ledger must release the removed child's slot,
+// otherwise the next genuinely-delivered transition for a reused id
+// would be (incorrectly) dedup-suppressed against the stale row.
+func RemoveNotifyStateRecord(childSessionID string) (bool, error) {
+	if strings.TrimSpace(childSessionID) == "" {
+		return false, errors.New("notify-state sweep: empty child session id")
+	}
+
+	path := transitionNotifyStatePath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	var state transitionNotifyState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return false, err
+	}
+	if state.Records == nil {
+		return false, nil
+	}
+	if _, present := state.Records[childSessionID]; !present {
+		return false, nil
+	}
+	delete(state.Records, childSessionID)
+
+	out, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return true, err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+		return true, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return true, err
+	}
+	return true, nil
+}
